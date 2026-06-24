@@ -1755,13 +1755,14 @@
     const useLastApp = await findByText('button,a', /use my last application|autofill with/i, 3000);
     if (useLastApp) { LOG('Skipping "Use My Last Application"'); }
 
-    // Handle sign-in/create account pages
+    // Handle sign-in/create account pages with the shared saved-credentials flow
+    // (fills email + password + confirm, ticks consent, submits, and falls back to
+    // sign-in if the account already exists).
     const signInBtn = $('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"]');
     if (signInBtn && isVisible(signInBtn)) {
-      LOG('Workday sign-in page detected — filling credentials');
-      const emailInput = $('input[data-automation-id="email"]');
-      if (emailInput && !emailInput.value) nativeSet(emailInput, p.email || '');
-      await sleep(500);
+      LOG('Workday sign-in/create-account page detected');
+      await handleAccountAuth();
+      await sleep(1500);
     }
 
     // Wait for form page
@@ -5202,6 +5203,13 @@
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none">
         <input type="checkbox" id="ua-sb-tailor" style="accent-color:#00f0a0;width:14px;height:14px"> Tailor resume for each job <span style="color:#6f6f76">(slower)</span>
       </label>
+      <button id="ua-sb-cred-toggle" style="${ghostBtn};width:100%;text-align:left;margin-bottom:8px">🔑 ATS account login (saved credentials)</button>
+      <div id="ua-sb-cred-wrap" style="display:none;margin-bottom:10px">
+        <input id="ua-sb-cred-email" type="text" placeholder="Email" autocomplete="off" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;margin-bottom:6px">
+        <input id="ua-sb-cred-pw" type="text" placeholder="Password (reused for ATS sign-ups)" autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px">
+        <button id="ua-sb-cred-save" style="${ghostBtn};width:100%;margin-top:6px">Save credentials</button>
+        <div style="font-size:9px;color:#6f6f76;margin-top:5px;line-height:1.4">Used to auto-create / sign in to ATS accounts (Workday, iCIMS, Taleo, SuccessFactors…). The same email &amp; password are reused across sites.</div>
+      </div>
       <div style="display:flex;align-items:center;gap:6px;margin-bottom:11px">
         <span style="font-size:11px;font-weight:600;color:#bfbfc4">Speed:</span>
         <button class="ua-sb-sp" data-sp="1" style="min-width:30px;height:24px;border-radius:12px;border:1px solid #fff;background:#fff;color:#0e0e0f;font-size:11px;font-weight:700;cursor:pointer">1x</button>
@@ -5270,6 +5278,25 @@
     const tailorCb = wrap.querySelector('#ua-sb-tailor');
     tailorCb.checked = queueUseTailor;
     tailorCb.addEventListener('change', () => { queueUseTailor = tailorCb.checked; try { st.set('ua_queue_tailor', queueUseTailor); } catch (_) {} LOG('Queue tailoring ' + (queueUseTailor ? 'ON' : 'OFF')); });
+    // --- saved ATS credentials ---
+    const credWrap = wrap.querySelector('#ua-sb-cred-wrap');
+    wrap.querySelector('#ua-sb-cred-toggle').addEventListener('click', async () => {
+      const show = credWrap.style.display === 'none';
+      credWrap.style.display = show ? 'block' : 'none';
+      if (show) {
+        try { const pr = await getProfile(); wrap.querySelector('#ua-sb-cred-email').value = pr.email || ''; wrap.querySelector('#ua-sb-cred-pw').value = await getAppPassword(); } catch (_) {}
+      }
+    });
+    wrap.querySelector('#ua-sb-cred-save').addEventListener('click', async () => {
+      const em = wrap.querySelector('#ua-sb-cred-email').value.trim();
+      const pw = wrap.querySelector('#ua-sb-cred-pw').value.trim();
+      try {
+        if (pw) await st.set('ua_app_password', pw);
+        if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); }
+      } catch (_) {}
+      const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
+      LOG('Saved ATS credentials');
+    });
     // Speed selector (shared with the overlay; controls inter-job delay).
     const paintSpeed = () => wrap.querySelectorAll('.ua-sb-sp').forEach(b => {
       const on = parseFloat(b.dataset.sp) === qSpeed;
@@ -5461,10 +5488,99 @@
     return clicks > 0;
   }
 
+  // ===================== ACCOUNT CREATION / LOGIN (shared saved credentials) =====================
+  // Many ATS (Workday, iCIMS, Taleo, SuccessFactors, ADP/BrassRing, Jobvite…) require
+  // creating an account or signing in before you can apply. We reuse ONE saved
+  // credential set across all of them: the profile email + a saved password.
+  function generateStrongPassword() {
+    const up = 'ABCDEFGHJKLMNPQRSTUVWXYZ', lo = 'abcdefghijkmnpqrstuvwxyz', dg = '23456789', sp = '!@#$%';
+    const pick = s => s[Math.floor(Math.random() * s.length)];
+    let core = '';
+    for (let i = 0; i < 8; i++) core += pick(lo + up + dg);
+    // Guarantee complexity (upper/lower/digit/special, 12+ chars) for ATS rules.
+    return 'Jb' + pick(up) + core + pick(dg) + pick(sp);
+  }
+  async function getAppPassword() {
+    let pw = await st.get('ua_app_password');
+    if (!pw) { pw = generateStrongPassword(); await st.set('ua_app_password', pw); LOG('Generated & saved a reusable ATS account password'); }
+    return pw;
+  }
+  function looksLikeAuthPage() { return $$('input[type=password]').some(isVisible); }
+  function findAuthSubmit(mode) {
+    const re = mode === 'signin' ? /^(sign ?in|log ?in|continue|submit)$/i
+      : mode === 'create' ? /^(create account|create my account|register|sign ?up|continue|submit|next)$/i
+        : /^(create account|create my account|register|sign ?up|sign ?in|log ?in|continue|submit|next)$/i;
+    const known = $('[data-automation-id="createAccountSubmitButton"],[data-automation-id="signInSubmitButton"]');
+    if (known && isVisible(known)) return known;
+    const btns = $$('button,a[role="button"],input[type=submit],input[type=button]').filter(isVisible);
+    return btns.find(b => re.test((b.textContent || b.value || '').trim())) ||
+      btns.find(b => /^(submit|continue|next)$/i.test((b.textContent || b.value || '').trim())) || null;
+  }
+  // Detect a sign-in/create-account page and complete it with saved credentials.
+  async function handleAccountAuth() {
+    try {
+      // Never auto-fill credentials on the user's personal job-board / social logins —
+      // only on ATS account walls. (Their LinkedIn/Indeed password isn't ours to set.)
+      if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
+      const p = await getProfile();
+      const email = p.email || '';
+      if (!email) return false;
+      // If no password field yet, try to open a "Create account" form.
+      if (!looksLikeAuthPage()) {
+        const createLink = $$('button,a,[role="button"]').filter(isVisible)
+          .find(b => { const t = (b.textContent || '').trim(); return t.length < 30 && /^(create account|create an account|sign ?up|register|new user)/i.test(t); });
+        if (createLink) { LOG('Account: opening create-account form'); realClick(createLink); await sleep(1500); }
+      }
+      if (!looksLikeAuthPage()) return false;
+      LOG('Account auth page detected — filling saved credentials');
+      const pw = await getAppPassword();
+      // Email / username
+      let emailField = $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
+      if (!emailField) emailField = $$('input[type=text],input:not([type])').filter(isVisible)
+        .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '')));
+      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(200); }
+      // Password + confirm-password
+      const pwFields = $$('input[type=password]').filter(isVisible);
+      for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); await sleep(150); } }
+      // Required consent / terms checkboxes
+      $$('input[type=checkbox]').filter(isVisible).forEach(c => {
+        const lbl = (getLabel(c) || '');
+        if (!c.checked && (isFieldRequired(c) || /agree|terms|privacy|consent|acknowledge|i have read/i.test(lbl))) realClick(c);
+      });
+      const isCreate = pwFields.length > 1
+        || pwFields.some(f => /confirm|verify|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '')))
+        || /create (an )?account|register|sign ?up/i.test((document.body.innerText || '').toLowerCase().slice(0, 4000));
+      await sleep(400);
+      const submit = findAuthSubmit(isCreate ? 'create' : 'signin') || findAuthSubmit();
+      if (submit) {
+        LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in'));
+        realClick(submit);
+        await sleep(3500);
+        // Account already exists → switch to sign-in with the same creds.
+        const bodyTxt = (document.body.innerText || '').toLowerCase();
+        if (isCreate && /already (exists|in use|registered)|account.*exists|email.*taken|use a different email|already have an account/i.test(bodyTxt)) {
+          LOG('Account exists — switching to sign-in');
+          const toggle = $$('button,a,[role="button"]').filter(isVisible).find(b => /^(sign ?in|log ?in|already have)/i.test((b.textContent || '').trim()));
+          if (toggle) { realClick(toggle); await sleep(1500); }
+          const ef = $$('input[type=email],input[type=text]').filter(isVisible)[0];
+          if (ef && !ef.value) nativeSet(ef, email);
+          const pf = $$('input[type=password]').filter(isVisible)[0];
+          if (pf && !pf.value) nativeSet(pf, pw);
+          await sleep(300);
+          const si = findAuthSubmit('signin');
+          if (si) { realClick(si); await sleep(3500); }
+        }
+      }
+      return true;
+    } catch (e) { LOG('handleAccountAuth error:', e?.message || e); return false; }
+  }
+
   // ===================== ATS DISPATCHER =====================
   async function dispatchATSAutomation() {
     // Reveal the application form first if we're on a listing/landing page.
     await openApplicationForm();
+    // Create an account / sign in with saved credentials if the ATS requires it.
+    await handleAccountAuth();
     const url = location.href;
     if (isWorkday()) return await workdayAutomation();
     if (/greenhouse\.io|boards\.greenhouse/i.test(url)) return await greenhouseAutomation();

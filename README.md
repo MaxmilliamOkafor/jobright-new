@@ -73,6 +73,23 @@ While the queue runs, a panel shows in the top-right:
 Progress is saved per-job, so if a page reloads or you stop midway, **Resume**
 continues from where it left off.
 
+### Managing the queue
+
+The sidebar card has a full queue manager: tick individual jobs or **All**, then
+**Delete selected**, or **Clear all**. Each row shows the job and its live status,
+with a **×** to remove it. Works on the whole queue even when large.
+
+### ATS account login (saved credentials)
+
+Some ATS (Workday, iCIMS, Taleo, SuccessFactors, ADP/BrassRing, Jobvite…) make you
+create an account or sign in before applying. Open **🔑 ATS account login** in the
+sidebar card and save one **email + password** — these are reused across every site.
+During a run the automation detects sign-in / create-account pages, fills the saved
+credentials (email, password, confirm-password, consent), submits, and falls back to
+sign-in if the account already exists. A strong password is auto-generated the first
+time if you don't set one. (Personal job-board logins like LinkedIn/Indeed are never
+touched.)
+
 ### Keyboard shortcuts
 
 | Shortcut | Action |
