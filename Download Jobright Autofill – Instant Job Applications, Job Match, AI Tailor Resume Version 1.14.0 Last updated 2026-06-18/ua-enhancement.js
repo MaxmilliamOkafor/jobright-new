@@ -5137,6 +5137,46 @@
     } catch (_) {}
   }
 
+  function escHtml(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+  // Render the manageable job list inside the sidebar card (checkboxes, status,
+  // per-row remove). Cheap-guarded so it only rebuilds when the queue/selection
+  // actually changes (avoids resetting scroll/checkboxes on every status tick).
+  let _sbQueueSig = '';
+  function renderSidebarQueue() {
+    if (!_sbSection) return;
+    const manage = _sbSection.querySelector('#ua-sb-manage');
+    const list = _sbSection.querySelector('#ua-sb-list');
+    if (!manage || !list) return;
+    if (!queue.length) { manage.style.display = 'none'; list.innerHTML = ''; _sbQueueSig = ''; return; }
+    const sig = queue.length + '|' + queue.map(j => j.id + ':' + j.status + (selected.has(j.id) ? '*' : '')).join(',');
+    if (sig === _sbQueueSig) return;
+    _sbQueueSig = sig;
+    manage.style.display = 'block';
+    const STC = { pending: '#9aa0a6', applying: '#4ea1ff', done: '#34d399', failed: '#f87171', timeout: '#fbbf24', skipped: '#9aa0a6' };
+    const MAX = 150;
+    const shown = queue.slice(0, MAX);
+    list.innerHTML = shown.map(j => {
+      const label = j.companyName ? `${j.companyName} — ${j.title || ''}` : (j.title || shortUrl(j.url));
+      return `<div style="display:flex;align-items:center;gap:7px;padding:5px 8px;background:#0e0e0f;border:1px solid #242427;border-radius:7px">
+        <input type="checkbox" class="ua-sb-jobcb" data-id="${j.id}" ${selected.has(j.id) ? 'checked' : ''} style="accent-color:#00f0a0;width:13px;height:13px;flex-shrink:0">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:11px;color:#e7e7ea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escHtml(j.url)}">${escHtml(label)}</div>
+          <div style="font-size:9px;font-weight:600;color:${STC[j.status] || '#9aa0a6'};text-transform:capitalize">${escHtml(j.status)}</div>
+        </div>
+        <button class="ua-sb-jobdel" data-id="${j.id}" title="Remove" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:15px;line-height:1;flex-shrink:0;padding:0 2px">×</button>
+      </div>`;
+    }).join('') + (queue.length > MAX ? `<div style="font-size:10px;color:#6f6f76;text-align:center;padding:5px">+${queue.length - MAX} more</div>` : '');
+    list.querySelectorAll('.ua-sb-jobcb').forEach(cb => cb.addEventListener('change', () => {
+      if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+      const selall = _sbSection.querySelector('#ua-sb-selall');
+      if (selall) selall.checked = queue.length > 0 && queue.every(j => selected.has(j.id));
+    }));
+    list.querySelectorAll('.ua-sb-jobdel').forEach(b => b.addEventListener('click', () => removeJob(b.dataset.id)));
+    const selall = _sbSection.querySelector('#ua-sb-selall');
+    if (selall) selall.checked = queue.length > 0 && queue.every(j => selected.has(j.id));
+  }
+
   function buildSidebarSection() {
     if (_sbSection) return _sbSection;
     const wrap = document.createElement('div');
@@ -5182,7 +5222,15 @@
         <button id="ua-sb-pause" style="${ghostBtn};flex:1">Pause</button>
         <button id="ua-sb-skip" style="${ghostBtn};flex:1">Skip</button>
       </div>
-      <div style="margin-top:8px;font-size:10px;color:#6f6f76;line-height:1.4">CSV / list of job URLs → opens each, runs Jobright Autofill, fills required fields &amp; submits automatically.</div>
+      <div id="ua-sb-manage" style="display:none;margin-top:12px;border-top:1px solid #242427;padding-top:11px">
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none"><input type="checkbox" id="ua-sb-selall" style="accent-color:#00f0a0;width:13px;height:13px"> All</label>
+          <button id="ua-sb-delsel" style="${ghostBtn};padding:6px 9px;flex:0 0 auto;font-size:11px">Delete selected</button>
+          <button id="ua-sb-clear" style="padding:6px 9px;border:1px solid #5a2330;border-radius:8px;background:transparent;color:#f87171;font-size:11px;font-weight:600;cursor:pointer">Clear all</button>
+        </div>
+        <div id="ua-sb-list" style="max-height:190px;overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div>
+      </div>
+      <div style="margin-top:10px;font-size:10px;color:#6f6f76;line-height:1.4">CSV / list of job URLs → opens each, runs Jobright Autofill, fills required fields &amp; submits automatically.</div>
     `;
     // --- wire events (engine functions are in this same scope) ---
     const fileInput = wrap.querySelector('#ua-sb-file');
@@ -5205,6 +5253,20 @@
     wrap.querySelector('#ua-sb-stop').addEventListener('click', stopQ);
     wrap.querySelector('#ua-sb-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
     wrap.querySelector('#ua-sb-skip').addEventListener('click', skipJob);
+    // --- bulk queue management ---
+    wrap.querySelector('#ua-sb-selall').addEventListener('change', e => {
+      if (e.target.checked) queue.forEach(j => selected.add(j.id)); else selected.clear();
+      renderSidebarQueue();
+    });
+    wrap.querySelector('#ua-sb-delsel').addEventListener('click', async () => {
+      if (!selected.size) { alert('Select one or more jobs first (tick the boxes or "All").'); return; }
+      const n = selected.size;
+      if (confirm(`Remove ${n} selected job${n === 1 ? '' : 's'} from the queue?`)) await removeSelected();
+    });
+    wrap.querySelector('#ua-sb-clear').addEventListener('click', async () => {
+      if (!queue.length) return;
+      if (confirm(`Clear ALL ${queue.length} jobs from the queue?`)) await clearQ();
+    });
     const tailorCb = wrap.querySelector('#ua-sb-tailor');
     tailorCb.checked = queueUseTailor;
     tailorCb.addEventListener('change', () => { queueUseTailor = tailorCb.checked; try { st.set('ua_queue_tailor', queueUseTailor); } catch (_) {} LOG('Queue tailoring ' + (queueUseTailor ? 'ON' : 'OFF')); });
@@ -5248,6 +5310,7 @@
 
   function updateSidebarUI() {
     if (!_sbSection) return;
+    renderSidebarQueue();
     const q = (id) => _sbSection.querySelector(id);
     const pending = queue.filter(j => j.status === 'pending').length;
     const cnt = q('#ua-sb-count'); if (cnt) cnt.textContent = `${queue.length} job${queue.length === 1 ? '' : 's'}`;
