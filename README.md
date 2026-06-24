@@ -61,17 +61,28 @@ The queue then, for each imported URL:
 The control panel stays open for the whole run (it mounts on every job page, including
 listing pages), so you always see progress and can Pause / Skip / Quit / change Speed.
 
-### Automation panel (matches 1.14.0)
+### Watch it work in the Jobright popup
 
-While the queue runs, a panel shows in the top-right:
+The automation drives **Jobright's own Autofill** on each job — exactly like applying
+manually one-by-one — and keeps the **native Jobright popup open** throughout so you can
+watch it fill and submit. There's no separate "Ultimate Autofill" panel; the queue is run
+entirely from the bulk-apply card inside the Jobright popup.
+
+### Automation panel (draggable)
+
+While the queue runs, a status panel appears:
 
 - **Automation In Progress** · **Job X of N**
 - **Position at …** (current company) with a live progress bar
 - **Pause / Skip / Quit**
 - **Speed:** `1x` `1.5x` `2x` `3x` — controls the delay between jobs
 
-Progress is saved per-job, so if a page reloads or you stop midway, **Resume**
-continues from where it left off.
+**Drag it by its header** to move it anywhere so it never blocks the Jobright popup — its
+position is remembered across pages and jobs. Progress is saved per-job, so if a page
+reloads or you stop midway, **Resume** continues from where it left off.
+
+> The advanced settings drawer (profile / AI key / history) is hidden by default to keep
+> things simple — press **Alt+Q** if you ever need it.
 
 ### Managing the queue
 

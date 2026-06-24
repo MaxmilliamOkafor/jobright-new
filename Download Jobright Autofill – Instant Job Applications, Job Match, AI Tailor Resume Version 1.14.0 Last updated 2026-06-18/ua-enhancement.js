@@ -4372,17 +4372,22 @@
   function buildUI() {
     if (window.self !== window.top) return;
 
-    // --- Main FAB (draggable) ---
+    // --- Main FAB (the old "Ultimate Autofill" drawer entry) — HIDDEN by request.
+    // Everything is now driven from the native Jobright popup (bulk-apply card) plus
+    // the draggable "Automation In Progress" overlay, so this separate panel is not
+    // shown. The drawer code stays for power users via keyboard shortcut only.
     const fab = document.createElement('div'); fab.id = 'ua-fab';
     fab.innerHTML = ico('bolt', 22, 22, '#fff') + '<span class="badge" id="ua-badge"></span>';
+    fab.style.display = 'none';
     document.body.appendChild(fab);
     makeDraggable(fab);
     fab.addEventListener('click', () => { const d = document.getElementById('ua-drawer'); d.classList.toggle('open'); positionDrawer(); });
 
-    // --- Add-to-queue mini FAB ---
+    // --- Add-to-queue mini FAB --- (also hidden; add jobs from the sidebar card)
     const af = document.createElement('div'); af.id = 'ua-fab-add';
     af.innerHTML = ico('plus', 18, 18, '#6ee7b7');
     af.title = 'Add this page to queue';
+    af.style.display = 'none';
     document.body.appendChild(af);
     af.addEventListener('click', () => addJob(location.href, document.title));
 
@@ -4410,6 +4415,15 @@
       </div>
     </div>`;
     document.body.appendChild(ctrl);
+    // Drag the panel by its header so it never blocks the Jobright popup. Position
+    // persists across pages/jobs.
+    makeDraggableByHandle(ctrl, ctrl.querySelector('.uc-top'));
+    st.get('ua_ctrl_pos').then(p => {
+      if (!p || !p.left) return;
+      const left = Math.max(0, Math.min(window.innerWidth - 80, parseInt(p.left) || 0));
+      const top = Math.max(0, Math.min(window.innerHeight - 40, parseInt(p.top) || 0));
+      ctrl.style.left = left + 'px'; ctrl.style.top = top + 'px'; ctrl.style.right = 'auto';
+    });
     document.getElementById('uc-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
     document.getElementById('uc-skip').addEventListener('click', skipJob);
     document.getElementById('uc-quit').addEventListener('click', stopQ);
@@ -4581,6 +4595,41 @@
   }
 
   // ===================== DRAGGABLE =====================
+  // Drag `target` only when grabbing `handle` (so buttons inside still click).
+  function makeDraggableByHandle(target, handle) {
+    if (!target || !handle) return;
+    handle.style.cursor = 'move';
+    handle.style.userSelect = 'none';
+    handle.title = 'Drag to move';
+    let sx, sy, ox, oy, dragging = false;
+    const onDown = e => {
+      if (e.target.closest('button')) return; // never start a drag from a control
+      const t = e.touches ? e.touches[0] : e;
+      sx = t.clientX; sy = t.clientY;
+      const r = target.getBoundingClientRect(); ox = r.left; oy = r.top;
+      dragging = true;
+      target.style.transition = 'none';
+      document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);
+      document.addEventListener('touchmove', onMove, { passive: false }); document.addEventListener('touchend', onUp);
+      e.preventDefault();
+    };
+    const onMove = e => {
+      if (!dragging) return; e.preventDefault();
+      const t = e.touches ? e.touches[0] : e;
+      const nx = Math.max(0, Math.min(window.innerWidth - target.offsetWidth, ox + (t.clientX - sx)));
+      const ny = Math.max(0, Math.min(window.innerHeight - target.offsetHeight, oy + (t.clientY - sy)));
+      target.style.left = nx + 'px'; target.style.top = ny + 'px'; target.style.right = 'auto'; target.style.bottom = 'auto';
+    };
+    const onUp = () => {
+      dragging = false; target.style.transition = '';
+      document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp);
+      if (target.style.left) { try { st.set('ua_ctrl_pos', { left: target.style.left, top: target.style.top }); } catch (_) {} }
+    };
+    handle.addEventListener('mousedown', onDown);
+    handle.addEventListener('touchstart', onDown, { passive: false });
+  }
+
   function makeDraggable(el) {
     let sx, sy, ox, oy, dragging = false, moved = false;
     const onDown = e => {
@@ -5444,7 +5493,8 @@
     o.observe(document.body || document.documentElement, { childList: true, subtree: true });
     // Safety net: periodic re-inject in case the sidebar mounts without mutations
     // we observed (e.g. inside a shadow root). Cheap — one querySelector per tick.
-    setInterval(injectSidebarUI, 1500);
+    // During a run, also keep Jobright's own popup open so you can watch it autofill.
+    setInterval(() => { injectSidebarUI(); if (qActive) forceOpenSidebar(); }, 1500);
   }
 
   // ===================== APPLY-BUTTON OPENER (reveal the form on listing pages) =====================
