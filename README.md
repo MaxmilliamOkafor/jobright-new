@@ -82,13 +82,24 @@ with a **×** to remove it. Works on the whole queue even when large.
 ### ATS account login (saved credentials)
 
 Some ATS (Workday, iCIMS, Taleo, SuccessFactors, ADP/BrassRing, Jobvite…) make you
-create an account or sign in before applying. Open **🔑 ATS account login** in the
-sidebar card and save one **email + password** — these are reused across every site.
-During a run the automation detects sign-in / create-account pages, fills the saved
-credentials (email, password, confirm-password, consent), submits, and falls back to
-sign-in if the account already exists. A strong password is auto-generated the first
-time if you don't set one. (Personal job-board logins like LinkedIn/Indeed are never
-touched.)
+create an account or sign in before applying. This is **fully automatic across all ATS** —
+no manual effort:
+
+- The automation detects sign-in / create-account pages on **every** platform, fills the
+  saved credentials (email, password, confirm-password, consent), submits, and falls back
+  to sign-in if the account already exists.
+- A strong password is **auto-generated and saved the first time**, and the email comes
+  from your profile — so it works with zero setup. You can still view/override them under
+  **🔑 ATS account login** in the sidebar card.
+- Personal job-board logins (LinkedIn/Indeed/Glassdoor/etc.) are never touched.
+
+### Self-navigating to completion
+
+Each application drives itself to a **confirmed submission** with no supervision: it opens
+the Apply form, clears any account wall, autofills, then advances through every page —
+multi-step forms, review/confirm screens — clicking Next/Continue/Submit on its own. This
+is a **universal driver that runs for all ATS platforms**, on top of the platform-specific
+flows. Only once submission is confirmed does the queue move to the next job.
 
 ### Keyboard shortcuts
 

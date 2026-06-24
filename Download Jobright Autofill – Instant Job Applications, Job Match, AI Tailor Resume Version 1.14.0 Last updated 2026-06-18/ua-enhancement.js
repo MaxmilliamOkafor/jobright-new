@@ -1488,23 +1488,19 @@
 
     // Step 7: Auto submit or next
     LOG('Step 5: Auto-submit/next');
-    const result = await autoSubmitOrNext();
-
-    if (result === 'next_page') {
-      LOG('Navigated to next page — continuing multi-page flow');
-      await sleep(3000);
-      await multiPageLoop();
-    } else if (result === 'submitted') {
-      LOG('Application submitted!');
-      await learnFromPage();
-      await sleep(2000);
-      if (checkSuccess()) LOG('Success confirmed!');
-    }
+    await autoSubmitOrNext();
+    await learnFromPage();
+    await sleep(2000);
+    // Remaining pages / review-confirm / account walls are driven to completion by
+    // the dispatcher's universal multi-page driver after this returns.
   }
 
   // ===================== MULTI-PAGE FORM LOOP =====================
+  // Self-navigating: at every step it (re)opens the apply form, completes any
+  // account-creation / sign-in wall, autofills, then advances — until the
+  // application is submitted (confirmed) or there is genuinely nothing left to do.
   async function multiPageLoop() {
-    const MAX_PAGES = 10;
+    const MAX_PAGES = 18;
     let prevPageHash = getPageHash();
     for (let page = 1; page <= MAX_PAGES; page++) {
       if (checkSuccess()) { LOG('Success detected — stopping multi-page loop'); break; }
@@ -1525,6 +1521,11 @@
       }
       prevPageHash = getPageHash();
 
+      // Handle anything blocking this step before filling: an "Apply"/"Continue
+      // to application" button, or an account-creation / sign-in wall.
+      await openApplicationForm();
+      await handleAccountAuth();
+
       // Try Jobright autofill again
       await triggerAutofill();
       await sleep(3000);
@@ -1542,18 +1543,24 @@
       if (action === 'submitted') {
         LOG('Submitted on page ' + page);
         await sleep(3000);
-        if (checkSuccess()) LOG('Success confirmed after submit');
-        break;
+        if (checkSuccess()) { LOG('Success confirmed after submit'); break; }
+        // Some ATS show a final review/confirm step after the first "submit" —
+        // keep looping so we click it too instead of stopping prematurely.
+        continue;
       } else if (action === 'next_page') {
         LOG('Next page clicked on page ' + page);
         await sleep(3000);
         continue;
       } else {
-        // No button found — try one more fallback+submit
-        await sleep(2000);
+        // No submit/next found — re-fill once and retry; only stop if still nothing.
+        await sleep(1500);
+        await openApplicationForm();
+        await handleAccountAuth();
         await fallbackFill();
+        await handleValidationErrors();
         const retry = await autoSubmitOrNext();
-        if (retry) LOG('Retry result:', retry);
+        if (retry) { LOG('Retry result: ' + retry); await sleep(3000); continue; }
+        LOG('Nothing left to click on page ' + page + ' — ending loop');
         break;
       }
     }
@@ -1575,8 +1582,9 @@
     await sleep(1000);
     await fallbackFill();
     await sleep(1000);
-    const result = await autoSubmitOrNext();
-    if (result === 'next_page') { await sleep(3000); await multiPageLoop(); }
+    await autoSubmitOrNext();
+    await sleep(2000);
+    // Remaining pages are driven by the dispatcher's universal multi-page driver.
   }
 
   // ===================== ASHBY AUTOMATION (from LazyApply) =====================
@@ -5582,27 +5590,32 @@
     // Create an account / sign in with saved credentials if the ATS requires it.
     await handleAccountAuth();
     const url = location.href;
-    if (isWorkday()) return await workdayAutomation();
-    if (/greenhouse\.io|boards\.greenhouse/i.test(url)) return await greenhouseAutomation();
-    if (/lever\.co|jobs\.lever/i.test(url)) return await leverAutomation();
-    if (/icims\.com/i.test(url)) return await icimsAutomation();
-    if (/linkedin\.com.*\/jobs/i.test(url)) return await linkedinEasyApply();
-    if (/ashbyhq\.com/i.test(url)) return await ashbyAutomation();
-    if (/bamboohr\.com/i.test(url)) return await bamboohrAutomation();
-    if (/smartrecruiters\.com/i.test(url)) return await smartRecruitersAutomation();
-    if (/taleo\.net|oraclecloud\.com.*Candidate/i.test(url)) return await taleoAutomation();
-    if (/jobvite\.com/i.test(url)) return await jobviteAutomation();
-    if (/workable\.com/i.test(url)) return await workableAutomation();
-    if (/indeed\.com/i.test(url)) return await indeedEasyApply();
-    if (/breezy\.hr|breezyhr\.com/i.test(url)) return await breezyhrAutomation();
-    if (/ats\.rippling\.com/i.test(url)) return await ripplingAutomation();
-    if (/adp\.com|workforcenow\.adp/i.test(url)) return await adpAutomation();
-    if (/successfactors\.com/i.test(url)) return await successFactorsAutomation();
-    if (/jazz\.co|applytojob\.com/i.test(url)) return await jazzhrAutomation();
-    if (/joinhandshake\.com/i.test(url)) return await handshakeAutomation();
-    if (/governmentjobs\.com|usajobs\.gov/i.test(url)) return await usajobsAutomation();
-    if (/eightfold\.ai/i.test(url)) return await eightfoldAutomation();
-    return await tailorFirstFlow();
+    // Route to the platform-specific flow…
+    if (isWorkday()) await workdayAutomation();
+    else if (/greenhouse\.io|boards\.greenhouse/i.test(url)) await greenhouseAutomation();
+    else if (/lever\.co|jobs\.lever/i.test(url)) await leverAutomation();
+    else if (/icims\.com/i.test(url)) await icimsAutomation();
+    else if (/linkedin\.com.*\/jobs/i.test(url)) await linkedinEasyApply();
+    else if (/ashbyhq\.com/i.test(url)) await ashbyAutomation();
+    else if (/bamboohr\.com/i.test(url)) await bamboohrAutomation();
+    else if (/smartrecruiters\.com/i.test(url)) await smartRecruitersAutomation();
+    else if (/taleo\.net|oraclecloud\.com.*Candidate/i.test(url)) await taleoAutomation();
+    else if (/jobvite\.com/i.test(url)) await jobviteAutomation();
+    else if (/workable\.com/i.test(url)) await workableAutomation();
+    else if (/indeed\.com/i.test(url)) await indeedEasyApply();
+    else if (/breezy\.hr|breezyhr\.com/i.test(url)) await breezyhrAutomation();
+    else if (/ats\.rippling\.com/i.test(url)) await ripplingAutomation();
+    else if (/adp\.com|workforcenow\.adp/i.test(url)) await adpAutomation();
+    else if (/successfactors\.com/i.test(url)) await successFactorsAutomation();
+    else if (/jazz\.co|applytojob\.com/i.test(url)) await jazzhrAutomation();
+    else if (/joinhandshake\.com/i.test(url)) await handshakeAutomation();
+    else if (/governmentjobs\.com|usajobs\.gov/i.test(url)) await usajobsAutomation();
+    else if (/eightfold\.ai/i.test(url)) await eightfoldAutomation();
+    else await tailorFirstFlow();
+    // …then a UNIVERSAL completion driver for EVERY ATS: if the application isn't
+    // confirmed submitted yet, self-navigate the remaining steps (account walls,
+    // multi-page forms, review/confirm screens) until it is.
+    if (!checkSuccess()) await multiPageLoop();
   }
 
   // ===================== INIT =====================
