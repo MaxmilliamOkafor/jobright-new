@@ -232,6 +232,7 @@
   // LazyApply-enhanced state tracking
   let qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0 };
   let qStoppedAt = -1; // LazyApply session resumption index
+  let queueUseTailor = false; // queue uses plain Autofill by default (see load())
   async function load() {
     queue = (await st.get(SK.Q)) || [];
     qActive = (await st.get(SK.QA)) || false;
@@ -240,6 +241,10 @@
     qStats = (await st.get('ua_q_stats')) || qStats;
     qStoppedAt = (await st.get('ua_q_stopped_at')) || -1;
     qSpeed = (await st.get('ua_q_speed')) || 1; // persist speed across per-job navigations
+    // Default OFF: the queue uses the reliable plain "Autofill" path. The
+    // "Generate Custom Resume + Autofill" combo depends on Jobright's resume
+    // generator and can stall, so we don't use it automatically unless opted in.
+    queueUseTailor = (await st.get('ua_queue_tailor')) === true;
   }
   async function saveQ() { await st.set(SK.Q, queue); }
   async function saveStats() { await st.set('ua_q_stats', qStats); }
@@ -1410,9 +1415,11 @@
     if (!sidebar) { LOG('Jobright sidebar not found — falling back to direct autofill'); await directAutofillFlow(); return; }
     await sleep(2000);
 
-    // Step 1: Click "Generate Custom Resume" if available
-    const tailorBtn = sidebar.querySelector('.application-dashboard-tailor-resume') ||
-      sidebar.querySelector('.external-job-generate-resume-button');
+    // Step 1: Click "Generate Custom Resume" only if the user opted into tailoring
+    // during the queue. By default we skip it for reliability (the resume-generator
+    // combo can hang on "Opening resume generator…") and go straight to Autofill.
+    const tailorBtn = queueUseTailor ? (sidebar.querySelector('.application-dashboard-tailor-resume') ||
+      sidebar.querySelector('.external-job-generate-resume-button')) : null;
     if (tailorBtn && isVisible(tailorBtn)) {
       LOG('Step 1: Clicking Generate Custom Resume');
       realClick(tailorBtn);
@@ -4975,7 +4982,8 @@
     if (!u.length) { alert('No valid URLs found.'); return; }
     LOG(`Imported ${u.length} URLs from file`);
     for (const x of u) await addJob(x);
-    document.getElementById('ua-drawer').classList.add('open'); positionDrawer();
+    // Refresh the in-sidebar bulk-apply UI (no separate popup — user preference).
+    injectSidebarUI(); updateSidebarUI();
   }
 
   // ===================== RENDER =====================
@@ -5010,7 +5018,137 @@
     document.getElementById('uq-clear')?.addEventListener('click', clearQ);
   }
 
+  // ===================== IN-SIDEBAR BULK-APPLY UI (native Jobright panel) =====================
+  // Per user request the CSV import + queue controls live INSIDE the native Jobright
+  // sidebar (not a separate floating popup that can disappear). We use one persistent
+  // node and re-attach it whenever React re-renders the sidebar, so it never vanishes.
+  let _sbSection = null;
+
+  function findSidebarRoot() {
+    let el = document.getElementById('jobright-helper-id');
+    if (el) return el;
+    for (const host of $$('plasmo-csui,[id*="plasmo"],[class*="plasmo"]')) {
+      const r = host.shadowRoot;
+      if (r) { const inner = r.querySelector('#jobright-helper-id,.jobright-helper-content-container'); if (inner) return inner; }
+    }
+    return null;
+  }
+
+  function buildSidebarSection() {
+    if (_sbSection) return _sbSection;
+    const wrap = document.createElement('div');
+    wrap.id = 'ua-sb';
+    wrap.setAttribute('data-ua-keep', '1');
+    wrap.setAttribute('style', "margin:10px 12px;padding:13px 14px;background:#141416;border:1px solid #2a2a2d;border-radius:12px;font-family:'Inter',system-ui,-apple-system,sans-serif;color:#e7e7ea");
+    const greenBtn = 'padding:11px;border:none;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;width:100%;background:#00f0a0;color:#001b12';
+    const ghostBtn = 'padding:9px;border:1px solid #34343a;border-radius:9px;font-size:12px;font-weight:600;cursor:pointer;background:transparent;color:#e7e7ea';
+    wrap.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px">
+        <div style="font-size:13px;font-weight:700;color:#fff">⚡ Bulk Auto-Apply</div>
+        <div id="ua-sb-count" style="font-size:11px;font-weight:700;color:#9ff5d3;background:#0c2a20;border:1px solid #1c5743;border-radius:8px;padding:3px 9px">0 jobs</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button id="ua-sb-upload" style="${ghostBtn};flex:1">⬆ Upload CSV</button>
+        <button id="ua-sb-paste-toggle" style="${ghostBtn};flex:1">⛓ Paste URLs</button>
+      </div>
+      <input type="file" id="ua-sb-file" accept=".csv,.txt,.tsv,.json" style="display:none">
+      <div id="ua-sb-paste-wrap" style="display:none;margin-bottom:8px">
+        <textarea id="ua-sb-textarea" placeholder="Paste job URLs — one per line" style="width:100%;box-sizing:border-box;min-height:64px;background:#0e0e0f;border:1px solid #34343a;border-radius:9px;color:#e7e7ea;font-size:12px;padding:8px;resize:vertical"></textarea>
+        <button id="ua-sb-add" style="${ghostBtn};width:100%;margin-top:6px">Add to queue</button>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none">
+        <input type="checkbox" id="ua-sb-tailor" style="accent-color:#00f0a0;width:14px;height:14px"> Tailor resume for each job <span style="color:#6f6f76">(slower)</span>
+      </label>
+      <div id="ua-sb-status" style="display:none;margin-bottom:9px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span id="ua-sb-job" style="font-size:12px;font-weight:600;color:#e7e7ea">Job 0 of 0</span>
+          <span id="ua-sb-proc" style="font-size:11px;font-weight:600;color:#4ea1ff">Processing…</span>
+        </div>
+        <div style="margin-top:7px;height:5px;border-radius:4px;background:#2a2a2d;overflow:hidden"><div id="ua-sb-bar" style="height:100%;width:0%;border-radius:4px;background:linear-gradient(90deg,#00a86b,#00e58f);transition:width .4s"></div></div>
+      </div>
+      <button id="ua-sb-start" style="${greenBtn}">Start Applying</button>
+      <button id="ua-sb-stop" style="${greenBtn};background:#000;color:#fff;border:1px solid #2c2c30;display:none">Stop</button>
+      <div id="ua-sb-runrow" style="display:none;gap:8px;margin-top:8px">
+        <button id="ua-sb-pause" style="${ghostBtn};flex:1">Pause</button>
+        <button id="ua-sb-skip" style="${ghostBtn};flex:1">Skip</button>
+      </div>
+      <div style="margin-top:8px;font-size:10px;color:#6f6f76;line-height:1.4">CSV / list of job URLs → opens each, runs Jobright Autofill, fills required fields &amp; submits automatically.</div>
+    `;
+    // --- wire events (engine functions are in this same scope) ---
+    const fileInput = wrap.querySelector('#ua-sb-file');
+    wrap.querySelector('#ua-sb-upload').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', e => { if (e.target.files[0]) { handleFile(e.target.files[0]); e.target.value = ''; } });
+    const pasteWrap = wrap.querySelector('#ua-sb-paste-wrap');
+    wrap.querySelector('#ua-sb-paste-toggle').addEventListener('click', () => {
+      pasteWrap.style.display = pasteWrap.style.display === 'none' ? 'block' : 'none';
+      if (pasteWrap.style.display === 'block') wrap.querySelector('#ua-sb-textarea').focus();
+    });
+    wrap.querySelector('#ua-sb-add').addEventListener('click', async () => {
+      const ta = wrap.querySelector('#ua-sb-textarea');
+      const urls = parseBulkUrls(ta.value);
+      if (!urls.length) { alert('No valid URLs found.'); return; }
+      for (const u of urls) await addJob(u);
+      ta.value = ''; pasteWrap.style.display = 'none';
+      LOG(`Added ${urls.length} URLs from sidebar`);
+    });
+    wrap.querySelector('#ua-sb-start').addEventListener('click', () => { if (!queue.some(j => j.status === 'pending')) { alert('Queue is empty — upload a CSV or paste job URLs first.'); return; } startQ(); });
+    wrap.querySelector('#ua-sb-stop').addEventListener('click', stopQ);
+    wrap.querySelector('#ua-sb-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
+    wrap.querySelector('#ua-sb-skip').addEventListener('click', skipJob);
+    const tailorCb = wrap.querySelector('#ua-sb-tailor');
+    tailorCb.checked = queueUseTailor;
+    tailorCb.addEventListener('change', () => { queueUseTailor = tailorCb.checked; try { st.set('ua_queue_tailor', queueUseTailor); } catch (_) {} LOG('Queue tailoring ' + (queueUseTailor ? 'ON' : 'OFF')); });
+    _sbSection = wrap;
+    return wrap;
+  }
+
+  // Ensure the bulk-apply section is present inside the native sidebar; React
+  // re-renders can detach it, so we re-append the same node (preserves state).
+  function injectSidebarUI() {
+    const root = findSidebarRoot();
+    if (!root) return;
+    const sec = buildSidebarSection();
+    // Already attached — do nothing here (state is synced by updateCtrl on real
+    // events). Avoids a feedback loop with the childList MutationObserver.
+    if (sec.isConnected && root.contains(sec)) return;
+    const anchor = root.querySelector('.autofill-button-group') ||
+      root.querySelector('.job-profile-container') ||
+      (root.querySelector('.auto-fill-button') && root.querySelector('.auto-fill-button').parentElement);
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(sec, anchor.nextSibling);
+    else root.appendChild(sec);
+    updateSidebarUI();
+  }
+
+  function updateSidebarUI() {
+    if (!_sbSection) return;
+    const q = (id) => _sbSection.querySelector(id);
+    const pending = queue.filter(j => j.status === 'pending').length;
+    const cnt = q('#ua-sb-count'); if (cnt) cnt.textContent = `${queue.length} job${queue.length === 1 ? '' : 's'}`;
+    const tailorCb = q('#ua-sb-tailor'); if (tailorCb && tailorCb.checked !== queueUseTailor) tailorCb.checked = queueUseTailor;
+    const start = q('#ua-sb-start'), stop = q('#ua-sb-stop'), runrow = q('#ua-sb-runrow'), status = q('#ua-sb-status');
+    if (qActive) {
+      if (start) start.style.display = 'none';
+      if (stop) stop.style.display = 'block';
+      if (runrow) runrow.style.display = 'flex';
+      if (status) status.style.display = 'block';
+      const total = queue.length;
+      const dn = queue.filter(j => ['done', 'failed', 'timeout', 'skipped'].includes(j.status)).length;
+      const current = queue.find(j => j.status === 'applying') || queue.find(j => j.status === 'pending');
+      const curIndex = current ? queue.indexOf(current) + 1 : total;
+      const job = q('#ua-sb-job'); if (job) job.textContent = `Job ${Math.min(curIndex, total)} of ${total}`;
+      const bar = q('#ua-sb-bar'); if (bar) bar.style.width = (total ? Math.round((dn / total) * 100) : 0) + '%';
+      const proc = q('#ua-sb-proc'); if (proc) proc.textContent = qPaused ? 'Paused' : 'Processing…';
+      const pause = q('#ua-sb-pause'); if (pause) pause.textContent = qPaused ? 'Resume' : 'Pause';
+    } else {
+      if (start) { start.style.display = 'block'; start.textContent = pending ? `Start Applying (${pending})` : 'Start Applying'; start.style.opacity = pending ? '1' : '.55'; }
+      if (stop) stop.style.display = 'none';
+      if (runrow) runrow.style.display = 'none';
+      if (status) status.style.display = 'none';
+    }
+  }
+
   function updateCtrl() {
+    updateSidebarUI(); // keep the in-native-sidebar bulk-apply controls in sync
     const ctrl = document.getElementById('ua-ctrl');
     if (!ctrl) return;
     const pauseBtn = document.getElementById('uc-pause');
@@ -5064,7 +5202,19 @@
   function showATSBadge() { const a = detectATS(); if (a) { document.getElementById('ua-ats-n').textContent = a + ' Detected'; document.getElementById('ua-ats').classList.add('show'); } }
 
   // ===================== OBSERVER =====================
-  function observe() { const o = new MutationObserver(() => hideCredits()); o.observe(document.body || document.documentElement, { childList: true, subtree: true }); }
+  let _sbInjectThrottle = 0;
+  function observe() {
+    const o = new MutationObserver(() => {
+      hideCredits();
+      // Re-attach the in-sidebar bulk-apply UI when Jobright (re)renders its panel.
+      const now = Date.now();
+      if (now - _sbInjectThrottle > 400) { _sbInjectThrottle = now; injectSidebarUI(); }
+    });
+    o.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    // Safety net: periodic re-inject in case the sidebar mounts without mutations
+    // we observed (e.g. inside a shadow root). Cheap — one querySelector per tick.
+    setInterval(injectSidebarUI, 1500);
+  }
 
   // ===================== ATS DISPATCHER =====================
   async function dispatchATSAutomation() {
@@ -5104,7 +5254,7 @@
     if (typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
     await load(); await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
-    observe(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
+    observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
     // Update answer bank count in UI
     const ansCntEl = document.getElementById('ua-ans-cnt');
     if (ansCntEl) ansCntEl.textContent = `(${Object.keys(_answerBank).length} answers)`;
@@ -6735,10 +6885,15 @@ Result: Shipped my first production change in week three and my notes doc became
   // ---------- 2. fetch() interception ----------
   const JOBRIGHT_HOST_RE = /(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i;
   const JOBRIGHT_PATH_RE = /(user|account|profile|me|subscription|membership|plan|credit|quota|usage|limit|entitlement|permission|feature|billing|paywall|tier|premium)/i;
+  // Resume-generation / tailoring / cover-letter / upload endpoints must NEVER be
+  // rewritten — the recursive PRO-profile merge can corrupt their payloads and leave
+  // "Generate Custom Resume + Autofill" stuck on "Opening resume generator…".
+  const PATCH_EXCLUDE_RE = /(resume|tailor|cover.?letter|generat|optimi[sz]e|upload|file|document|preview|download|pdf|swan|template|render)/i;
   function shouldPatchUrl(url) {
     try {
       const u = new URL(url, location.href);
       if (!JOBRIGHT_HOST_RE.test(u.hostname)) return false;
+      if (PATCH_EXCLUDE_RE.test(u.pathname)) return false;
       return JOBRIGHT_PATH_RE.test(u.pathname);
     } catch (_) { return false; }
   }
