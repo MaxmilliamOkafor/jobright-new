@@ -7104,21 +7104,20 @@ Result: Shipped my first production change in week three and my notes doc became
   // longer restyle it (no font override, no button-spacing tweaks). We only keep the
   // paywall/upgrade-chrome hiding so upsell modals can't interrupt unattended automation.
   const SIDEBAR_CSS = `
-/* Native 1.14.0 sidebar look preserved — only upsell/paywall chrome is hidden so it
-   cannot block the fully-automated queue. Scoped to the Jobright sidebar shadow root. */
-[class*="credit" i],
-[class*="upgrade" i],
+/* Native 1.14.0 sidebar look preserved. Hide ONLY real upsell/paywall chrome —
+   never functional controls. The broad [class*="credit"] match was removed because
+   it also hit Jobright's own ".autofill-button-group--with-credit" (the Autofill +
+   Generate buttons). We now target the specific credit classes + upsell links, and
+   any [class*="credit"] match explicitly excludes autofill/button/group elements. */
+.autofill-credit-row,
+.autofill-credit-text,
+.autofill-credit-text-right,
+.payment-entry,
+.plugin-setting-credits-tip,
+[class*="credit" i]:not([class*="autofill" i]):not([class*="auto-fill" i]):not([class*="button" i]):not([class*="group" i]),
 [class*="paywall" i],
-[class*="turbo" i],
 [class*="get-unlimited" i],
 [class*="getUnlimited" i],
-[data-testid*="credit" i],
-[data-testid*="upgrade" i],
-[data-testid*="paywall" i],
-[data-testid*="turbo" i],
-[aria-label*="credit" i],
-[aria-label*="upgrade" i],
-[aria-label*="turbo" i],
 a[href*="/pricing" i],
 a[href*="/upgrade" i],
 a[href*="/billing" i],
