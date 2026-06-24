@@ -3513,16 +3513,28 @@
   // LazyApply-inspired: configurable delays and timeout
   const QUEUE_DELAYS = { 1: 2000, 1.5: 1500, 2: 1000, 3: 500 };
   let qSpeed = 1;
-  let qTimeout = 90000; // 90s timeout per job (LazyApply default ~60s, we're more generous)
+  let qTimeout = 150000; // 150s hard cap per job — enough for the fill→submit→verify→retry loop; protects against truly stuck pages (captcha/login)
   let _qTimeoutId = null;
+
+  // Are we on the page for the currently-applying job? Match the queued URL, OR
+  // accept any page that now shows an application form / Apply button — because
+  // clicking "Apply" often navigates us to an external ATS form whose URL differs
+  // from the imported listing URL. Without this the queue would skip mid-apply.
+  function onCurrentJobPage(c) {
+    try {
+      const p = new URL(c.url).pathname;
+      if (location.href.includes(p.slice(0, Math.min(p.length, 25)))) return true;
+    } catch (_) {}
+    try { if (new URL(c.url).hostname === location.hostname) return true; } catch (_) {}
+    return hasApplicationForm() || hasApplyButton();
+  }
 
   async function processQ() {
     if (!qActive || qPaused || !queue.length) return;
     const c = queue.find(j => j.status === 'applying');
     if (c) {
       try {
-        const p = new URL(c.url).pathname;
-        if (location.href.includes(p.slice(0, Math.min(p.length, 25)))) {
+        if (onCurrentJobPage(c)) {
           // LazyApply: start timeout timer — auto-skip if job stalls
           clearTimeout(_qTimeoutId);
           _qTimeoutId = setTimeout(async () => {
@@ -3536,34 +3548,53 @@
             goNext();
           }, qTimeout);
 
-          // Run ATS-specific flow
-          await withRetry(async () => {
-            await dispatchATSAutomation();
-          }, 'Queue job automation');
-
-          // Clear timeout — job completed normally
-          clearTimeout(_qTimeoutId);
-
-          // Wait and check success
+          // Drive the application to a CONFIRMED submission before moving on.
+          // The user requirement: each job must be fully autofilled AND submitted
+          // before the queue advances. We attempt fill+submit, verify, and retry
+          // (re-opening the form / filling gaps / re-submitting) until confirmed or
+          // the per-job timeout fires. Only a confirmed submission counts as done.
           let success = false;
-          for (let check = 0; check < 3; check++) {
-            await sleep(2000);
-            if (checkSuccess()) { success = true; break; }
+          for (let attempt = 0; attempt < 3 && !success; attempt++) {
+            await withRetry(async () => { await dispatchATSAutomation(); }, 'Queue job automation');
+            // Verify submission (poll for a confirmation signal).
+            for (let check = 0; check < 6; check++) {
+              await sleep(2000);
+              if (checkSuccess()) { success = true; break; }
+            }
+            if (success) break;
+            // Not confirmed — fill any remaining gaps and force another submit.
+            LOG(`Submission not confirmed (attempt ${attempt + 1}/3) — retrying fill + submit`);
+            try {
+              await openApplicationForm();
+              await fallbackFill();
+              await guaranteeRequiredFields();
+              const r = await autoSubmitOrNext();
+              if (r === 'next_page') { await sleep(2500); await multiPageLoop(); }
+            } catch (e) { LOG('Retry pass error:', e?.message || e); }
+            for (let check = 0; check < 4; check++) {
+              await sleep(2000);
+              if (checkSuccess()) { success = true; break; }
+            }
           }
 
-          // LazyApply-enhanced status tracking
+          // Clear timeout — job finished (confirmed or exhausted retries)
+          clearTimeout(_qTimeoutId);
+
           c.completedAt = Date.now();
           c.duration = c.completedAt - (c.startedAt || c.completedAt);
           if (success) {
             c.status = 'done';
             qStats.completed++;
-            LOG('Queue job completed successfully');
+            LOG('Queue job: submission CONFIRMED');
             await recordApplication(c.url, c.title, 'applied', c.jobBoard, c.duration);
           } else {
-            c.status = 'done';
-            qStats.completed++;
-            LOG('Queue job completed (success not confirmed)');
-            await recordApplication(c.url, c.title, 'completed', c.jobBoard, c.duration);
+            // Could not confirm submission — mark failed (not a false "done") so the
+            // user can see it didn't complete, and don't silently skip it as applied.
+            c.status = 'failed';
+            c.error = 'Could not confirm submission after retries';
+            qStats.failed++;
+            LOG('Queue job: submission NOT confirmed after retries — marked failed');
+            await recordApplication(c.url, c.title, 'failed', c.jobBoard, c.duration);
           }
           qStats.totalTime += c.duration;
 
@@ -5088,6 +5119,23 @@
       tick();
     });
   }
+  // Best-effort: make sure the Jobright sidebar is visible/expanded during a run,
+  // and re-show our own control overlay. The host may have been hidden (display:none)
+  // by a previous toggle, or Jobright may have collapsed the panel.
+  function forceOpenSidebar() {
+    try {
+      const s = getSidebar();
+      if (s) {
+        const host = (s.getRootNode && s.getRootNode().host) || null;
+        if (host && host.style && host.style.display === 'none') host.style.display = '';
+        // Expand if collapsed (click the collapse/expand toggle when it reads collapsed).
+        const expandBtn = s.querySelector('.toggle-handler[aria-expanded="false"]');
+        if (expandBtn && isVisible(expandBtn)) realClick(expandBtn);
+      }
+      const ctrl = document.getElementById('ua-ctrl');
+      if (ctrl && qActive) ctrl.classList.add('show');
+    } catch (_) {}
+  }
 
   function buildSidebarSection() {
     if (_sbSection) return _sbSection;
@@ -5114,6 +5162,13 @@
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none">
         <input type="checkbox" id="ua-sb-tailor" style="accent-color:#00f0a0;width:14px;height:14px"> Tailor resume for each job <span style="color:#6f6f76">(slower)</span>
       </label>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:11px">
+        <span style="font-size:11px;font-weight:600;color:#bfbfc4">Speed:</span>
+        <button class="ua-sb-sp" data-sp="1" style="min-width:30px;height:24px;border-radius:12px;border:1px solid #fff;background:#fff;color:#0e0e0f;font-size:11px;font-weight:700;cursor:pointer">1x</button>
+        <button class="ua-sb-sp" data-sp="1.5" style="min-width:30px;height:24px;border-radius:12px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:600;cursor:pointer">1.5x</button>
+        <button class="ua-sb-sp" data-sp="2" style="min-width:30px;height:24px;border-radius:12px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:600;cursor:pointer">2x</button>
+        <button class="ua-sb-sp" data-sp="3" style="min-width:30px;height:24px;border-radius:12px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:600;cursor:pointer">3x</button>
+      </div>
       <div id="ua-sb-status" style="display:none;margin-bottom:9px">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <span id="ua-sb-job" style="font-size:12px;font-weight:600;color:#e7e7ea">Job 0 of 0</span>
@@ -5153,6 +5208,23 @@
     const tailorCb = wrap.querySelector('#ua-sb-tailor');
     tailorCb.checked = queueUseTailor;
     tailorCb.addEventListener('change', () => { queueUseTailor = tailorCb.checked; try { st.set('ua_queue_tailor', queueUseTailor); } catch (_) {} LOG('Queue tailoring ' + (queueUseTailor ? 'ON' : 'OFF')); });
+    // Speed selector (shared with the overlay; controls inter-job delay).
+    const paintSpeed = () => wrap.querySelectorAll('.ua-sb-sp').forEach(b => {
+      const on = parseFloat(b.dataset.sp) === qSpeed;
+      b.style.background = on ? '#fff' : 'transparent';
+      b.style.color = on ? '#0e0e0f' : '#bfbfc4';
+      b.style.borderColor = on ? '#fff' : '#34343a';
+      b.style.fontWeight = on ? '700' : '600';
+    });
+    wrap.querySelectorAll('.ua-sb-sp').forEach(b => b.addEventListener('click', () => {
+      qSpeed = parseFloat(b.dataset.sp) || 1;
+      try { st.set('ua_q_speed', qSpeed); } catch (_) {}
+      paintSpeed();
+      const ov = document.getElementById('ua-ctrl');
+      if (ov) ov.querySelectorAll('.uc-sp').forEach(x => x.classList.toggle('active', parseFloat(x.dataset.sp) === qSpeed));
+      LOG('Queue speed set to ' + qSpeed + 'x');
+    }));
+    paintSpeed();
     _sbSection = wrap;
     return wrap;
   }
@@ -5180,6 +5252,12 @@
     const pending = queue.filter(j => j.status === 'pending').length;
     const cnt = q('#ua-sb-count'); if (cnt) cnt.textContent = `${queue.length} job${queue.length === 1 ? '' : 's'}`;
     const tailorCb = q('#ua-sb-tailor'); if (tailorCb && tailorCb.checked !== queueUseTailor) tailorCb.checked = queueUseTailor;
+    _sbSection.querySelectorAll('.ua-sb-sp').forEach(b => {
+      const on = parseFloat(b.dataset.sp) === qSpeed;
+      b.style.background = on ? '#fff' : 'transparent';
+      b.style.color = on ? '#0e0e0f' : '#bfbfc4';
+      b.style.borderColor = on ? '#fff' : '#34343a';
+    });
     const start = q('#ua-sb-start'), stop = q('#ua-sb-stop'), runrow = q('#ua-sb-runrow'), status = q('#ua-sb-status');
     if (qActive) {
       if (start) start.style.display = 'none';
@@ -5271,8 +5349,59 @@
     setInterval(injectSidebarUI, 1500);
   }
 
+  // ===================== APPLY-BUTTON OPENER (reveal the form on listing pages) =====================
+  // Many imported CSV URLs point at a job listing/description, where you must click
+  // "Apply" / "Apply Now" / "Easy Apply" before any form exists. Without this the
+  // queue lands on the listing, finds no fields, and times out. We click through to
+  // the actual application form first.
+  function hasApplicationForm() {
+    const hasFile = $$('input[type=file]').some(isVisible);
+    if (hasFile) return true;
+    const fields = $$('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]):not([type=checkbox]):not([type=radio]),textarea,select').filter(isVisible);
+    return fields.length >= 3;
+  }
+  const APPLY_TEXT_RE = /^(apply now|apply for this job|apply to this job|apply online|easy apply|quick apply|apply with|i'?m interested|start (your )?application|begin application|continue application|apply)\b/i;
+  const APPLY_BAD_RE = /already applied|how to apply|apply filter|save job|sign ?in|log ?in|create account|^applied$/i;
+  function findApplyButton() {
+    const known = ['.jobs-apply-button', 'button.jobs-apply-button--top-card', '#indeedApplyButton',
+      '#applyButtonLinkContainer a', 'button[data-testid*="apply" i]', 'a[data-testid*="apply" i]',
+      '[class*="apply-button" i]', 'button[aria-label*="apply" i]', 'a[aria-label*="apply" i]'];
+    for (const sel of known) { const el = $(sel); if (el && isVisible(el) && !el.disabled && !APPLY_BAD_RE.test((el.textContent || '').trim())) return el; }
+    const cands = $$('button,a[role="button"],a,[role="button"],input[type=button],input[type=submit]').filter(isVisible);
+    return cands.find(b => {
+      const t = (b.textContent || b.value || '').trim();
+      return t.length > 0 && t.length < 40 && APPLY_TEXT_RE.test(t) && !APPLY_BAD_RE.test(t) && !b.disabled;
+    }) || null;
+  }
+  function hasApplyButton() { return !!findApplyButton(); }
+  async function waitForFormOrModal(ms) {
+    const dl = Date.now() + (ms || 9000);
+    while (Date.now() < dl) { if (hasApplicationForm()) return true; await sleep(400); }
+    return hasApplicationForm();
+  }
+  async function openApplicationForm(maxClicks) {
+    const limit = maxClicks || 2;
+    let clicks = 0;
+    while (clicks < limit) {
+      if (hasApplicationForm()) return clicks > 0;
+      const btn = findApplyButton();
+      if (!btn) return clicks > 0;
+      // Keep apply links in the same tab so the queue can drive the form.
+      if (btn.tagName === 'A' && btn.target === '_blank') btn.target = '_self';
+      LOG('Opening application form — clicking Apply: ' + (btn.textContent || btn.value || '').trim().slice(0, 30));
+      btn.scrollIntoView?.({ block: 'center' });
+      realClick(btn);
+      clicks++;
+      await waitForFormOrModal(9000);
+      await sleep(1200);
+    }
+    return clicks > 0;
+  }
+
   // ===================== ATS DISPATCHER =====================
   async function dispatchATSAutomation() {
+    // Reveal the application form first if we're on a listing/landing page.
+    await openApplicationForm();
     const url = location.href;
     if (isWorkday()) return await workdayAutomation();
     if (/greenhouse\.io|boards\.greenhouse/i.test(url)) return await greenhouseAutomation();
@@ -5300,16 +5429,20 @@
   // ===================== INIT =====================
   async function init() {
     if (window.self !== window.top) return;
-    // Master gate: don't mount the sidebar UI, MutationObserver, or 5s
-    // form-analysis interval on non-application pages. Without this, sites like
-    // hiring.cafe that re-render thousands of DOM nodes per second freeze
-    // because `hideCredits()` walks `document.querySelectorAll('*')` twice on
-    // every mutation. The gate is defined in a later IIFE; if it isn't loaded
-    // yet, default to running (matches prior behaviour).
-    if (typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
-    await load(); await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
+    // Load queue state FIRST so we know whether a bulk run is in progress.
+    await load();
+    // Master gate: don't mount the sidebar UI / observers on heavy non-application
+    // pages. BUT never skip when a queue is running — we must mount the controls
+    // and drive automation on every imported job URL (listing pages included,
+    // where we click "Apply" to reveal the form). Skipping was the #1 reason the
+    // CSV queue "did nothing" on many sites.
+    if (!qActive && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
+    await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
+    // When a queue is active, keep Jobright's own sidebar open and our control
+    // overlay visible for the whole run.
+    if (qActive) { forceOpenSidebar(); updateCtrl(); }
     // Update answer bank count in UI
     const ansCntEl = document.getElementById('ua-ans-cnt');
     if (ansCntEl) ansCntEl.textContent = `(${Object.keys(_answerBank).length} answers)`;

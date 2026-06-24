@@ -51,9 +51,15 @@ you'll see the **⚡ Bulk Auto-Apply** card. Then:
 The queue then, for each imported URL:
 
 1. Navigates to the job page,
-2. Runs **Jobright autofill** (tailor → autofill),
-3. Fills any gaps + commits location/required fields,
-4. **Submits**, and moves to the next job automatically.
+2. Clicks **Apply / Apply Now / Easy Apply** if needed to open the application form,
+3. Runs **Jobright autofill**,
+4. Fills any gaps + commits location/required fields,
+5. **Submits and verifies the submission was confirmed** — retrying fill+submit if
+   not — *before* moving to the next job. A job only counts as done once submission
+   is confirmed; otherwise it's marked **failed** (not a false "applied").
+
+The control panel stays open for the whole run (it mounts on every job page, including
+listing pages), so you always see progress and can Pause / Skip / Quit / change Speed.
 
 ### Automation panel (matches 1.14.0)
 
