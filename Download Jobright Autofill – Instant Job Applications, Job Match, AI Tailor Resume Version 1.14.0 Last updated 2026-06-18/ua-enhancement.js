@@ -1349,7 +1349,7 @@
     }
 
     // Also try Jobright's continue-button
-    const jrContinue = $('.continue-button:not(.continue-button-disabled)');
+    const jrContinue = pageOrSidebar('.continue-button:not(.continue-button-disabled)');
     if (jrContinue && isVisible(jrContinue)) {
       LOG('Clicking Jobright continue button');
       await sleep(500);
@@ -1410,8 +1410,8 @@
     if (!ats) return;
     LOG(`Tailor-first flow starting for ${ats}...`);
 
-    // Wait for Jobright sidebar to load
-    const sidebar = await waitFor('#jobright-helper-id', 15000);
+    // Wait for Jobright sidebar to load (shadow-aware)
+    const sidebar = await waitForSidebar(15000);
     if (!sidebar) { LOG('Jobright sidebar not found — falling back to direct autofill'); await directAutofillFlow(); return; }
     await sleep(2000);
 
@@ -3296,8 +3296,8 @@
     });
     if (!fileInputs.length) return false;
 
-    // Check if Jobright sidebar has a resume ready
-    const sidebar = $('#jobright-helper-id');
+    // Check if Jobright sidebar has a resume ready (shadow-aware)
+    const sidebar = getSidebar();
     if (!sidebar) return false;
 
     // Look for "Download Resume" or similar button in sidebar
@@ -3481,28 +3481,31 @@
   }
 
   // ===================== AUTOFILL TRIGGER =====================
+  // Shadow-DOM aware: 1.14.0 renders the sidebar inside an open shadow root, so we
+  // locate the button via getSidebar()/findAutofillButton() rather than document.
   async function triggerAutofill() {
-    await waitFor('#jobright-helper-id', 8000);
+    await waitForSidebar(8000);
     await sleep(1500);
-    let b = $('.auto-fill-button');
-    if (b && !b.disabled) { realClick(b); LOG('Autofill button clicked'); return true; }
-    await sleep(3000);
-    b = $('.auto-fill-button');
-    if (b && !b.disabled) { realClick(b); LOG('Autofill button clicked (retry)'); return true; }
-    LOG('Autofill button not found or disabled');
+    // Try several times — the button may still be mounting / disabled while the
+    // sidebar hydrates. This is the click that was silently failing in 1.14.0.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const b = findAutofillButton();
+      if (b && !b.disabled && isVisible(b)) { realClick(b); LOG(`Autofill button clicked (attempt ${attempt + 1})`); return true; }
+      await sleep(attempt === 0 ? 1500 : 2500);
+    }
+    LOG('Autofill button not found or disabled (shadow-aware lookup)');
     return false;
   }
 
   // Quick autofill trigger with shorter timeout (won't freeze the flow)
   async function triggerAutofillQuick() {
-    const sidebar = $('#jobright-helper-id');
-    if (!sidebar) { LOG('No sidebar — skipping quick autofill'); return false; }
-    const b = sidebar.querySelector('.auto-fill-button');
+    let b = findAutofillButton();
+    if (!b) { LOG('No sidebar/autofill button — skipping quick autofill'); return false; }
     if (b && !b.disabled) { realClick(b); LOG('Quick autofill triggered'); await sleep(3000); return true; }
     // One retry after 1.5s
     await sleep(1500);
-    const b2 = sidebar.querySelector('.auto-fill-button');
-    if (b2 && !b2.disabled) { realClick(b2); LOG('Quick autofill triggered (retry)'); await sleep(3000); return true; }
+    b = findAutofillButton();
+    if (b && !b.disabled) { realClick(b); LOG('Quick autofill triggered (retry)'); await sleep(3000); return true; }
     return false;
   }
 
@@ -5024,14 +5027,66 @@
   // node and re-attach it whenever React re-renders the sidebar, so it never vanishes.
   let _sbSection = null;
 
-  function findSidebarRoot() {
-    let el = document.getElementById('jobright-helper-id');
-    if (el) return el;
+  // Jobright 1.14.0 mounts its sidebar inside an OPEN Shadow DOM (plasmo-csui →
+  // attachShadow). document.querySelector cannot pierce it, so the autofill button
+  // lookups must walk shadow roots. getSidebar() returns the sidebar container
+  // element (light or shadow) and caches it until it disconnects.
+  let _sidebarCache = null;
+  function getSidebar() {
+    if (_sidebarCache && _sidebarCache.isConnected) return _sidebarCache;
+    _sidebarCache = null;
+    // 1. Light DOM (older builds)
+    const light = document.getElementById('jobright-helper-id');
+    if (light) { _sidebarCache = light; return light; }
+    // 2. Known Plasmo hosts (fast path)
     for (const host of $$('plasmo-csui,[id*="plasmo"],[class*="plasmo"]')) {
       const r = host.shadowRoot;
-      if (r) { const inner = r.querySelector('#jobright-helper-id,.jobright-helper-content-container'); if (inner) return inner; }
+      if (r) {
+        const inner = r.querySelector('#jobright-helper-id,.jobright-helper-content-container');
+        if (inner) { _sidebarCache = inner; return inner; }
+      }
+    }
+    // 3. Bounded deep walk of every open shadow root (robust fallback)
+    const stack = [document.documentElement];
+    let guard = 0;
+    while (stack.length && guard++ < 40000) {
+      const node = stack.pop();
+      if (!node) continue;
+      const sr = node.shadowRoot;
+      if (sr) {
+        const inner = sr.querySelector('#jobright-helper-id,.jobright-helper-content-container');
+        if (inner) { _sidebarCache = inner; return inner; }
+        const afb = sr.querySelector('.auto-fill-button');
+        // Return a node INSIDE the shadow tree (never the host — its querySelector
+        // can't see into its own shadow root).
+        if (afb) { _sidebarCache = afb.closest('#jobright-helper-id,.jobright-helper-content-container') || afb.parentElement; return _sidebarCache; }
+        for (const c of sr.children) stack.push(c);
+      }
+      const kids = node.children;
+      if (kids) for (const c of kids) stack.push(c);
     }
     return null;
+  }
+  // Back-compat alias used by the in-sidebar UI injector.
+  function findSidebarRoot() { return getSidebar(); }
+  // Query inside the sidebar (pierces shadow because we start from a node in its tree).
+  function sbQuery(sel) { const s = getSidebar(); return s && s.querySelector ? s.querySelector(sel) : null; }
+  // The Jobright "Autofill" button, wherever it lives.
+  function findAutofillButton() { return sbQuery('.auto-fill-button'); }
+  // Resolve a selector against the page first, then the sidebar shadow tree.
+  function pageOrSidebar(sel) { return document.querySelector(sel) || sbQuery(sel); }
+  // Wait until the Jobright sidebar exists (shadow-aware).
+  function waitForSidebar(ms) {
+    return new Promise(res => {
+      const dl = Date.now() + (ms || 10000);
+      const tick = () => {
+        const s = getSidebar();
+        if (s) return res(s);
+        if (Date.now() > dl) return res(null);
+        setTimeout(tick, 300);
+      };
+      tick();
+    });
   }
 
   function buildSidebarSection() {
@@ -7104,21 +7159,20 @@ Result: Shipped my first production change in week three and my notes doc became
   // longer restyle it (no font override, no button-spacing tweaks). We only keep the
   // paywall/upgrade-chrome hiding so upsell modals can't interrupt unattended automation.
   const SIDEBAR_CSS = `
-/* Native 1.14.0 sidebar look preserved — only upsell/paywall chrome is hidden so it
-   cannot block the fully-automated queue. Scoped to the Jobright sidebar shadow root. */
-[class*="credit" i],
-[class*="upgrade" i],
+/* Native 1.14.0 sidebar look preserved. Hide ONLY real upsell/paywall chrome —
+   never functional controls. The broad [class*="credit"] match was removed because
+   it also hit Jobright's own ".autofill-button-group--with-credit" (the Autofill +
+   Generate buttons). We now target the specific credit classes + upsell links, and
+   any [class*="credit"] match explicitly excludes autofill/button/group elements. */
+.autofill-credit-row,
+.autofill-credit-text,
+.autofill-credit-text-right,
+.payment-entry,
+.plugin-setting-credits-tip,
+[class*="credit" i]:not([class*="autofill" i]):not([class*="auto-fill" i]):not([class*="button" i]):not([class*="group" i]),
 [class*="paywall" i],
-[class*="turbo" i],
 [class*="get-unlimited" i],
 [class*="getUnlimited" i],
-[data-testid*="credit" i],
-[data-testid*="upgrade" i],
-[data-testid*="paywall" i],
-[data-testid*="turbo" i],
-[aria-label*="credit" i],
-[aria-label*="upgrade" i],
-[aria-label*="turbo" i],
 a[href*="/pricing" i],
 a[href*="/upgrade" i],
 a[href*="/billing" i],
