@@ -36,12 +36,16 @@ the only addition is a separate automation panel that matches its look.
 
 ## Upload a CSV and auto-apply
 
-1. Click the floating Jobright/automation button to open the queue drawer.
-2. In **Job Queue**, either:
-   - **Drop a CSV** (or `.txt` / `.tsv`) onto the drop zone, or click to browse, **or**
-   - **Paste multiple job URLs** into the URL box (one per line / comma / tab separated).
+The bulk-apply controls live **inside the native Jobright sidebar** (under the
+Autofill buttons) — no separate popup window. Open Jobright on any job/ATS page and
+you'll see the **⚡ Bulk Auto-Apply** card. Then:
+
+1. **Upload CSV** (`.csv` / `.txt` / `.tsv`) **or** click **Paste URLs** and paste a
+   list (one job URL per line / comma / tab separated).
    - CSV format: one job URL per row. A header row (`url`, `link`, `job`, …) is
      auto-skipped. Extra columns (title, company, status) are ignored.
+2. (Optional) tick **Tailor resume for each job** — off by default for speed and
+   reliability (see note below).
 3. Click **Start Applying**.
 
 The queue then, for each imported URL:
@@ -77,5 +81,12 @@ continues from where it left off.
 - Supports 150+ ATS platforms (Workday, Greenhouse, Lever, SmartRecruiters, iCIMS,
   Ashby, Workable, LinkedIn/Indeed Easy Apply, and more) plus multi-page forms.
 - Each job has a 90s timeout — if a page stalls it auto-skips so the queue keeps moving.
-- Review your profile under the drawer's profile panel before a large run so the
-  autofill values (name, phone, **city**, work authorization, etc.) are correct.
+- Review your profile in Jobright's **Your Autofill Information** before a large run so
+  the autofill values (name, phone, **city**, work authorization, etc.) are correct.
+- **Reliability:** the queue uses the plain **Autofill** path by default. The
+  "Generate Custom Resume + Autofill" combo depends on Jobright's resume generator and
+  can hang on *"Opening resume generator…"*, so it isn't used automatically unless you
+  tick **Tailor resume for each job**. The credit/quota unlock no longer touches
+  resume/cover-letter endpoints, so the generator's own responses aren't altered.
+- An optional advanced panel (profile editor, saved responses, application history) is
+  still available via the floating button, but it's no longer required for bulk applying.
