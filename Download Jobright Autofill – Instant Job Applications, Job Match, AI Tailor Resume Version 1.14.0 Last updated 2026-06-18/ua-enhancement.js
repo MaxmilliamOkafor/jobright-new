@@ -3628,10 +3628,17 @@
     if (!isWorkday()) return false;
     const pwFields = $$('input[type=password]').filter(isVisible);
     if (!pwFields.length) return false; // not on a create-account / sign-in page
-    const p = await getProfile();
-    const email = p.email || '';
+    // Same locked credentials for every account/application.
+    const email = await getAppEmail();
     const pw = await getAppPassword();
     if (!email) return false;
+    // If this tenant already has an account, switch to Sign In and use the same creds.
+    const knownHost = await accountExistsFor(location.hostname);
+    if (knownHost) {
+      const signInToggle = $$('button,a,[role="button"]').filter(isVisible)
+        .find(b => /^(sign ?in|log ?in|already have an account)/i.test((b.textContent || '').trim()));
+      if (signInToggle && $$('input[type=password]').filter(isVisible).length > 1) { realClick(signInToggle); await sleep(1200); }
+    }
     // The fields may already be visually filled but NOT registered by Workday, so
     // for the first few passes we always re-type them with the reliable method.
     const force = _wdFillPasses < 3;
@@ -3641,7 +3648,7 @@
       $$('input[type=email],input[type=text]').filter(isVisible)
         .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
     if (emailField && (force || !emailField.value)) { reactTypeValue(emailField, email); did = true; await sleep(180); }
-    for (const f of pwFields) { if (force || !f.value) { reactTypeValue(f, pw); did = true; await sleep(180); } }
+    for (const f of $$('input[type=password]').filter(isVisible)) { if (force || !f.value) { reactTypeValue(f, pw); did = true; await sleep(180); } }
     // Agree to Privacy Notice / consent checkboxes
     $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
     if (submit && !_wdAccountSubmitted) {
@@ -3649,11 +3656,13 @@
       for (let i = 0; i < 8; i++) {
         const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])');
         if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-          LOG('Workday: submitting Create Account with saved credentials');
+          LOG('Workday: submitting account with the same saved credentials');
           _wdAccountSubmitted = true;
           btn.scrollIntoView?.({ block: 'center' });
           await sleep(150);
           clickEl(btn);
+          // Remember this tenant so future visits sign in with the same creds.
+          markAccountCreated(location.hostname);
           await sleep(2500);
           break;
         }
@@ -5562,7 +5571,7 @@
       const pw = pwInput.value.trim();
       try {
         if (pw) await st.set('ua_app_password', pw);
-        if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); }
+        if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); await st.set('ua_app_email', em); }
       } catch (_) {}
       maskPw(); // re-hide the password after saving, for safety
       const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
@@ -5849,6 +5858,21 @@
     if (!pw) { pw = generateStrongPassword(); await st.set('ua_app_password', pw); LOG('Generated & saved a reusable ATS account password'); }
     return pw;
   }
+  // Lock the email after first use so the SAME credentials are reused for every
+  // future account/application (even if the profile email later changes).
+  async function getAppEmail() {
+    let e = await st.get('ua_app_email');
+    if (!e) { e = ((await getProfile()).email || '').trim(); if (e) await st.set('ua_app_email', e); }
+    return e;
+  }
+  // Remember which ATS hosts already have an account so return visits sign in with
+  // the same credentials instead of trying to create a duplicate.
+  async function markAccountCreated(host) {
+    try { const m = (await st.get('ua_created_accounts')) || {}; m[host] = Date.now(); await st.set('ua_created_accounts', m); } catch (_) {}
+  }
+  async function accountExistsFor(host) {
+    try { const m = (await st.get('ua_created_accounts')) || {}; return !!m[host]; } catch (_) { return false; }
+  }
   function looksLikeAuthPage() { return $$('input[type=password]').some(isVisible); }
   function findAuthSubmit(mode) {
     const re = mode === 'signin' ? /^(sign ?in|log ?in|continue|submit)$/i
@@ -5869,8 +5893,8 @@
       if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
       // Workday create-account uses the dedicated, more reliable filler.
       if (isWorkday() && await fillWorkdayCreateAccount(true)) return true;
-      const p = await getProfile();
-      const email = p.email || '';
+      // Same locked credentials for every ATS account/application.
+      const email = await getAppEmail();
       if (!email) return false;
       // If no password field yet, try to open a "Create account" form.
       if (!looksLikeAuthPage()) {
@@ -5913,10 +5937,11 @@
         await sleep(450);
       }
       if (submit) {
-        LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in'));
+        LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in') + ' (same saved credentials)');
         submit.scrollIntoView?.({ block: 'center' });
         await sleep(200);
         clickEl(submit);
+        markAccountCreated(location.hostname); // reuse these creds (sign in) on return
         await sleep(3500);
         // Account already exists → switch to sign-in with the same creds.
         const bodyTxt = (document.body.innerText || '').toLowerCase();
