@@ -1800,12 +1800,11 @@
       const allBtns = $$('a, button');
       for (const b of allBtns) { if (/^\s*(Apply|Apply Now|Apply for Job)\s*$/i.test(b.textContent) && isVisible(b)) { clickEl(b); clicked = true; await sleep(2000); break; } }
     }
-    // Click Apply Manually (skip Easy Apply / external links)
-    const am = await waitFor("//*[@data-automation-id='applyManually']", 8000, true);
-    if (am) { await sleep(500); clickEl(am); await sleep(2000); }
-    // Handle "Use My Last Application" — skip it for fresh fill
-    const useLastApp = await findByText('button,a', /use my last application|autofill with/i, 3000);
-    if (useLastApp) { LOG('Skipping "Use My Last Application"'); }
+    // Always choose "Apply Manually" on Workday's "Start Your Application" modal —
+    // never "Autofill with Resume" or "Use My Last Application" — then fill ourselves.
+    await waitForApplyTarget(8000);
+    await clickApplyManually();
+    await sleep(1500);
 
     // Handle sign-in/create account pages with the shared saved-credentials flow
     // (fills email + password + confirm, ticks consent, submits, and falls back to
@@ -3632,10 +3631,10 @@
           // page, skip it quickly instead of burning minutes on retries.
           await openApplicationForm();
           await handleAccountAuth();
-          if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+          if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess()) {
             await sleep(2500); // one short grace period for slow SPAs
             await openApplicationForm();
-            if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+            if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess()) {
               LOG('No application form / Apply found — skipping as invalid job');
               clearTimeout(_qTimeoutId);
               c.status = 'skipped'; c.error = 'No application form found'; c.completedAt = Date.now();
@@ -5683,21 +5682,55 @@
     while (Date.now() < dl) { if (hasApplicationForm()) return true; await sleep(400); }
     return hasApplicationForm();
   }
+  function findButtonByText(re, exclude) {
+    return $$('button,a,[role="button"],input[type=button],input[type=submit]').filter(isVisible)
+      .find(b => { const t = (b.textContent || b.value || '').trim(); return t && t.length < 60 && re.test(t) && (!exclude || !exclude.test(t)); }) || null;
+  }
+  // The "Apply Manually" choice on a Workday-style "Start Your Application" modal.
+  // We never pick "Autofill with Resume" or "Use My Last Application".
+  function findApplyManually() {
+    return $('[data-automation-id="applyManually"]') ||
+      findButtonByText(/^\s*apply manually\s*$|^apply without (a )?(resume|sign)|^fill (it )?out manually|^continue manually|^enter manually/i);
+  }
+  async function clickApplyManually() {
+    const am = findApplyManually();
+    if (am && isVisible(am)) {
+      LOG('Apply choice modal — clicking "Apply Manually"');
+      am.scrollIntoView?.({ block: 'center' });
+      clickEl(am);
+      await sleep(800);
+      return true;
+    }
+    return false;
+  }
+  // Resolve as soon as either a form OR the apply-choice modal appears (fast).
+  async function waitForApplyTarget(ms) {
+    const dl = Date.now() + (ms || 6000);
+    while (Date.now() < dl) {
+      if (hasApplicationForm()) return 'form';
+      if (findApplyManually()) return 'choice';
+      await sleep(250);
+    }
+    return hasApplicationForm() ? 'form' : null;
+  }
   async function openApplicationForm(maxClicks) {
-    const limit = maxClicks || 2;
+    const limit = maxClicks || 3;
     let clicks = 0;
     while (clicks < limit) {
-      if (hasApplicationForm()) return clicks > 0;
+      // If a "Start Your Application" choice modal is up, always pick Apply Manually.
+      if (await clickApplyManually()) { await waitForApplyTarget(6000); continue; }
+      if (hasApplicationForm()) return true;
       const btn = findApplyButton();
       if (!btn) return clicks > 0;
       // Keep apply links in the same tab so the queue can drive the form.
       if (btn.tagName === 'A' && btn.target === '_blank') btn.target = '_self';
-      LOG('Opening application form — clicking Apply: ' + (btn.textContent || btn.value || '').trim().slice(0, 30));
+      LOG('Clicking Apply: ' + (btn.textContent || btn.value || '').trim().slice(0, 30));
       btn.scrollIntoView?.({ block: 'center' });
       realClick(btn);
       clicks++;
-      await waitForFormOrModal(9000);
-      await sleep(1200);
+      // Condition-based wait — fires the moment a form OR the choice modal appears,
+      // instead of a fixed multi-second delay (faster Apply on every ATS).
+      await waitForApplyTarget(6000);
     }
     return clicks > 0;
   }
@@ -5858,7 +5891,7 @@
         await dispatchATSAutomation();
       }
     }
-    if (runnerActive) { await sleep(2000); processQ(); }
+    if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
