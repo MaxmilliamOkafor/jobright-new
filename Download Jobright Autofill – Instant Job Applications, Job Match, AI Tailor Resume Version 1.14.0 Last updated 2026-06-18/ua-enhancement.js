@@ -6009,13 +6009,12 @@
       }
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
-    // Workday Create Account auto-filler: on a Workday apply flow, fill the
-    // email/password/verify/consent and submit so the account step completes on its
-    // own (resolves Jobright's "Set a password to continue"). Submits on /apply
-    // pages (clear apply intent) or during a queue run.
-    if (/myworkdayjobs\.com|myworkdaysite\.com|workday\.com/i.test(location.hostname)) {
-      const wdShouldSubmit = () => (qActive && isRunnerTab()) || /\/apply/i.test(location.pathname || '');
-      setInterval(() => { fillWorkdayCreateAccount(wdShouldSubmit()).catch(() => {}); }, 2500);
+    // Workday Create Account auto-filler — ONLY during an active bulk run in the
+    // runner tab. When you're browsing/applying manually it stays out of the way so
+    // Jobright's own native account flow ("Set a password to continue") works exactly
+    // like the stock extension (it was the constant watcher that interfered before).
+    if (runnerActive && /myworkdayjobs\.com|myworkdaysite\.com|workday\.com/i.test(location.hostname)) {
+      setInterval(() => { if (qActive && isRunnerTab()) fillWorkdayCreateAccount(true).catch(() => {}); }, 2500);
     }
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
