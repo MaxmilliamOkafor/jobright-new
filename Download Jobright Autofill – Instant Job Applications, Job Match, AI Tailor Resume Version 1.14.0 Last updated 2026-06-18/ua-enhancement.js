@@ -8217,6 +8217,92 @@ a[href*="/checkout" i],
   }
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+  // Repeated-section support: tabs like Education / Work Experience / Skill hold
+  // multiple entries ("Education 1", "Work Experience 2", …). A flat {label:value}
+  // map collapses them to one entry, which is why only the first was captured.
+  // These helpers group fields by their entry heading so we keep ALL of them.
+  const ENTRY_HEADING_RE = /^(education|work experience|employment|experience|skill|certification|certificate|project|language|publication|award|volunteer)\s*#?\s*\d+\b/i;
+  function isEntryHeading(el) {
+    const txt = (el.textContent || '').trim();
+    return !!txt && txt.length < 36 && ENTRY_HEADING_RE.test(txt) &&
+      !el.querySelector('input,textarea,select');
+  }
+  // Returns an array of entries (each {label:value}) for repeated tabs, or null
+  // when the tab has no entry headings (caller falls back to a flat snapshot).
+  function snapshotEntries(modal) {
+    const entries = []; let cur = null, lastHeading = null;
+    for (const el of modal.querySelectorAll('*')) {
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        if (!cur) continue;
+        if (['file', 'submit', 'button', 'hidden'].includes(el.type)) continue;
+        const r = el.getBoundingClientRect(); if (r.width === 0 && r.height === 0) continue;
+        const key = labelFor(el); if (!key) continue;
+        let val = (el.type === 'checkbox' || el.type === 'radio') ? !!el.checked : el.value;
+        if (val === '' || val == null) continue;
+        cur[key] = val;
+      } else if (isEntryHeading(el)) {
+        const txt = (el.textContent || '').trim();
+        if (txt !== lastHeading) { cur = {}; entries.push(cur); lastHeading = txt; }
+      }
+    }
+    const nonEmpty = entries.filter(e => Object.keys(e).length);
+    return nonEmpty.length ? nonEmpty : null;
+  }
+  function snapshotTab(modal) {
+    return snapshotEntries(modal) || snapshotVisible(modal);
+  }
+  // Group the current input elements by entry (for import filling).
+  function groupInputsByEntry(modal) {
+    const groups = []; let cur = null, lastHeading = null;
+    for (const el of modal.querySelectorAll('*')) {
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        if (!cur) continue;
+        if (['file', 'submit', 'button', 'hidden'].includes(el.type)) continue;
+        const r = el.getBoundingClientRect(); if (r.width === 0 && r.height === 0) continue;
+        cur.push(el);
+      } else if (isEntryHeading(el)) {
+        const txt = (el.textContent || '').trim();
+        if (txt !== lastHeading) { cur = []; groups.push(cur); lastHeading = txt; }
+      }
+    }
+    return groups.filter(g => g.length);
+  }
+  function findAddButton(modal, name) {
+    const re = new RegExp('add\\s+(another\\s+)?' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    return [...modal.querySelectorAll('button,a,[role="button"],div,span')]
+      .filter(b => { const t = (b.textContent || '').trim(); return t.length < 32 && /add/i.test(t) && !b.querySelector('input,textarea,select'); })
+      .find(b => re.test((b.textContent || '').trim())) || null;
+  }
+  // Fill an array of entries: create missing entry rows via the "Add …" button,
+  // then fill each group in order.
+  async function applyEntries(modal, name, entries) {
+    let groups = groupInputsByEntry(modal);
+    let guard = 0;
+    while (groups.length < entries.length && guard++ < entries.length + 4) {
+      const addBtn = findAddButton(modal, name);
+      if (!addBtn) break;
+      try { addBtn.click(); } catch (_) {}
+      await sleep(500);
+      groups = groupInputsByEntry(modal);
+    }
+    let filled = 0;
+    for (let i = 0; i < entries.length && i < groups.length; i++) {
+      const data = entries[i];
+      for (const el of groups[i]) {
+        const key = labelFor(el);
+        if (!key || !(key in data)) continue;
+        const v = data[key];
+        if (el.type === 'checkbox' || el.type === 'radio') { const want = !!v; if (el.checked !== want) el.click(); }
+        else setReactValue(el, String(v));
+        filled++;
+      }
+      await sleep(60);
+    }
+    return filled;
+  }
+
   async function exportProfile() {
     const modal = findModal();
     if (!modal) { alert('Open "Your Autofill information" first.'); return; }
@@ -8227,7 +8313,7 @@ a[href*="/checkout" i],
       if (!tab) continue;
       try { tab.click(); } catch (_) {}
       await sleep(220);
-      out[name] = snapshotVisible(modal);
+      out[name] = snapshotTab(modal);
     }
     if (original) { const t = findTabElement(modal, original); if (t) try { t.click(); } catch (_) {} }
     try { chrome.storage.local.set({ [STORAGE_KEY]: out }); } catch (_) {}
@@ -8245,7 +8331,9 @@ a[href*="/checkout" i],
     const tab = findTabElement(modal, name);
     if (!tab) return 0;
     try { tab.click(); } catch (_) {}
-    await sleep(260);
+    await sleep(300);
+    // Repeated section (Education / Work Experience / Skill) — restore every entry.
+    if (Array.isArray(fields)) return await applyEntries(modal, name, fields);
     let n = 0;
     const inputs = modal.querySelectorAll('input, textarea, select');
     for (const el of inputs) {
