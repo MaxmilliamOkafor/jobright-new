@@ -5368,63 +5368,6 @@
   function findAutofillButton() { return sbQuery('.auto-fill-button'); }
   // Resolve a selector against the page first, then the sidebar shadow tree.
   function pageOrSidebar(sel) { return document.querySelector(sel) || sbQuery(sel); }
-  // Shadow-aware querySelector across the page + every open shadow root.
-  function deepFind(sel) {
-    const direct = document.querySelector(sel); if (direct) return direct;
-    const stack = [document.documentElement]; let guard = 0;
-    while (stack.length && guard++ < 40000) {
-      const node = stack.pop(); if (!node) continue;
-      const sr = node.shadowRoot;
-      if (sr) { const f = sr.querySelector(sel); if (f) return f; for (const c of sr.children) stack.push(c); }
-      const kids = node.children; if (kids) for (const c of kids) stack.push(c);
-    }
-    return null;
-  }
-  function deepFindByText(re) {
-    const stack = [document.documentElement]; let guard = 0;
-    while (stack.length && guard++ < 60000) {
-      const node = stack.pop(); if (!node) continue;
-      if (node.nodeType === 1 && node.children.length === 0 && re.test((node.textContent || '').trim())) return node;
-      const sr = node.shadowRoot; if (sr) for (const c of sr.children) stack.push(c);
-      const kids = node.children; if (kids) for (const c of kids) stack.push(c);
-    }
-    return null;
-  }
-  // Bridge: fill Jobright's OWN native "Sign-up Information" password (the one that
-  // resolves "Set a password to continue") from the password saved in our card, then
-  // let Jobright save it via its Update button. Set the password once in our card and
-  // Jobright's native account flow does the rest. Idempotent + non-destructive.
-  let _signupBridgeDone = false, _signupBridgeBusy = false;
-  async function bridgeJobrightSignupPassword() {
-    if (_signupBridgeDone || _signupBridgeBusy) return;
-    _signupBridgeBusy = true;
-    try {
-      const pw = await getAppPassword();
-      if (!pw) return;
-      let pwInput = deepFind("input[name='workday-signup-password']");
-      if (!pwInput || !isVisible(pwInput)) {
-        // Open the Sign-up tab via Jobright's own "Set a password to continue" prompt.
-        const prompt = deepFindByText(/^set a password to continue$/i);
-        if (!prompt) return;
-        const clickable = prompt.closest('button,a,[role="button"],[class*="setup" i],[class*="action" i]') || prompt;
-        realClick(clickable);
-        await sleep(1300);
-        pwInput = deepFind("input[name='workday-signup-password']");
-      }
-      if (!pwInput || !isVisible(pwInput) || pwInput.value) return;
-      // Registration email (the non-password text input in the sign-up panel).
-      const panel = pwInput.closest("[class*='signup' i],[class*='autofill-info-modal' i]") || document;
-      const emailInput = panel.querySelector("input[type='text'],input:not([type='password']):not([type='checkbox']):not([type='button'])");
-      const email = await getAppEmail();
-      if (emailInput && isVisible(emailInput) && !emailInput.value && email) { reactTypeValue(emailInput, email); await sleep(250); }
-      reactTypeValue(pwInput, pw);
-      await sleep(500);
-      // Click Jobright's own Update/Submit to persist it natively.
-      const updateBtn = deepFind('.autofill-info-modal-submit') || deepFindByText(/^update$/i);
-      if (updateBtn) { (updateBtn.closest('button') || updateBtn).click?.(); realClick(updateBtn.closest('button') || updateBtn); _signupBridgeDone = true; LOG('Bridged saved password into Jobright Sign-up Information'); }
-    } catch (e) { LOG('signup bridge error:', e?.message || e); }
-    finally { _signupBridgeBusy = false; }
-  }
   // Wait until the Jobright sidebar exists (shadow-aware).
   function waitForSidebar(ms) {
     return new Promise(res => {
@@ -5809,9 +5752,6 @@
     // we observed (e.g. inside a shadow root). Cheap — one querySelector per tick.
     // During a run, also keep Jobright's own popup open so you can watch it autofill.
     setInterval(() => { injectSidebarUI(); if (qActive && isRunnerTab()) forceOpenSidebar(); }, 1500);
-    // Keep Jobright's native Sign-up Information password in sync with our saved one
-    // so "Set a password to continue" resolves on its own. Stops after it's set.
-    setInterval(() => { bridgeJobrightSignupPassword(); }, 2500);
     // Watchdog: keep the control panel alive throughout the run. If anything removes
     // it (page script, re-render), re-mount it within ~600ms so the controls never
     // disappear while automation is in progress.
