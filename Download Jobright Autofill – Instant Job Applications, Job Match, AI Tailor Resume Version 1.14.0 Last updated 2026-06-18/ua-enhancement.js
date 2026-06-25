@@ -3592,7 +3592,38 @@
   // "Set a password to continue" because that password lives in Jobright's own store.
   // We fill the actual Workday fields with the saved credentials and submit so the
   // flow moves past the account step — independent of Jobright's prompt.
+  // SpeedyApply-style reliable setter for React/Workday inputs: real typing via
+  // execCommand('insertText') so Workday's onChange fires and validation clears.
+  // Setting .value alone leaves the field "invalid" (red dot) and the Create
+  // Account button disabled — which is exactly what was happening.
+  function reactTypeValue(el, value) {
+    try {
+      el.focus(); el.click();
+      try { el.setSelectionRange(0, (el.value || '').length); } catch (_) { try { el.select(); } catch (_) {} }
+      let ok = false;
+      try { ok = document.execCommand('insertText', false, value); } catch (_) {}
+      if (!ok || el.value !== value) {
+        // Fallback: native setter + a real InputEvent.
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, value); else el.value = value;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      }
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+    } catch (_) {
+      // Direct fallback (do NOT call nativeSet — it routes back here on Workday).
+      try {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, value); else el.value = value;
+        ['input', 'change', 'blur'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true })));
+      } catch (_) {}
+    }
+  }
+
   let _wdAccountSubmitted = false;
+  let _wdFillPasses = 0;
   async function fillWorkdayCreateAccount(submit) {
     if (!isWorkday()) return false;
     const pwFields = $$('input[type=password]').filter(isVisible);
@@ -3601,27 +3632,32 @@
     const email = p.email || '';
     const pw = await getAppPassword();
     if (!email) return false;
+    // The fields may already be visually filled but NOT registered by Workday, so
+    // for the first few passes we always re-type them with the reliable method.
+    const force = _wdFillPasses < 3;
+    _wdFillPasses++;
     let did = false;
-    // Email
     let emailField = $('input[data-automation-id="email"]') ||
       $$('input[type=email],input[type=text]').filter(isVisible)
         .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
-    if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); did = true; await sleep(120); }
-    // Password + Verify password
-    for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); did = true; await sleep(120); } }
+    if (emailField && (force || !emailField.value)) { reactTypeValue(emailField, email); did = true; await sleep(180); }
+    for (const f of pwFields) { if (force || !f.value) { reactTypeValue(f, pw); did = true; await sleep(180); } }
     // Agree to Privacy Notice / consent checkboxes
     $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
     if (submit && !_wdAccountSubmitted) {
-      await sleep(700);
-      const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])') ||
-        findAuthSubmit('create');
-      if (btn && isVisible(btn) && !btn.disabled) {
-        LOG('Workday: submitting Create Account with saved credentials');
-        _wdAccountSubmitted = true;
-        btn.scrollIntoView?.({ block: 'center' });
-        await sleep(150);
-        clickEl(btn);
-        await sleep(2500);
+      // Give Workday a moment to validate, then click once the button enables.
+      for (let i = 0; i < 8; i++) {
+        const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])');
+        if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+          LOG('Workday: submitting Create Account with saved credentials');
+          _wdAccountSubmitted = true;
+          btn.scrollIntoView?.({ block: 'center' });
+          await sleep(150);
+          clickEl(btn);
+          await sleep(2500);
+          break;
+        }
+        await sleep(450);
       }
     }
     return did;
@@ -6509,6 +6545,13 @@ Result: Shipped my first production change in week three and my notes doc became
   }
 
   function nativeSet(el, val) {
+    // On Workday, plain .value assignment leaves fields "unregistered" (validation
+    // fails, Continue/Create stays disabled). Use real-typing there so React commits.
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+        el.type !== 'checkbox' && el.type !== 'radio' &&
+        typeof isWorkday === 'function' && isWorkday()) {
+      return reactTypeValue(el, String(val));
+    }
     try {
       const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
