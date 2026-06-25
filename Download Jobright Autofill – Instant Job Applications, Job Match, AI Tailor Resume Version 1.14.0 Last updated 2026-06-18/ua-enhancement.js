@@ -3586,8 +3586,48 @@
     return (_appHistory || []).some(a => a.status === 'applied' && normalizeUrl(a.url) === n);
   }
 
+  // ===================== WORKDAY CREATE-ACCOUNT AUTO-FILLER =====================
+  // Workday gates the application behind a Create Account step (email, password,
+  // verify password, "Agree to Privacy Notice"). Jobright pauses here asking you to
+  // "Set a password to continue" because that password lives in Jobright's own store.
+  // We fill the actual Workday fields with the saved credentials and submit so the
+  // flow moves past the account step — independent of Jobright's prompt.
+  let _wdAccountSubmitted = false;
+  async function fillWorkdayCreateAccount(submit) {
+    if (!isWorkday()) return false;
+    const pwFields = $$('input[type=password]').filter(isVisible);
+    if (!pwFields.length) return false; // not on a create-account / sign-in page
+    const p = await getProfile();
+    const email = p.email || '';
+    const pw = await getAppPassword();
+    if (!email) return false;
+    let did = false;
+    // Email
+    let emailField = $('input[data-automation-id="email"]') ||
+      $$('input[type=email],input[type=text]').filter(isVisible)
+        .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
+    if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); did = true; await sleep(120); }
+    // Password + Verify password
+    for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); did = true; await sleep(120); } }
+    // Agree to Privacy Notice / consent checkboxes
+    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
+    if (submit && !_wdAccountSubmitted) {
+      await sleep(700);
+      const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])') ||
+        findAuthSubmit('create');
+      if (btn && isVisible(btn) && !btn.disabled) {
+        LOG('Workday: submitting Create Account with saved credentials');
+        _wdAccountSubmitted = true;
+        btn.scrollIntoView?.({ block: 'center' });
+        await sleep(150);
+        clickEl(btn);
+        await sleep(2500);
+      }
+    }
+    return did;
+  }
+
   // Are we on the page for the currently-applying job? Match the queued URL, OR
-  // accept any page that now shows an application form / Apply button — because
   // clicking "Apply" often navigates us to an external ATS form whose URL differs
   // from the imported listing URL. Without this the queue would skip mid-apply.
   function onCurrentJobPage(c) {
@@ -5791,6 +5831,8 @@
       // Never auto-fill credentials on the user's personal job-board / social logins —
       // only on ATS account walls. (Their LinkedIn/Indeed password isn't ours to set.)
       if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
+      // Workday create-account uses the dedicated, more reliable filler.
+      if (isWorkday() && await fillWorkdayCreateAccount(true)) return true;
       const p = await getProfile();
       const email = p.email || '';
       if (!email) return false;
@@ -5931,6 +5973,14 @@
       }
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
+    // Workday Create Account auto-filler: on a Workday apply flow, fill the
+    // email/password/verify/consent and submit so the account step completes on its
+    // own (resolves Jobright's "Set a password to continue"). Submits on /apply
+    // pages (clear apply intent) or during a queue run.
+    if (/myworkdayjobs\.com|myworkdaysite\.com|workday\.com/i.test(location.hostname)) {
+      const wdShouldSubmit = () => (qActive && isRunnerTab()) || /\/apply/i.test(location.pathname || '');
+      setInterval(() => { fillWorkdayCreateAccount(wdShouldSubmit()).catch(() => {}); }, 2500);
+    }
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
