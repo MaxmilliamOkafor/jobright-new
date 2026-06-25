@@ -78,8 +78,16 @@ While the queue runs, a status panel appears:
 - **Speed:** `1x` `1.5x` `2x` `3x` — controls the delay between jobs
 
 **Drag it by its header** to move it anywhere so it never blocks the Jobright popup — its
-position is remembered across pages and jobs. Progress is saved per-job, so if a page
-reloads or you stop midway, **Resume** continues from where it left off.
+position is remembered across pages and jobs. The selected **Speed** is highlighted green
+and actually changes how fast each application is processed (it scales the automation's
+waits, not just the gap between jobs). Progress is saved per-job, so if a page reloads or
+you stop midway, **Resume** continues from where it left off.
+
+### Runs in one tab — browse freely
+
+The queue drives **only the tab you started it in**. Open new tabs, browse, or work in
+other windows — the automation won't touch them. Invalid URLs (no application form / Apply
+button, not a known ATS) are **skipped quickly** instead of stalling the queue.
 
 > The advanced settings drawer (profile / AI key / history) is hidden by default to keep
 > things simple — press **Alt+Q** if you ever need it.

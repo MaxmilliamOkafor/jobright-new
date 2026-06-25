@@ -229,6 +229,7 @@
     getMulti: keys => new Promise(r => chrome.storage.local.get(keys, d => r(d)))
   };
   let queue = [], qActive = false, qPaused = false, autoApply = false, selected = new Set();
+  let qSpeedFactor = 1; // multiplies automation waits (set from queue speed); lower = faster
   // LazyApply-enhanced state tracking
   let qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0 };
   let qStoppedAt = -1; // LazyApply session resumption index
@@ -241,6 +242,7 @@
     qStats = (await st.get('ua_q_stats')) || qStats;
     qStoppedAt = (await st.get('ua_q_stopped_at')) || -1;
     qSpeed = (await st.get('ua_q_speed')) || 1; // persist speed across per-job navigations
+    qSpeedFactor = speedFactorFor(qSpeed);
     // Default OFF: the queue uses the reliable plain "Autofill" path. The
     // "Generate Custom Resume + Autofill" combo depends on Jobright's resume
     // generator and can stall, so we don't use it automatically unless opted in.
@@ -978,7 +980,10 @@
   // ===================== DOM HELPERS =====================
   const $$ = (sel, root) => [...(root || document).querySelectorAll(sel)];
   const $ = (sel, root) => (root || document).querySelector(sel);
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // While a queue is running, scale waits by the selected speed (1x..3x) so the
+  // chosen speed visibly changes how fast each application is processed.
+  const sleep = ms => new Promise(r => setTimeout(r, Math.max(40, ms * (qActive && !qPaused ? qSpeedFactor : 1))));
+  function speedFactorFor(s) { return ({ 1: 1, 1.5: 0.66, 2: 0.45, 3: 0.3 })[s] || 1; }
 
   function isVisible(el) {
     if (!el) return false;
@@ -1103,7 +1108,20 @@
   }
 
   // ===================== QUEUE OPS =====================
-  async function addJob(url, title, meta) { if (!url || queue.some(j => j.url === url)) return; queue.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), url, title: title || shortUrl(url), status: 'pending', addedAt: Date.now(), jobBoard: detectJobBoard(url), companyName: meta?.companyName || '', error: null, startedAt: null, completedAt: null, duration: null, ...(meta || {}) }); await saveQ(); renderQ(); updateCtrl(); }
+  // Normalize a URL so the same job isn't counted twice (the two parsers can emit
+  // slightly different strings — trailing punctuation, hash, etc.). This is what
+  // made a CSV of N urls show ~2N "jobs".
+  function normalizeUrl(u) {
+    if (!u) return '';
+    let s = String(u).trim().replace(/[)\]}>"'.,;]+$/, '');
+    try { const x = new URL(s); x.hash = ''; let h = x.href; return h.replace(/\/$/, ''); } catch (_) { return s; }
+  }
+  async function addJob(url, title, meta) {
+    url = normalizeUrl(url);
+    if (!url || queue.some(j => normalizeUrl(j.url) === url)) return;
+    queue.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), url, title: title || shortUrl(url), status: 'pending', addedAt: Date.now(), jobBoard: detectJobBoard(url), companyName: meta?.companyName || '', error: null, startedAt: null, completedAt: null, duration: null, ...(meta || {}) });
+    await saveQ(); renderQ(); updateCtrl();
+  }
   async function removeJob(id) { queue = queue.filter(j => j.id !== id); selected.delete(id); await saveQ(); renderQ(); updateCtrl(); }
   async function clearQ() { queue = []; selected.clear(); await saveQ(); renderQ(); updateCtrl(); }
   async function removeSelected() { queue = queue.filter(j => !selected.has(j.id)); selected.clear(); await saveQ(); renderQ(); updateCtrl(); }
@@ -3520,10 +3538,20 @@
 
   // ===================== QUEUE ENGINE (LazyApply-enhanced) =====================
   // LazyApply-inspired: configurable delays and timeout
-  const QUEUE_DELAYS = { 1: 2000, 1.5: 1500, 2: 1000, 3: 500 };
+  const QUEUE_DELAYS = { 1: 1500, 1.5: 1000, 2: 600, 3: 300 };
   let qSpeed = 1;
   let qTimeout = 150000; // 150s hard cap per job — enough for the fill→submit→verify→retry loop; protects against truly stuck pages (captcha/login)
   let _qTimeoutId = null;
+
+  // ===================== SINGLE RUNNER TAB =====================
+  // The queue must drive exactly ONE tab — otherwise every open tab (and any new
+  // tab you open to browse) would also navigate itself to job URLs and hijack your
+  // browsing. window.name survives same-tab navigations (even cross-origin), so we
+  // tag the tab that started the run and only that tab processes/navigates.
+  const RUNNER_PREFIX = 'UAQRUN::';
+  function isRunnerTab() { try { return typeof window.name === 'string' && window.name.indexOf(RUNNER_PREFIX) === 0; } catch (_) { return false; } }
+  function markRunnerTab() { try { if (window.name.indexOf(RUNNER_PREFIX) !== 0) window.name = RUNNER_PREFIX + (window.name || ''); } catch (_) {} }
+  function unmarkRunnerTab() { try { if (typeof window.name === 'string' && window.name.indexOf(RUNNER_PREFIX) === 0) window.name = window.name.slice(RUNNER_PREFIX.length); } catch (_) {} }
 
   // Are we on the page for the currently-applying job? Match the queued URL, OR
   // accept any page that now shows an application form / Apply button — because
@@ -3540,6 +3568,8 @@
 
   async function processQ() {
     if (!qActive || qPaused || !queue.length) return;
+    // Only the dedicated runner tab drives the queue — never hijack other tabs.
+    if (!isRunnerTab()) return;
     const c = queue.find(j => j.status === 'applying');
     if (c) {
       try {
@@ -3557,13 +3587,33 @@
             goNext();
           }, qTimeout);
 
+          // FAST VALIDITY GATE (LazyApply-style): if this URL has no application
+          // form, no Apply button, isn't a known ATS, and isn't already a success
+          // page, skip it quickly instead of burning minutes on retries.
+          await openApplicationForm();
+          await handleAccountAuth();
+          if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+            await sleep(2500); // one short grace period for slow SPAs
+            await openApplicationForm();
+            if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+              LOG('No application form / Apply found — skipping as invalid job');
+              clearTimeout(_qTimeoutId);
+              c.status = 'skipped'; c.error = 'No application form found'; c.completedAt = Date.now();
+              qStats.skipped++;
+              await saveQ(); await saveStats(); renderQ(); updateCtrl();
+              await sleep(600);
+              goNext();
+              return;
+            }
+          }
+
           // Drive the application to a CONFIRMED submission before moving on.
           // The user requirement: each job must be fully autofilled AND submitted
           // before the queue advances. We attempt fill+submit, verify, and retry
           // (re-opening the form / filling gaps / re-submitting) until confirmed or
           // the per-job timeout fires. Only a confirmed submission counts as done.
           let success = false;
-          for (let attempt = 0; attempt < 3 && !success; attempt++) {
+          for (let attempt = 0; attempt < 2 && !success; attempt++) {
             await withRetry(async () => { await dispatchATSAutomation(); }, 'Queue job automation');
             // Verify submission (poll for a confirmation signal).
             for (let check = 0; check < 6; check++) {
@@ -3637,13 +3687,16 @@
       const idx = queue.indexOf(n);
       st.set('ua_q_stopped_at', idx);
       saveQ().then(() => {
-        const delay = Math.max(_rateLimitDelay || 3000, QUEUE_DELAYS[qSpeed] || 2000);
+        // Inter-job delay scales with speed (no hidden 3s floor unless the user
+        // explicitly enabled rate limiting).
+        const delay = Math.max(_rateLimitDelay || 0, QUEUE_DELAYS[qSpeed] || 1500);
         setTimeout(() => { location.href = n.url; }, delay);
       });
     } else {
       qActive = false;
       st.set(SK.QA, false);
       st.set('ua_q_stopped_at', -1);
+      unmarkRunnerTab(); // free this tab — run finished
       // LazyApply-style: completion summary
       LOG('Queue complete — all jobs processed');
       const done = queue.filter(j => j.status === 'done').length;
@@ -3664,6 +3717,7 @@
     const pending = queue.filter(j => j.status === 'pending');
     if (!pending.length) return;
     qActive = true; qPaused = false;
+    markRunnerTab(); // this tab becomes the dedicated automation tab
     qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0 };
     await st.set(SK.QA, true); await st.set(SK.QP, false); await saveStats();
     updateCtrl(); goNext();
@@ -3676,6 +3730,7 @@
       if (queue[i].status === 'applying' || queue[i].status === 'timeout') queue[i].status = 'pending';
     }
     qActive = true; qPaused = false;
+    markRunnerTab();
     await st.set(SK.QA, true); await st.set(SK.QP, false);
     await saveQ(); updateCtrl(); goNext();
     LOG(`Resumed queue from job #${qStoppedAt + 1}`);
@@ -3684,6 +3739,7 @@
   async function stopQ() {
     clearTimeout(_qTimeoutId);
     qActive = false; qPaused = false;
+    unmarkRunnerTab();
     await st.set(SK.QA, false); await st.set(SK.QP, false);
     // LazyApply: save stop point for session resumption
     const applyingIdx = queue.findIndex(j => j.status === 'applying');
@@ -4182,9 +4238,10 @@
 .uc-proc.paused{color:#fbbf24}
 .uc-speed{display:flex;align-items:center;gap:6px;margin-top:14px}
 .uc-speed-l{font-size:12px;font-weight:600;color:#bfbfc4;margin-right:2px}
-.uc-sp{min-width:34px;height:26px;padding:0 8px;border-radius:13px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s}
+.uc-sp{min-width:38px;height:28px;padding:0 9px;border-radius:14px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:700;cursor:pointer;transition:all .15s}
+.uc-sp:hover{border-color:#00f0a0;color:#e7e7ea}
 .uc-sp:hover{border-color:#4b4b52;color:#e7e7ea}
-.uc-sp.active{background:#fff;border-color:#fff;color:#0e0e0f}
+.uc-sp.active{background:#00f0a0;border-color:#00f0a0;color:#06231a;box-shadow:0 0 0 2px rgba(0,240,160,.25)}
 .uc-actions{display:flex;gap:10px;margin-top:16px}
 .uc-act{flex:1;height:38px;border-radius:9px;border:none;cursor:pointer;font-size:13px;font-weight:700;transition:filter .15s,background .15s}
 .uc-act:hover{filter:brightness(1.08)}
@@ -4427,12 +4484,10 @@
     document.getElementById('uc-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
     document.getElementById('uc-skip').addEventListener('click', skipJob);
     document.getElementById('uc-quit').addEventListener('click', stopQ);
-    // Speed selector (1x / 1.5x / 2x / 3x) — controls inter-job delay (LazyApply-style).
+    // Speed selector (1x / 1.5x / 2x / 3x) — scales how fast each application is
+    // processed (waits) AND the delay between jobs.
     ctrl.querySelectorAll('.uc-sp').forEach(btn => btn.addEventListener('click', () => {
-      qSpeed = parseFloat(btn.dataset.sp) || 1;
-      ctrl.querySelectorAll('.uc-sp').forEach(b => b.classList.toggle('active', b === btn));
-      try { st.set('ua_q_speed', qSpeed); } catch (_) {}
-      LOG('Queue speed set to ' + qSpeed + 'x');
+      setQueueSpeed(parseFloat(btn.dataset.sp) || 1);
     }));
 
     // --- Drawer ---
@@ -5067,14 +5122,15 @@
 
   async function handleFile(f) {
     const text = await f.text();
-    // Use both parsers for maximum compatibility (LazyApply-enhanced)
-    const u1 = parseCSV(text);
-    const u2 = parseBulkUrls(text);
-    const u = [...new Set([...u1, ...u2])];
-    if (!u.length) { alert('No valid URLs found.'); return; }
-    LOG(`Imported ${u.length} URLs from file`);
+    // Parse with both parsers, then NORMALIZE + de-dupe so the count matches the
+    // number of unique job URLs in the file (no more ~2x inflation).
+    const raw = [...parseCSV(text), ...parseBulkUrls(text)];
+    const u = [...new Set(raw.map(normalizeUrl).filter(Boolean))];
+    if (!u.length) { alert('No valid URLs found in the file.'); return; }
+    const before = queue.length;
     for (const x of u) await addJob(x);
-    // Refresh the in-sidebar bulk-apply UI (no separate popup — user preference).
+    const added = queue.length - before;
+    LOG(`Imported ${u.length} unique URLs (${added} new, ${u.length - added} already in queue)`);
     injectSidebarUI(); updateSidebarUI();
   }
 
@@ -5184,14 +5240,14 @@
     try {
       const s = getSidebar();
       if (s) {
+        // Only un-hide the host if something hid it. We deliberately do NOT click
+        // Jobright's collapse toggle — doing so on every tick made the panel flicker
+        // (disappear/appear). The panel naturally reloads once per job navigation.
         const host = (s.getRootNode && s.getRootNode().host) || null;
         if (host && host.style && host.style.display === 'none') host.style.display = '';
-        // Expand if collapsed (click the collapse/expand toggle when it reads collapsed).
-        const expandBtn = s.querySelector('.toggle-handler[aria-expanded="false"]');
-        if (expandBtn && isVisible(expandBtn)) realClick(expandBtn);
       }
       const ctrl = document.getElementById('ua-ctrl');
-      if (ctrl && qActive) ctrl.classList.add('show');
+      if (ctrl && qActive && isRunnerTab()) ctrl.classList.add('show');
     } catch (_) {}
   }
 
@@ -5354,23 +5410,9 @@
       const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
       LOG('Saved ATS credentials');
     });
-    // Speed selector (shared with the overlay; controls inter-job delay).
-    const paintSpeed = () => wrap.querySelectorAll('.ua-sb-sp').forEach(b => {
-      const on = parseFloat(b.dataset.sp) === qSpeed;
-      b.style.background = on ? '#fff' : 'transparent';
-      b.style.color = on ? '#0e0e0f' : '#bfbfc4';
-      b.style.borderColor = on ? '#fff' : '#34343a';
-      b.style.fontWeight = on ? '700' : '600';
-    });
-    wrap.querySelectorAll('.ua-sb-sp').forEach(b => b.addEventListener('click', () => {
-      qSpeed = parseFloat(b.dataset.sp) || 1;
-      try { st.set('ua_q_speed', qSpeed); } catch (_) {}
-      paintSpeed();
-      const ov = document.getElementById('ua-ctrl');
-      if (ov) ov.querySelectorAll('.uc-sp').forEach(x => x.classList.toggle('active', parseFloat(x.dataset.sp) === qSpeed));
-      LOG('Queue speed set to ' + qSpeed + 'x');
-    }));
-    paintSpeed();
+    // Speed selector (shared with the overlay; scales automation waits + job delay).
+    wrap.querySelectorAll('.ua-sb-sp').forEach(b => b.addEventListener('click', () => setQueueSpeed(parseFloat(b.dataset.sp) || 1)));
+    paintSidebarSpeed();
     _sbSection = wrap;
     return wrap;
   }
@@ -5399,12 +5441,7 @@
     const pending = queue.filter(j => j.status === 'pending').length;
     const cnt = q('#ua-sb-count'); if (cnt) cnt.textContent = `${queue.length} job${queue.length === 1 ? '' : 's'}`;
     const tailorCb = q('#ua-sb-tailor'); if (tailorCb && tailorCb.checked !== queueUseTailor) tailorCb.checked = queueUseTailor;
-    _sbSection.querySelectorAll('.ua-sb-sp').forEach(b => {
-      const on = parseFloat(b.dataset.sp) === qSpeed;
-      b.style.background = on ? '#fff' : 'transparent';
-      b.style.color = on ? '#0e0e0f' : '#bfbfc4';
-      b.style.borderColor = on ? '#fff' : '#34343a';
-    });
+    paintSidebarSpeed();
     const start = q('#ua-sb-start'), stop = q('#ua-sb-stop'), runrow = q('#ua-sb-runrow'), status = q('#ua-sb-status');
     if (qActive) {
       if (start) start.style.display = 'none';
@@ -5427,12 +5464,36 @@
     }
   }
 
+  // Paint the sidebar card's speed buttons (green = selected, clear indicator).
+  function paintSidebarSpeed() {
+    if (!_sbSection) return;
+    _sbSection.querySelectorAll('.ua-sb-sp').forEach(b => {
+      const on = parseFloat(b.dataset.sp) === qSpeed;
+      b.style.background = on ? '#00f0a0' : 'transparent';
+      b.style.color = on ? '#06231a' : '#bfbfc4';
+      b.style.borderColor = on ? '#00f0a0' : '#34343a';
+      b.style.fontWeight = on ? '800' : '600';
+      b.style.boxShadow = on ? '0 0 0 2px rgba(0,240,160,.25)' : 'none';
+    });
+  }
+  // Single source of truth for speed: updates the wait factor, persistence, and
+  // BOTH indicators (overlay + sidebar card).
+  function setQueueSpeed(s) {
+    qSpeed = s; qSpeedFactor = speedFactorFor(s);
+    try { st.set('ua_q_speed', qSpeed); } catch (_) {}
+    const ov = document.getElementById('ua-ctrl');
+    if (ov) ov.querySelectorAll('.uc-sp').forEach(b => b.classList.toggle('active', parseFloat(b.dataset.sp) === qSpeed));
+    paintSidebarSpeed();
+    LOG('Queue speed set to ' + qSpeed + 'x (wait factor ' + qSpeedFactor + ')');
+  }
+
   function updateCtrl() {
     updateSidebarUI(); // keep the in-native-sidebar bulk-apply controls in sync
     const ctrl = document.getElementById('ua-ctrl');
     if (!ctrl) return;
     const pauseBtn = document.getElementById('uc-pause');
-    if (qActive) {
+    // Only show the run overlay in the dedicated runner tab.
+    if (qActive && isRunnerTab()) {
       ctrl.classList.add('show');
       const total = queue.length;
       const dn = queue.filter(j => ['done', 'failed', 'timeout', 'skipped'].includes(j.status)).length;
@@ -5494,7 +5555,7 @@
     // Safety net: periodic re-inject in case the sidebar mounts without mutations
     // we observed (e.g. inside a shadow root). Cheap — one querySelector per tick.
     // During a run, also keep Jobright's own popup open so you can watch it autofill.
-    setInterval(() => { injectSidebarUI(); if (qActive) forceOpenSidebar(); }, 1500);
+    setInterval(() => { injectSidebarUI(); if (qActive && isRunnerTab()) forceOpenSidebar(); }, 1500);
   }
 
   // ===================== APPLY-BUTTON OPENER (reveal the form on listing pages) =====================
@@ -5678,13 +5739,14 @@
     // and drive automation on every imported job URL (listing pages included,
     // where we click "Apply" to reveal the form). Skipping was the #1 reason the
     // CSV queue "did nothing" on many sites.
-    if (!qActive && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
+    const runnerActive = qActive && isRunnerTab();
+    if (!runnerActive && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
-    // When a queue is active, keep Jobright's own sidebar open and our control
-    // overlay visible for the whole run.
-    if (qActive) { forceOpenSidebar(); updateCtrl(); }
+    // When a queue is active IN THIS (runner) tab, keep Jobright's own sidebar open
+    // and our control overlay visible for the whole run.
+    if (runnerActive) { forceOpenSidebar(); updateCtrl(); }
     // Update answer bank count in UI
     const ansCntEl = document.getElementById('ua-ans-cnt');
     if (ansCntEl) ansCntEl.textContent = `(${Object.keys(_answerBank).length} answers)`;
@@ -5698,7 +5760,7 @@
         await dispatchATSAutomation();
       }
     }
-    if (qActive) { await sleep(2000); processQ(); }
+    if (runnerActive) { await sleep(2000); processQ(); }
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
