@@ -7676,7 +7676,10 @@ Result: Shipped my first production change in week three and my notes doc became
   // Resume-generation / tailoring / cover-letter / upload endpoints must NEVER be
   // rewritten — the recursive PRO-profile merge can corrupt their payloads and leave
   // "Generate Custom Resume + Autofill" stuck on "Opening resume generator…".
-  const PATCH_EXCLUDE_RE = /(resume|tailor|cover.?letter|generat|optimi[sz]e|upload|file|document|preview|download|pdf|swan|template|render)/i;
+  // Never rewrite resume/tailor/cover responses, NOR the autofill-profile / sign-up /
+  // account-save endpoints (Jobright echoes the saved profile — incl. the Sign-up
+  // password — back in the response; patching it corrupted the save).
+  const PATCH_EXCLUDE_RE = /(resume|tailor|cover.?letter|generat|optimi[sz]e|upload|file|document|preview|download|pdf|swan|template|render|autofill|candidate|signup|sign-?up|onboard|workday)/i;
   function shouldPatchUrl(url) {
     try {
       const u = new URL(url, location.href);
@@ -7749,25 +7752,24 @@ Result: Shipped my first production change in week three and my notes doc became
         return origGet(keys, (items) => {
           try {
             items = items || {};
+            // READ-ONLY spoof: only inject a subscription/credit override key when it
+            // is genuinely ABSENT. We never mutate, overwrite, or persist Jobright's
+            // real stored data — doing so was wiping the saved Sign-up password (and
+            // anything Jobright stores). This keeps the password save identical to the
+            // stock extension while still unlocking when those keys aren't present.
             for (const k of Object.keys(STORAGE_OVERRIDES)) {
-              if (items[k] === undefined && (keys === null || keys === undefined || keys === k ||
-                  (Array.isArray(keys) && keys.includes(k)) ||
-                  (typeof keys === 'object' && keys && k in keys))) {
-                items[k] = structuredCloneSafe(STORAGE_OVERRIDES[k]);
-              } else if (items[k] !== undefined) {
-                if (typeof items[k] === 'number' && COUNT_KEY_RE.test(k)) items[k] = UNLIMITED;
-                else if (typeof items[k] === 'object') patchObject(items[k], 0);
-              }
+              const requested = keys === null || keys === undefined || keys === k ||
+                (Array.isArray(keys) && keys.includes(k)) ||
+                (typeof keys === 'object' && keys && k in keys);
+              if (requested && items[k] === undefined) items[k] = structuredCloneSafe(STORAGE_OVERRIDES[k]);
             }
-            // Seed full overrides when caller passes null (request all).
-            if (keys === null || keys === undefined) Object.assign(items, structuredCloneSafe(STORAGE_OVERRIDES));
           } catch (_) {}
           if (typeof cb === 'function') cb(items);
         });
       };
       chrome.storage.local.__uaUnlockPatched = true;
-      // Persist overrides so async readers also see them.
-      try { chrome.storage.local.set(STORAGE_OVERRIDES); } catch (_) {}
+      // NOTE: we intentionally do NOT chrome.storage.local.set() any overrides —
+      // never write spoof values into real storage.
     }
   } catch (_) {}
 
