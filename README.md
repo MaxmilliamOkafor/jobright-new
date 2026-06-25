@@ -61,17 +61,71 @@ The queue then, for each imported URL:
 The control panel stays open for the whole run (it mounts on every job page, including
 listing pages), so you always see progress and can Pause / Skip / Quit / change Speed.
 
-### Automation panel (matches 1.14.0)
+### Watch it work in the Jobright popup
 
-While the queue runs, a panel shows in the top-right:
+The automation drives **Jobright's own Autofill** on each job — exactly like applying
+manually one-by-one — and keeps the **native Jobright popup open** throughout so you can
+watch it fill and submit. There's no separate "Ultimate Autofill" panel; the queue is run
+entirely from the bulk-apply card inside the Jobright popup.
+
+### Automation panel (draggable)
+
+While the queue runs, a status panel appears:
 
 - **Automation In Progress** · **Job X of N**
 - **Position at …** (current company) with a live progress bar
 - **Pause / Skip / Quit**
 - **Speed:** `1x` `1.5x` `2x` `3x` — controls the delay between jobs
 
-Progress is saved per-job, so if a page reloads or you stop midway, **Resume**
-continues from where it left off.
+**Drag it by its header** to move it anywhere so it never blocks the Jobright popup — its
+position is remembered across pages and jobs. The selected **Speed** is highlighted green
+and actually changes how fast each application is processed (it scales the automation's
+waits, not just the gap between jobs). Progress is saved per-job, so if a page reloads or
+you stop midway, **Resume** continues from where it left off.
+
+### LazyApply-style controls
+
+- **Skip already-applied** (on by default) — never re-applies to a job you've already
+  applied to, even across separate CSV imports.
+- **Live counters** in the panel — `applied · skipped · failed` tick up as it runs, and a
+  completion summary is shown when the run finishes.
+
+### Runs in one tab — browse freely
+
+The queue drives **only the tab you started it in**. Open new tabs, browse, or work in
+other windows — the automation won't touch them. Invalid URLs (no application form / Apply
+button, not a known ATS) are **skipped quickly** instead of stalling the queue.
+
+> The advanced settings drawer (profile / AI key / history) is hidden by default to keep
+> things simple — press **Alt+Q** if you ever need it.
+
+### Managing the queue
+
+The sidebar card has a full queue manager: tick individual jobs or **All**, then
+**Delete selected**, or **Clear all**. Each row shows the job and its live status,
+with a **×** to remove it. Works on the whole queue even when large.
+
+### ATS account login (saved credentials)
+
+Some ATS (Workday, iCIMS, Taleo, SuccessFactors, ADP/BrassRing, Jobvite…) make you
+create an account or sign in before applying. This is **fully automatic across all ATS** —
+no manual effort:
+
+- The automation detects sign-in / create-account pages on **every** platform, fills the
+  saved credentials (email, password, confirm-password, consent), submits, and falls back
+  to sign-in if the account already exists.
+- A strong password is **auto-generated and saved the first time**, and the email comes
+  from your profile — so it works with zero setup. You can still view/override them under
+  **🔑 ATS account login** in the sidebar card.
+- Personal job-board logins (LinkedIn/Indeed/Glassdoor/etc.) are never touched.
+
+### Self-navigating to completion
+
+Each application drives itself to a **confirmed submission** with no supervision: it opens
+the Apply form, clears any account wall, autofills, then advances through every page —
+multi-step forms, review/confirm screens — clicking Next/Continue/Submit on its own. This
+is a **universal driver that runs for all ATS platforms**, on top of the platform-specific
+flows. Only once submission is confirmed does the queue move to the next job.
 
 ### Keyboard shortcuts
 

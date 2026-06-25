@@ -229,6 +229,8 @@
     getMulti: keys => new Promise(r => chrome.storage.local.get(keys, d => r(d)))
   };
   let queue = [], qActive = false, qPaused = false, autoApply = false, selected = new Set();
+  let qSpeedFactor = 1; // multiplies automation waits (set from queue speed); lower = faster
+  let qSkipApplied = true; // LazyApply-style: skip URLs already applied to (across imports)
   // LazyApply-enhanced state tracking
   let qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0 };
   let qStoppedAt = -1; // LazyApply session resumption index
@@ -241,10 +243,12 @@
     qStats = (await st.get('ua_q_stats')) || qStats;
     qStoppedAt = (await st.get('ua_q_stopped_at')) || -1;
     qSpeed = (await st.get('ua_q_speed')) || 1; // persist speed across per-job navigations
+    qSpeedFactor = speedFactorFor(qSpeed);
     // Default OFF: the queue uses the reliable plain "Autofill" path. The
     // "Generate Custom Resume + Autofill" combo depends on Jobright's resume
     // generator and can stall, so we don't use it automatically unless opted in.
     queueUseTailor = (await st.get('ua_queue_tailor')) === true;
+    qSkipApplied = (await st.get('ua_skip_applied')) !== false; // default ON
   }
   async function saveQ() { await st.set(SK.Q, queue); }
   async function saveStats() { await st.set('ua_q_stats', qStats); }
@@ -978,7 +982,10 @@
   // ===================== DOM HELPERS =====================
   const $$ = (sel, root) => [...(root || document).querySelectorAll(sel)];
   const $ = (sel, root) => (root || document).querySelector(sel);
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // While a queue is running, scale waits by the selected speed (1x..3x) so the
+  // chosen speed visibly changes how fast each application is processed.
+  const sleep = ms => new Promise(r => setTimeout(r, Math.max(40, ms * (qActive && !qPaused ? qSpeedFactor : 1))));
+  function speedFactorFor(s) { return ({ 1: 1, 1.5: 0.66, 2: 0.45, 3: 0.3 })[s] || 1; }
 
   function isVisible(el) {
     if (!el) return false;
@@ -1103,7 +1110,20 @@
   }
 
   // ===================== QUEUE OPS =====================
-  async function addJob(url, title, meta) { if (!url || queue.some(j => j.url === url)) return; queue.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), url, title: title || shortUrl(url), status: 'pending', addedAt: Date.now(), jobBoard: detectJobBoard(url), companyName: meta?.companyName || '', error: null, startedAt: null, completedAt: null, duration: null, ...(meta || {}) }); await saveQ(); renderQ(); updateCtrl(); }
+  // Normalize a URL so the same job isn't counted twice (the two parsers can emit
+  // slightly different strings — trailing punctuation, hash, etc.). This is what
+  // made a CSV of N urls show ~2N "jobs".
+  function normalizeUrl(u) {
+    if (!u) return '';
+    let s = String(u).trim().replace(/[)\]}>"'.,;]+$/, '');
+    try { const x = new URL(s); x.hash = ''; let h = x.href; return h.replace(/\/$/, ''); } catch (_) { return s; }
+  }
+  async function addJob(url, title, meta) {
+    url = normalizeUrl(url);
+    if (!url || queue.some(j => normalizeUrl(j.url) === url)) return;
+    queue.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), url, title: title || shortUrl(url), status: 'pending', addedAt: Date.now(), jobBoard: detectJobBoard(url), companyName: meta?.companyName || '', error: null, startedAt: null, completedAt: null, duration: null, ...(meta || {}) });
+    await saveQ(); renderQ(); updateCtrl();
+  }
   async function removeJob(id) { queue = queue.filter(j => j.id !== id); selected.delete(id); await saveQ(); renderQ(); updateCtrl(); }
   async function clearQ() { queue = []; selected.clear(); await saveQ(); renderQ(); updateCtrl(); }
   async function removeSelected() { queue = queue.filter(j => !selected.has(j.id)); selected.clear(); await saveQ(); renderQ(); updateCtrl(); }
@@ -1488,23 +1508,19 @@
 
     // Step 7: Auto submit or next
     LOG('Step 5: Auto-submit/next');
-    const result = await autoSubmitOrNext();
-
-    if (result === 'next_page') {
-      LOG('Navigated to next page — continuing multi-page flow');
-      await sleep(3000);
-      await multiPageLoop();
-    } else if (result === 'submitted') {
-      LOG('Application submitted!');
-      await learnFromPage();
-      await sleep(2000);
-      if (checkSuccess()) LOG('Success confirmed!');
-    }
+    await autoSubmitOrNext();
+    await learnFromPage();
+    await sleep(2000);
+    // Remaining pages / review-confirm / account walls are driven to completion by
+    // the dispatcher's universal multi-page driver after this returns.
   }
 
   // ===================== MULTI-PAGE FORM LOOP =====================
+  // Self-navigating: at every step it (re)opens the apply form, completes any
+  // account-creation / sign-in wall, autofills, then advances — until the
+  // application is submitted (confirmed) or there is genuinely nothing left to do.
   async function multiPageLoop() {
-    const MAX_PAGES = 10;
+    const MAX_PAGES = 18;
     let prevPageHash = getPageHash();
     for (let page = 1; page <= MAX_PAGES; page++) {
       if (checkSuccess()) { LOG('Success detected — stopping multi-page loop'); break; }
@@ -1525,6 +1541,11 @@
       }
       prevPageHash = getPageHash();
 
+      // Handle anything blocking this step before filling: an "Apply"/"Continue
+      // to application" button, or an account-creation / sign-in wall.
+      await openApplicationForm();
+      await handleAccountAuth();
+
       // Try Jobright autofill again
       await triggerAutofill();
       await sleep(3000);
@@ -1542,18 +1563,24 @@
       if (action === 'submitted') {
         LOG('Submitted on page ' + page);
         await sleep(3000);
-        if (checkSuccess()) LOG('Success confirmed after submit');
-        break;
+        if (checkSuccess()) { LOG('Success confirmed after submit'); break; }
+        // Some ATS show a final review/confirm step after the first "submit" —
+        // keep looping so we click it too instead of stopping prematurely.
+        continue;
       } else if (action === 'next_page') {
         LOG('Next page clicked on page ' + page);
         await sleep(3000);
         continue;
       } else {
-        // No button found — try one more fallback+submit
-        await sleep(2000);
+        // No submit/next found — re-fill once and retry; only stop if still nothing.
+        await sleep(1500);
+        await openApplicationForm();
+        await handleAccountAuth();
         await fallbackFill();
+        await handleValidationErrors();
         const retry = await autoSubmitOrNext();
-        if (retry) LOG('Retry result:', retry);
+        if (retry) { LOG('Retry result: ' + retry); await sleep(3000); continue; }
+        LOG('Nothing left to click on page ' + page + ' — ending loop');
         break;
       }
     }
@@ -1575,8 +1602,9 @@
     await sleep(1000);
     await fallbackFill();
     await sleep(1000);
-    const result = await autoSubmitOrNext();
-    if (result === 'next_page') { await sleep(3000); await multiPageLoop(); }
+    await autoSubmitOrNext();
+    await sleep(2000);
+    // Remaining pages are driven by the dispatcher's universal multi-page driver.
   }
 
   // ===================== ASHBY AUTOMATION (from LazyApply) =====================
@@ -1755,13 +1783,14 @@
     const useLastApp = await findByText('button,a', /use my last application|autofill with/i, 3000);
     if (useLastApp) { LOG('Skipping "Use My Last Application"'); }
 
-    // Handle sign-in/create account pages
+    // Handle sign-in/create account pages with the shared saved-credentials flow
+    // (fills email + password + confirm, ticks consent, submits, and falls back to
+    // sign-in if the account already exists).
     const signInBtn = $('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"]');
     if (signInBtn && isVisible(signInBtn)) {
-      LOG('Workday sign-in page detected — filling credentials');
-      const emailInput = $('input[data-automation-id="email"]');
-      if (emailInput && !emailInput.value) nativeSet(emailInput, p.email || '');
-      await sleep(500);
+      LOG('Workday sign-in/create-account page detected');
+      await handleAccountAuth();
+      await sleep(1500);
     }
 
     // Wait for form page
@@ -3511,10 +3540,26 @@
 
   // ===================== QUEUE ENGINE (LazyApply-enhanced) =====================
   // LazyApply-inspired: configurable delays and timeout
-  const QUEUE_DELAYS = { 1: 2000, 1.5: 1500, 2: 1000, 3: 500 };
+  const QUEUE_DELAYS = { 1: 1500, 1.5: 1000, 2: 600, 3: 300 };
   let qSpeed = 1;
   let qTimeout = 150000; // 150s hard cap per job — enough for the fill→submit→verify→retry loop; protects against truly stuck pages (captcha/login)
   let _qTimeoutId = null;
+
+  // ===================== SINGLE RUNNER TAB =====================
+  // The queue must drive exactly ONE tab — otherwise every open tab (and any new
+  // tab you open to browse) would also navigate itself to job URLs and hijack your
+  // browsing. window.name survives same-tab navigations (even cross-origin), so we
+  // tag the tab that started the run and only that tab processes/navigates.
+  const RUNNER_PREFIX = 'UAQRUN::';
+  function isRunnerTab() { try { return typeof window.name === 'string' && window.name.indexOf(RUNNER_PREFIX) === 0; } catch (_) { return false; } }
+  function markRunnerTab() { try { if (window.name.indexOf(RUNNER_PREFIX) !== 0) window.name = RUNNER_PREFIX + (window.name || ''); } catch (_) {} }
+  function unmarkRunnerTab() { try { if (typeof window.name === 'string' && window.name.indexOf(RUNNER_PREFIX) === 0) window.name = window.name.slice(RUNNER_PREFIX.length); } catch (_) {} }
+
+  // Has this URL already been applied to in a previous session?
+  function alreadyApplied(url) {
+    const n = normalizeUrl(url);
+    return (_appHistory || []).some(a => a.status === 'applied' && normalizeUrl(a.url) === n);
+  }
 
   // Are we on the page for the currently-applying job? Match the queued URL, OR
   // accept any page that now shows an application form / Apply button — because
@@ -3531,6 +3576,8 @@
 
   async function processQ() {
     if (!qActive || qPaused || !queue.length) return;
+    // Only the dedicated runner tab drives the queue — never hijack other tabs.
+    if (!isRunnerTab()) return;
     const c = queue.find(j => j.status === 'applying');
     if (c) {
       try {
@@ -3548,13 +3595,45 @@
             goNext();
           }, qTimeout);
 
+          // LazyApply-style: never re-apply to a job already applied to before.
+          if (qSkipApplied && alreadyApplied(c.url)) {
+            LOG('Already applied previously — skipping');
+            clearTimeout(_qTimeoutId);
+            c.status = 'skipped'; c.error = 'Already applied'; c.completedAt = Date.now();
+            qStats.skipped++;
+            await saveQ(); await saveStats(); renderQ(); updateCtrl();
+            await sleep(400);
+            goNext();
+            return;
+          }
+
+          // FAST VALIDITY GATE (LazyApply-style): if this URL has no application
+          // form, no Apply button, isn't a known ATS, and isn't already a success
+          // page, skip it quickly instead of burning minutes on retries.
+          await openApplicationForm();
+          await handleAccountAuth();
+          if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+            await sleep(2500); // one short grace period for slow SPAs
+            await openApplicationForm();
+            if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+              LOG('No application form / Apply found — skipping as invalid job');
+              clearTimeout(_qTimeoutId);
+              c.status = 'skipped'; c.error = 'No application form found'; c.completedAt = Date.now();
+              qStats.skipped++;
+              await saveQ(); await saveStats(); renderQ(); updateCtrl();
+              await sleep(600);
+              goNext();
+              return;
+            }
+          }
+
           // Drive the application to a CONFIRMED submission before moving on.
           // The user requirement: each job must be fully autofilled AND submitted
           // before the queue advances. We attempt fill+submit, verify, and retry
           // (re-opening the form / filling gaps / re-submitting) until confirmed or
           // the per-job timeout fires. Only a confirmed submission counts as done.
           let success = false;
-          for (let attempt = 0; attempt < 3 && !success; attempt++) {
+          for (let attempt = 0; attempt < 2 && !success; attempt++) {
             await withRetry(async () => { await dispatchATSAutomation(); }, 'Queue job automation');
             // Verify submission (poll for a confirmation signal).
             for (let check = 0; check < 6; check++) {
@@ -3628,13 +3707,16 @@
       const idx = queue.indexOf(n);
       st.set('ua_q_stopped_at', idx);
       saveQ().then(() => {
-        const delay = Math.max(_rateLimitDelay || 3000, QUEUE_DELAYS[qSpeed] || 2000);
+        // Inter-job delay scales with speed (no hidden 3s floor unless the user
+        // explicitly enabled rate limiting).
+        const delay = Math.max(_rateLimitDelay || 0, QUEUE_DELAYS[qSpeed] || 1500);
         setTimeout(() => { location.href = n.url; }, delay);
       });
     } else {
       qActive = false;
       st.set(SK.QA, false);
       st.set('ua_q_stopped_at', -1);
+      unmarkRunnerTab(); // free this tab — run finished
       // LazyApply-style: completion summary
       LOG('Queue complete — all jobs processed');
       const done = queue.filter(j => j.status === 'done').length;
@@ -3647,7 +3729,7 @@
       st.get('ua_notif_enabled').then(enabled => {
         if (enabled) sendNotification('Queue Complete!', `${done} applied, ${failed} failed, ${skipped} skipped of ${queue.length} total`);
       });
-      renderQ(); updateCtrl();
+      renderQ(); updateCtrl(); showCompletionSummary();
     }
   }
 
@@ -3655,6 +3737,7 @@
     const pending = queue.filter(j => j.status === 'pending');
     if (!pending.length) return;
     qActive = true; qPaused = false;
+    markRunnerTab(); // this tab becomes the dedicated automation tab
     qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0 };
     await st.set(SK.QA, true); await st.set(SK.QP, false); await saveStats();
     updateCtrl(); goNext();
@@ -3667,6 +3750,7 @@
       if (queue[i].status === 'applying' || queue[i].status === 'timeout') queue[i].status = 'pending';
     }
     qActive = true; qPaused = false;
+    markRunnerTab();
     await st.set(SK.QA, true); await st.set(SK.QP, false);
     await saveQ(); updateCtrl(); goNext();
     LOG(`Resumed queue from job #${qStoppedAt + 1}`);
@@ -3675,6 +3759,7 @@
   async function stopQ() {
     clearTimeout(_qTimeoutId);
     qActive = false; qPaused = false;
+    unmarkRunnerTab();
     await st.set(SK.QA, false); await st.set(SK.QP, false);
     // LazyApply: save stop point for session resumption
     const applyingIdx = queue.findIndex(j => j.status === 'applying');
@@ -4171,11 +4256,15 @@
 .uc-bar-fill{height:100%;width:0%;border-radius:4px;background:linear-gradient(90deg,#00a86b,#00e58f);transition:width .4s ease}
 .uc-proc{margin-top:11px;font-size:12px;font-weight:600;color:#4ea1ff}
 .uc-proc.paused{color:#fbbf24}
+.uc-stats{display:flex;gap:10px;margin-top:9px;font-size:11px;color:#9aa0a6}
+.uc-stat b{font-variant-numeric:tabular-nums;font-weight:800}
+.uc-stat.ok b{color:#34d399}.uc-stat.sk b{color:#9aa0a6}.uc-stat.fa b{color:#f87171}
 .uc-speed{display:flex;align-items:center;gap:6px;margin-top:14px}
 .uc-speed-l{font-size:12px;font-weight:600;color:#bfbfc4;margin-right:2px}
-.uc-sp{min-width:34px;height:26px;padding:0 8px;border-radius:13px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s}
+.uc-sp{min-width:38px;height:28px;padding:0 9px;border-radius:14px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:700;cursor:pointer;transition:all .15s}
+.uc-sp:hover{border-color:#00f0a0;color:#e7e7ea}
 .uc-sp:hover{border-color:#4b4b52;color:#e7e7ea}
-.uc-sp.active{background:#fff;border-color:#fff;color:#0e0e0f}
+.uc-sp.active{background:#00f0a0;border-color:#00f0a0;color:#06231a;box-shadow:0 0 0 2px rgba(0,240,160,.25)}
 .uc-actions{display:flex;gap:10px;margin-top:16px}
 .uc-act{flex:1;height:38px;border-radius:9px;border:none;cursor:pointer;font-size:13px;font-weight:700;transition:filter .15s,background .15s}
 .uc-act:hover{filter:brightness(1.08)}
@@ -4341,7 +4430,7 @@
 .ua-scrape-btn:hover{background:linear-gradient(135deg,#2563eb,#1d4ed8)}
 .ua-scrape-btn:disabled{background:#e5e7eb;color:#9ca3af;cursor:default}
     `;
-    document.head.appendChild(s);
+    (document.head || document.documentElement).appendChild(s);
   }
 
   // ===================== SVG (inline, sized) =====================
@@ -4360,57 +4449,84 @@
   }
 
   // ===================== UI BUILD =====================
+  // Build (or re-build) the "Automation In Progress" control panel. Idempotent and
+  // safe to call very early (document_start) and repeatedly — this is what keeps the
+  // Skip/Pause/Quit controls constantly visible across every page navigation.
+  function ensureOverlay() {
+    try {
+      if (window.self !== window.top) return null;
+      const host = document.body || document.documentElement;
+      if (!host) return null;
+      let ctrl = document.getElementById('ua-ctrl');
+      if (ctrl && ctrl.isConnected) return ctrl;
+      injectCSS(); // ensure .uc-* styles exist
+      ctrl = document.createElement('div'); ctrl.id = 'ua-ctrl';
+      ctrl.innerHTML = `<div id="ua-ctrl-card">
+        <div class="uc-top">
+          <div class="uc-title">Automation In Progress</div>
+          <div class="uc-count" id="uc-count">Job 0 of 0</div>
+        </div>
+        <div class="uc-pos"><span id="uc-pos">Preparing…</span><span class="uc-pos-co" id="uc-pos-co" style="display:none"></span></div>
+        <div class="uc-bar"><div class="uc-bar-fill" id="uc-bar"></div></div>
+        <div class="uc-proc" id="uc-proc">Processing…</div>
+        <div class="uc-stats" id="uc-stats"><span class="uc-stat ok"><b id="uc-ok">0</b> applied</span><span class="uc-stat sk"><b id="uc-sk">0</b> skipped</span><span class="uc-stat fa"><b id="uc-fa">0</b> failed</span></div>
+        <div class="uc-speed">
+          <span class="uc-speed-l">Speed:</span>
+          <button class="uc-sp active" data-sp="1">1x</button>
+          <button class="uc-sp" data-sp="1.5">1.5x</button>
+          <button class="uc-sp" data-sp="2">2x</button>
+          <button class="uc-sp" data-sp="3">3x</button>
+        </div>
+        <div class="uc-actions">
+          <button class="uc-act pause" id="uc-pause">Pause</button>
+          <button class="uc-act skip" id="uc-skip">Skip</button>
+          <button class="uc-act quit" id="uc-quit">Quit</button>
+        </div>
+      </div>`;
+      host.appendChild(ctrl);
+      makeDraggableByHandle(ctrl, ctrl.querySelector('.uc-top'));
+      st.get('ua_ctrl_pos').then(p => {
+        if (!p || !p.left) return;
+        const left = Math.max(0, Math.min(window.innerWidth - 80, parseInt(p.left) || 0));
+        const top = Math.max(0, Math.min(window.innerHeight - 40, parseInt(p.top) || 0));
+        ctrl.style.left = left + 'px'; ctrl.style.top = top + 'px'; ctrl.style.right = 'auto';
+      });
+      ctrl.querySelector('#uc-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
+      ctrl.querySelector('#uc-skip').addEventListener('click', skipJob);
+      ctrl.querySelector('#uc-quit').addEventListener('click', stopQ);
+      ctrl.querySelectorAll('.uc-sp').forEach(btn => btn.addEventListener('click', () => setQueueSpeed(parseFloat(btn.dataset.sp) || 1)));
+      // If we already know a run is active in this runner tab, show immediately.
+      if (isRunnerTab()) ctrl.classList.add('show');
+      updateCtrl();
+      return ctrl;
+    } catch (_) { return null; }
+  }
+
   function buildUI() {
     if (window.self !== window.top) return;
 
-    // --- Main FAB (draggable) ---
+    // --- Main FAB (the old "Ultimate Autofill" drawer entry) — HIDDEN by request.
+    // Everything is now driven from the native Jobright popup (bulk-apply card) plus
+    // the draggable "Automation In Progress" overlay, so this separate panel is not
+    // shown. The drawer code stays for power users via keyboard shortcut only.
     const fab = document.createElement('div'); fab.id = 'ua-fab';
     fab.innerHTML = ico('bolt', 22, 22, '#fff') + '<span class="badge" id="ua-badge"></span>';
+    fab.style.display = 'none';
     document.body.appendChild(fab);
     makeDraggable(fab);
     fab.addEventListener('click', () => { const d = document.getElementById('ua-drawer'); d.classList.toggle('open'); positionDrawer(); });
 
-    // --- Add-to-queue mini FAB ---
+    // --- Add-to-queue mini FAB --- (also hidden; add jobs from the sidebar card)
     const af = document.createElement('div'); af.id = 'ua-fab-add';
     af.innerHTML = ico('plus', 18, 18, '#6ee7b7');
     af.title = 'Add this page to queue';
+    af.style.display = 'none';
     document.body.appendChild(af);
     af.addEventListener('click', () => addJob(location.href, document.title));
 
-    // --- Automation In Progress panel (matches Jobright 1.14.0 dark UI) ---
-    const ctrl = document.createElement('div'); ctrl.id = 'ua-ctrl';
-    ctrl.innerHTML = `<div id="ua-ctrl-card">
-      <div class="uc-top">
-        <div class="uc-title">Automation In Progress</div>
-        <div class="uc-count" id="uc-count">Job 0 of 0</div>
-      </div>
-      <div class="uc-pos"><span id="uc-pos">Preparing…</span><span class="uc-pos-co" id="uc-pos-co" style="display:none"></span></div>
-      <div class="uc-bar"><div class="uc-bar-fill" id="uc-bar"></div></div>
-      <div class="uc-proc" id="uc-proc">Processing…</div>
-      <div class="uc-speed">
-        <span class="uc-speed-l">Speed:</span>
-        <button class="uc-sp active" data-sp="1">1x</button>
-        <button class="uc-sp" data-sp="1.5">1.5x</button>
-        <button class="uc-sp" data-sp="2">2x</button>
-        <button class="uc-sp" data-sp="3">3x</button>
-      </div>
-      <div class="uc-actions">
-        <button class="uc-act pause" id="uc-pause">Pause</button>
-        <button class="uc-act skip" id="uc-skip">Skip</button>
-        <button class="uc-act quit" id="uc-quit">Quit</button>
-      </div>
-    </div>`;
-    document.body.appendChild(ctrl);
-    document.getElementById('uc-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
-    document.getElementById('uc-skip').addEventListener('click', skipJob);
-    document.getElementById('uc-quit').addEventListener('click', stopQ);
-    // Speed selector (1x / 1.5x / 2x / 3x) — controls inter-job delay (LazyApply-style).
-    ctrl.querySelectorAll('.uc-sp').forEach(btn => btn.addEventListener('click', () => {
-      qSpeed = parseFloat(btn.dataset.sp) || 1;
-      ctrl.querySelectorAll('.uc-sp').forEach(b => b.classList.toggle('active', b === btn));
-      try { st.set('ua_q_speed', qSpeed); } catch (_) {}
-      LOG('Queue speed set to ' + qSpeed + 'x');
-    }));
+    // --- Automation In Progress panel --- (created via ensureOverlay so it can be
+    // re-mounted instantly and kept alive throughout the run)
+    ensureOverlay();
 
     // --- Drawer ---
     const dw = document.createElement('div'); dw.id = 'ua-drawer';
@@ -4572,6 +4688,41 @@
   }
 
   // ===================== DRAGGABLE =====================
+  // Drag `target` only when grabbing `handle` (so buttons inside still click).
+  function makeDraggableByHandle(target, handle) {
+    if (!target || !handle) return;
+    handle.style.cursor = 'move';
+    handle.style.userSelect = 'none';
+    handle.title = 'Drag to move';
+    let sx, sy, ox, oy, dragging = false;
+    const onDown = e => {
+      if (e.target.closest('button')) return; // never start a drag from a control
+      const t = e.touches ? e.touches[0] : e;
+      sx = t.clientX; sy = t.clientY;
+      const r = target.getBoundingClientRect(); ox = r.left; oy = r.top;
+      dragging = true;
+      target.style.transition = 'none';
+      document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);
+      document.addEventListener('touchmove', onMove, { passive: false }); document.addEventListener('touchend', onUp);
+      e.preventDefault();
+    };
+    const onMove = e => {
+      if (!dragging) return; e.preventDefault();
+      const t = e.touches ? e.touches[0] : e;
+      const nx = Math.max(0, Math.min(window.innerWidth - target.offsetWidth, ox + (t.clientX - sx)));
+      const ny = Math.max(0, Math.min(window.innerHeight - target.offsetHeight, oy + (t.clientY - sy)));
+      target.style.left = nx + 'px'; target.style.top = ny + 'px'; target.style.right = 'auto'; target.style.bottom = 'auto';
+    };
+    const onUp = () => {
+      dragging = false; target.style.transition = '';
+      document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp);
+      if (target.style.left) { try { st.set('ua_ctrl_pos', { left: target.style.left, top: target.style.top }); } catch (_) {} }
+    };
+    handle.addEventListener('mousedown', onDown);
+    handle.addEventListener('touchstart', onDown, { passive: false });
+  }
+
   function makeDraggable(el) {
     let sx, sy, ox, oy, dragging = false, moved = false;
     const onDown = e => {
@@ -5009,14 +5160,15 @@
 
   async function handleFile(f) {
     const text = await f.text();
-    // Use both parsers for maximum compatibility (LazyApply-enhanced)
-    const u1 = parseCSV(text);
-    const u2 = parseBulkUrls(text);
-    const u = [...new Set([...u1, ...u2])];
-    if (!u.length) { alert('No valid URLs found.'); return; }
-    LOG(`Imported ${u.length} URLs from file`);
+    // Parse with both parsers, then NORMALIZE + de-dupe so the count matches the
+    // number of unique job URLs in the file (no more ~2x inflation).
+    const raw = [...parseCSV(text), ...parseBulkUrls(text)];
+    const u = [...new Set(raw.map(normalizeUrl).filter(Boolean))];
+    if (!u.length) { alert('No valid URLs found in the file.'); return; }
+    const before = queue.length;
     for (const x of u) await addJob(x);
-    // Refresh the in-sidebar bulk-apply UI (no separate popup — user preference).
+    const added = queue.length - before;
+    LOG(`Imported ${u.length} unique URLs (${added} new, ${u.length - added} already in queue)`);
     injectSidebarUI(); updateSidebarUI();
   }
 
@@ -5126,15 +5278,55 @@
     try {
       const s = getSidebar();
       if (s) {
+        // Only un-hide the host if something hid it. We deliberately do NOT click
+        // Jobright's collapse toggle — doing so on every tick made the panel flicker
+        // (disappear/appear). The panel naturally reloads once per job navigation.
         const host = (s.getRootNode && s.getRootNode().host) || null;
         if (host && host.style && host.style.display === 'none') host.style.display = '';
-        // Expand if collapsed (click the collapse/expand toggle when it reads collapsed).
-        const expandBtn = s.querySelector('.toggle-handler[aria-expanded="false"]');
-        if (expandBtn && isVisible(expandBtn)) realClick(expandBtn);
       }
       const ctrl = document.getElementById('ua-ctrl');
-      if (ctrl && qActive) ctrl.classList.add('show');
+      if (ctrl && qActive && isRunnerTab()) ctrl.classList.add('show');
     } catch (_) {}
+  }
+
+  function escHtml(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+  // Render the manageable job list inside the sidebar card (checkboxes, status,
+  // per-row remove). Cheap-guarded so it only rebuilds when the queue/selection
+  // actually changes (avoids resetting scroll/checkboxes on every status tick).
+  let _sbQueueSig = '';
+  function renderSidebarQueue() {
+    if (!_sbSection) return;
+    const manage = _sbSection.querySelector('#ua-sb-manage');
+    const list = _sbSection.querySelector('#ua-sb-list');
+    if (!manage || !list) return;
+    if (!queue.length) { manage.style.display = 'none'; list.innerHTML = ''; _sbQueueSig = ''; return; }
+    const sig = queue.length + '|' + queue.map(j => j.id + ':' + j.status + (selected.has(j.id) ? '*' : '')).join(',');
+    if (sig === _sbQueueSig) return;
+    _sbQueueSig = sig;
+    manage.style.display = 'block';
+    const STC = { pending: '#9aa0a6', applying: '#4ea1ff', done: '#34d399', failed: '#f87171', timeout: '#fbbf24', skipped: '#9aa0a6' };
+    const MAX = 150;
+    const shown = queue.slice(0, MAX);
+    list.innerHTML = shown.map(j => {
+      const label = j.companyName ? `${j.companyName} — ${j.title || ''}` : (j.title || shortUrl(j.url));
+      return `<div style="display:flex;align-items:center;gap:7px;padding:5px 8px;background:#0e0e0f;border:1px solid #242427;border-radius:7px">
+        <input type="checkbox" class="ua-sb-jobcb" data-id="${j.id}" ${selected.has(j.id) ? 'checked' : ''} style="accent-color:#00f0a0;width:13px;height:13px;flex-shrink:0">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:11px;color:#e7e7ea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escHtml(j.url)}">${escHtml(label)}</div>
+          <div style="font-size:9px;font-weight:600;color:${STC[j.status] || '#9aa0a6'};text-transform:capitalize">${escHtml(j.status)}</div>
+        </div>
+        <button class="ua-sb-jobdel" data-id="${j.id}" title="Remove" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:15px;line-height:1;flex-shrink:0;padding:0 2px">×</button>
+      </div>`;
+    }).join('') + (queue.length > MAX ? `<div style="font-size:10px;color:#6f6f76;text-align:center;padding:5px">+${queue.length - MAX} more</div>` : '');
+    list.querySelectorAll('.ua-sb-jobcb').forEach(cb => cb.addEventListener('change', () => {
+      if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+      const selall = _sbSection.querySelector('#ua-sb-selall');
+      if (selall) selall.checked = queue.length > 0 && queue.every(j => selected.has(j.id));
+    }));
+    list.querySelectorAll('.ua-sb-jobdel').forEach(b => b.addEventListener('click', () => removeJob(b.dataset.id)));
+    const selall = _sbSection.querySelector('#ua-sb-selall');
+    if (selall) selall.checked = queue.length > 0 && queue.every(j => selected.has(j.id));
   }
 
   function buildSidebarSection() {
@@ -5162,6 +5354,14 @@
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none">
         <input type="checkbox" id="ua-sb-tailor" style="accent-color:#00f0a0;width:14px;height:14px"> Tailor resume for each job <span style="color:#6f6f76">(slower)</span>
       </label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none"><input type="checkbox" id="ua-sb-skipapplied" style="accent-color:#00f0a0;width:13px;height:13px"> Skip jobs already applied to</label>
+      <button id="ua-sb-cred-toggle" style="${ghostBtn};width:100%;text-align:left;margin-bottom:8px">🔑 ATS account login (saved credentials)</button>
+      <div id="ua-sb-cred-wrap" style="display:none;margin-bottom:10px">
+        <input id="ua-sb-cred-email" type="text" placeholder="Email" autocomplete="off" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;margin-bottom:6px">
+        <input id="ua-sb-cred-pw" type="text" placeholder="Password (reused for ATS sign-ups)" autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px">
+        <button id="ua-sb-cred-save" style="${ghostBtn};width:100%;margin-top:6px">Save credentials</button>
+        <div style="font-size:9px;color:#6f6f76;margin-top:5px;line-height:1.4">Used to auto-create / sign in to ATS accounts (Workday, iCIMS, Taleo, SuccessFactors…). The same email &amp; password are reused across sites.</div>
+      </div>
       <div style="display:flex;align-items:center;gap:6px;margin-bottom:11px">
         <span style="font-size:11px;font-weight:600;color:#bfbfc4">Speed:</span>
         <button class="ua-sb-sp" data-sp="1" style="min-width:30px;height:24px;border-radius:12px;border:1px solid #fff;background:#fff;color:#0e0e0f;font-size:11px;font-weight:700;cursor:pointer">1x</button>
@@ -5182,7 +5382,15 @@
         <button id="ua-sb-pause" style="${ghostBtn};flex:1">Pause</button>
         <button id="ua-sb-skip" style="${ghostBtn};flex:1">Skip</button>
       </div>
-      <div style="margin-top:8px;font-size:10px;color:#6f6f76;line-height:1.4">CSV / list of job URLs → opens each, runs Jobright Autofill, fills required fields &amp; submits automatically.</div>
+      <div id="ua-sb-manage" style="display:none;margin-top:12px;border-top:1px solid #242427;padding-top:11px">
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none"><input type="checkbox" id="ua-sb-selall" style="accent-color:#00f0a0;width:13px;height:13px"> All</label>
+          <button id="ua-sb-delsel" style="${ghostBtn};padding:6px 9px;flex:0 0 auto;font-size:11px">Delete selected</button>
+          <button id="ua-sb-clear" style="padding:6px 9px;border:1px solid #5a2330;border-radius:8px;background:transparent;color:#f87171;font-size:11px;font-weight:600;cursor:pointer">Clear all</button>
+        </div>
+        <div id="ua-sb-list" style="max-height:190px;overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div>
+      </div>
+      <div style="margin-top:10px;font-size:10px;color:#6f6f76;line-height:1.4">CSV / list of job URLs → opens each, runs Jobright Autofill, fills required fields &amp; submits automatically.</div>
     `;
     // --- wire events (engine functions are in this same scope) ---
     const fileInput = wrap.querySelector('#ua-sb-file');
@@ -5205,26 +5413,48 @@
     wrap.querySelector('#ua-sb-stop').addEventListener('click', stopQ);
     wrap.querySelector('#ua-sb-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
     wrap.querySelector('#ua-sb-skip').addEventListener('click', skipJob);
+    // --- bulk queue management ---
+    wrap.querySelector('#ua-sb-selall').addEventListener('change', e => {
+      if (e.target.checked) queue.forEach(j => selected.add(j.id)); else selected.clear();
+      renderSidebarQueue();
+    });
+    wrap.querySelector('#ua-sb-delsel').addEventListener('click', async () => {
+      if (!selected.size) { alert('Select one or more jobs first (tick the boxes or "All").'); return; }
+      const n = selected.size;
+      if (confirm(`Remove ${n} selected job${n === 1 ? '' : 's'} from the queue?`)) await removeSelected();
+    });
+    wrap.querySelector('#ua-sb-clear').addEventListener('click', async () => {
+      if (!queue.length) return;
+      if (confirm(`Clear ALL ${queue.length} jobs from the queue?`)) await clearQ();
+    });
     const tailorCb = wrap.querySelector('#ua-sb-tailor');
     tailorCb.checked = queueUseTailor;
     tailorCb.addEventListener('change', () => { queueUseTailor = tailorCb.checked; try { st.set('ua_queue_tailor', queueUseTailor); } catch (_) {} LOG('Queue tailoring ' + (queueUseTailor ? 'ON' : 'OFF')); });
-    // Speed selector (shared with the overlay; controls inter-job delay).
-    const paintSpeed = () => wrap.querySelectorAll('.ua-sb-sp').forEach(b => {
-      const on = parseFloat(b.dataset.sp) === qSpeed;
-      b.style.background = on ? '#fff' : 'transparent';
-      b.style.color = on ? '#0e0e0f' : '#bfbfc4';
-      b.style.borderColor = on ? '#fff' : '#34343a';
-      b.style.fontWeight = on ? '700' : '600';
+    const skipCb = wrap.querySelector('#ua-sb-skipapplied');
+    skipCb.checked = qSkipApplied;
+    skipCb.addEventListener('change', () => { qSkipApplied = skipCb.checked; try { st.set('ua_skip_applied', qSkipApplied); } catch (_) {} });
+    // --- saved ATS credentials ---
+    const credWrap = wrap.querySelector('#ua-sb-cred-wrap');
+    wrap.querySelector('#ua-sb-cred-toggle').addEventListener('click', async () => {
+      const show = credWrap.style.display === 'none';
+      credWrap.style.display = show ? 'block' : 'none';
+      if (show) {
+        try { const pr = await getProfile(); wrap.querySelector('#ua-sb-cred-email').value = pr.email || ''; wrap.querySelector('#ua-sb-cred-pw').value = await getAppPassword(); } catch (_) {}
+      }
     });
-    wrap.querySelectorAll('.ua-sb-sp').forEach(b => b.addEventListener('click', () => {
-      qSpeed = parseFloat(b.dataset.sp) || 1;
-      try { st.set('ua_q_speed', qSpeed); } catch (_) {}
-      paintSpeed();
-      const ov = document.getElementById('ua-ctrl');
-      if (ov) ov.querySelectorAll('.uc-sp').forEach(x => x.classList.toggle('active', parseFloat(x.dataset.sp) === qSpeed));
-      LOG('Queue speed set to ' + qSpeed + 'x');
-    }));
-    paintSpeed();
+    wrap.querySelector('#ua-sb-cred-save').addEventListener('click', async () => {
+      const em = wrap.querySelector('#ua-sb-cred-email').value.trim();
+      const pw = wrap.querySelector('#ua-sb-cred-pw').value.trim();
+      try {
+        if (pw) await st.set('ua_app_password', pw);
+        if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); }
+      } catch (_) {}
+      const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
+      LOG('Saved ATS credentials');
+    });
+    // Speed selector (shared with the overlay; scales automation waits + job delay).
+    wrap.querySelectorAll('.ua-sb-sp').forEach(b => b.addEventListener('click', () => setQueueSpeed(parseFloat(b.dataset.sp) || 1)));
+    paintSidebarSpeed();
     _sbSection = wrap;
     return wrap;
   }
@@ -5248,16 +5478,13 @@
 
   function updateSidebarUI() {
     if (!_sbSection) return;
+    renderSidebarQueue();
     const q = (id) => _sbSection.querySelector(id);
     const pending = queue.filter(j => j.status === 'pending').length;
     const cnt = q('#ua-sb-count'); if (cnt) cnt.textContent = `${queue.length} job${queue.length === 1 ? '' : 's'}`;
     const tailorCb = q('#ua-sb-tailor'); if (tailorCb && tailorCb.checked !== queueUseTailor) tailorCb.checked = queueUseTailor;
-    _sbSection.querySelectorAll('.ua-sb-sp').forEach(b => {
-      const on = parseFloat(b.dataset.sp) === qSpeed;
-      b.style.background = on ? '#fff' : 'transparent';
-      b.style.color = on ? '#0e0e0f' : '#bfbfc4';
-      b.style.borderColor = on ? '#fff' : '#34343a';
-    });
+    const skipCb = q('#ua-sb-skipapplied'); if (skipCb && skipCb.checked !== qSkipApplied) skipCb.checked = qSkipApplied;
+    paintSidebarSpeed();
     const start = q('#ua-sb-start'), stop = q('#ua-sb-stop'), runrow = q('#ua-sb-runrow'), status = q('#ua-sb-status');
     if (qActive) {
       if (start) start.style.display = 'none';
@@ -5280,12 +5507,59 @@
     }
   }
 
+  // Paint the sidebar card's speed buttons (green = selected, clear indicator).
+  function paintSidebarSpeed() {
+    if (!_sbSection) return;
+    _sbSection.querySelectorAll('.ua-sb-sp').forEach(b => {
+      const on = parseFloat(b.dataset.sp) === qSpeed;
+      b.style.background = on ? '#00f0a0' : 'transparent';
+      b.style.color = on ? '#06231a' : '#bfbfc4';
+      b.style.borderColor = on ? '#00f0a0' : '#34343a';
+      b.style.fontWeight = on ? '800' : '600';
+      b.style.boxShadow = on ? '0 0 0 2px rgba(0,240,160,.25)' : 'none';
+    });
+  }
+  // Single source of truth for speed: updates the wait factor, persistence, and
+  // BOTH indicators (overlay + sidebar card).
+  function setQueueSpeed(s) {
+    qSpeed = s; qSpeedFactor = speedFactorFor(s);
+    try { st.set('ua_q_speed', qSpeed); } catch (_) {}
+    const ov = document.getElementById('ua-ctrl');
+    if (ov) ov.querySelectorAll('.uc-sp').forEach(b => b.classList.toggle('active', parseFloat(b.dataset.sp) === qSpeed));
+    paintSidebarSpeed();
+    LOG('Queue speed set to ' + qSpeed + 'x (wait factor ' + qSpeedFactor + ')');
+  }
+
+  // LazyApply-style completion summary shown in the overlay when a run finishes.
+  let _summaryTimer = null;
+  function showCompletionSummary() {
+    const ctrl = document.getElementById('ua-ctrl');
+    if (!ctrl) return;
+    const done = queue.filter(j => j.status === 'done').length;
+    const skipped = queue.filter(j => j.status === 'skipped').length;
+    const failed = queue.filter(j => ['failed', 'timeout'].includes(j.status)).length;
+    const set = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+    const title = ctrl.querySelector('.uc-title'); if (title) title.textContent = '✅ Automation Complete';
+    set('uc-count', `${queue.length} total`);
+    set('uc-pos', 'All jobs processed');
+    const co = document.getElementById('uc-pos-co'); if (co) co.style.display = 'none';
+    const bar = document.getElementById('uc-bar'); if (bar) bar.style.width = '100%';
+    const proc = document.getElementById('uc-proc');
+    if (proc) { proc.textContent = `${done} applied · ${skipped} skipped · ${failed} failed`; proc.classList.remove('paused'); proc.style.color = '#34d399'; }
+    set('uc-ok', done); set('uc-sk', skipped); set('uc-fa', failed);
+    const runrow = ctrl.querySelector('.uc-actions'); // keep Quit to dismiss
+    ctrl.classList.add('show');
+    clearTimeout(_summaryTimer);
+    _summaryTimer = setTimeout(() => { ctrl.classList.remove('show'); }, 15000);
+  }
+
   function updateCtrl() {
     updateSidebarUI(); // keep the in-native-sidebar bulk-apply controls in sync
     const ctrl = document.getElementById('ua-ctrl');
     if (!ctrl) return;
     const pauseBtn = document.getElementById('uc-pause');
-    if (qActive) {
+    // Only show the run overlay in the dedicated runner tab.
+    if (qActive && isRunnerTab()) {
       ctrl.classList.add('show');
       const total = queue.length;
       const dn = queue.filter(j => ['done', 'failed', 'timeout', 'skipped'].includes(j.status)).length;
@@ -5303,6 +5577,11 @@
       }
       const bar = document.getElementById('uc-bar');
       if (bar) bar.style.width = (total ? Math.round((dn / total) * 100) : 0) + '%';
+      // Live LazyApply-style counters.
+      const okEl = document.getElementById('uc-ok'), skEl = document.getElementById('uc-sk'), faEl = document.getElementById('uc-fa');
+      if (okEl) okEl.textContent = queue.filter(j => j.status === 'done').length;
+      if (skEl) skEl.textContent = queue.filter(j => j.status === 'skipped').length;
+      if (faEl) faEl.textContent = queue.filter(j => ['failed', 'timeout'].includes(j.status)).length;
       const proc = document.getElementById('uc-proc');
       if (proc) {
         if (qPaused) { proc.textContent = 'Paused'; proc.classList.add('paused'); }
@@ -5346,7 +5625,12 @@
     o.observe(document.body || document.documentElement, { childList: true, subtree: true });
     // Safety net: periodic re-inject in case the sidebar mounts without mutations
     // we observed (e.g. inside a shadow root). Cheap — one querySelector per tick.
-    setInterval(injectSidebarUI, 1500);
+    // During a run, also keep Jobright's own popup open so you can watch it autofill.
+    setInterval(() => { injectSidebarUI(); if (qActive && isRunnerTab()) forceOpenSidebar(); }, 1500);
+    // Watchdog: keep the control panel alive throughout the run. If anything removes
+    // it (page script, re-render), re-mount it within ~600ms so the controls never
+    // disappear while automation is in progress.
+    setInterval(() => { if (qActive && isRunnerTab()) { ensureOverlay(); } }, 600);
   }
 
   // ===================== APPLY-BUTTON OPENER (reveal the form on listing pages) =====================
@@ -5398,37 +5682,134 @@
     return clicks > 0;
   }
 
+  // ===================== ACCOUNT CREATION / LOGIN (shared saved credentials) =====================
+  // Many ATS (Workday, iCIMS, Taleo, SuccessFactors, ADP/BrassRing, Jobvite…) require
+  // creating an account or signing in before you can apply. We reuse ONE saved
+  // credential set across all of them: the profile email + a saved password.
+  function generateStrongPassword() {
+    const up = 'ABCDEFGHJKLMNPQRSTUVWXYZ', lo = 'abcdefghijkmnpqrstuvwxyz', dg = '23456789', sp = '!@#$%';
+    const pick = s => s[Math.floor(Math.random() * s.length)];
+    let core = '';
+    for (let i = 0; i < 8; i++) core += pick(lo + up + dg);
+    // Guarantee complexity (upper/lower/digit/special, 12+ chars) for ATS rules.
+    return 'Jb' + pick(up) + core + pick(dg) + pick(sp);
+  }
+  async function getAppPassword() {
+    let pw = await st.get('ua_app_password');
+    if (!pw) { pw = generateStrongPassword(); await st.set('ua_app_password', pw); LOG('Generated & saved a reusable ATS account password'); }
+    return pw;
+  }
+  function looksLikeAuthPage() { return $$('input[type=password]').some(isVisible); }
+  function findAuthSubmit(mode) {
+    const re = mode === 'signin' ? /^(sign ?in|log ?in|continue|submit)$/i
+      : mode === 'create' ? /^(create account|create my account|register|sign ?up|continue|submit|next)$/i
+        : /^(create account|create my account|register|sign ?up|sign ?in|log ?in|continue|submit|next)$/i;
+    const known = $('[data-automation-id="createAccountSubmitButton"],[data-automation-id="signInSubmitButton"]');
+    if (known && isVisible(known)) return known;
+    const btns = $$('button,a[role="button"],input[type=submit],input[type=button]').filter(isVisible);
+    return btns.find(b => re.test((b.textContent || b.value || '').trim())) ||
+      btns.find(b => /^(submit|continue|next)$/i.test((b.textContent || b.value || '').trim())) || null;
+  }
+  // Detect a sign-in/create-account page and complete it with saved credentials.
+  async function handleAccountAuth() {
+    try {
+      // Never auto-fill credentials on the user's personal job-board / social logins —
+      // only on ATS account walls. (Their LinkedIn/Indeed password isn't ours to set.)
+      if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
+      const p = await getProfile();
+      const email = p.email || '';
+      if (!email) return false;
+      // If no password field yet, try to open a "Create account" form.
+      if (!looksLikeAuthPage()) {
+        const createLink = $$('button,a,[role="button"]').filter(isVisible)
+          .find(b => { const t = (b.textContent || '').trim(); return t.length < 30 && /^(create account|create an account|sign ?up|register|new user)/i.test(t); });
+        if (createLink) { LOG('Account: opening create-account form'); realClick(createLink); await sleep(1500); }
+      }
+      if (!looksLikeAuthPage()) return false;
+      LOG('Account auth page detected — filling saved credentials');
+      const pw = await getAppPassword();
+      // Email / username
+      let emailField = $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
+      if (!emailField) emailField = $$('input[type=text],input:not([type])').filter(isVisible)
+        .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '')));
+      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(200); }
+      // Password + confirm-password
+      const pwFields = $$('input[type=password]').filter(isVisible);
+      for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); await sleep(150); } }
+      // Required consent / terms checkboxes
+      $$('input[type=checkbox]').filter(isVisible).forEach(c => {
+        const lbl = (getLabel(c) || '');
+        if (!c.checked && (isFieldRequired(c) || /agree|terms|privacy|consent|acknowledge|i have read/i.test(lbl))) realClick(c);
+      });
+      const isCreate = pwFields.length > 1
+        || pwFields.some(f => /confirm|verify|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '')))
+        || /create (an )?account|register|sign ?up/i.test((document.body.innerText || '').toLowerCase().slice(0, 4000));
+      await sleep(400);
+      const submit = findAuthSubmit(isCreate ? 'create' : 'signin') || findAuthSubmit();
+      if (submit) {
+        LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in'));
+        realClick(submit);
+        await sleep(3500);
+        // Account already exists → switch to sign-in with the same creds.
+        const bodyTxt = (document.body.innerText || '').toLowerCase();
+        if (isCreate && /already (exists|in use|registered)|account.*exists|email.*taken|use a different email|already have an account/i.test(bodyTxt)) {
+          LOG('Account exists — switching to sign-in');
+          const toggle = $$('button,a,[role="button"]').filter(isVisible).find(b => /^(sign ?in|log ?in|already have)/i.test((b.textContent || '').trim()));
+          if (toggle) { realClick(toggle); await sleep(1500); }
+          const ef = $$('input[type=email],input[type=text]').filter(isVisible)[0];
+          if (ef && !ef.value) nativeSet(ef, email);
+          const pf = $$('input[type=password]').filter(isVisible)[0];
+          if (pf && !pf.value) nativeSet(pf, pw);
+          await sleep(300);
+          const si = findAuthSubmit('signin');
+          if (si) { realClick(si); await sleep(3500); }
+        }
+      }
+      return true;
+    } catch (e) { LOG('handleAccountAuth error:', e?.message || e); return false; }
+  }
+
   // ===================== ATS DISPATCHER =====================
   async function dispatchATSAutomation() {
     // Reveal the application form first if we're on a listing/landing page.
     await openApplicationForm();
+    // Create an account / sign in with saved credentials if the ATS requires it.
+    await handleAccountAuth();
     const url = location.href;
-    if (isWorkday()) return await workdayAutomation();
-    if (/greenhouse\.io|boards\.greenhouse/i.test(url)) return await greenhouseAutomation();
-    if (/lever\.co|jobs\.lever/i.test(url)) return await leverAutomation();
-    if (/icims\.com/i.test(url)) return await icimsAutomation();
-    if (/linkedin\.com.*\/jobs/i.test(url)) return await linkedinEasyApply();
-    if (/ashbyhq\.com/i.test(url)) return await ashbyAutomation();
-    if (/bamboohr\.com/i.test(url)) return await bamboohrAutomation();
-    if (/smartrecruiters\.com/i.test(url)) return await smartRecruitersAutomation();
-    if (/taleo\.net|oraclecloud\.com.*Candidate/i.test(url)) return await taleoAutomation();
-    if (/jobvite\.com/i.test(url)) return await jobviteAutomation();
-    if (/workable\.com/i.test(url)) return await workableAutomation();
-    if (/indeed\.com/i.test(url)) return await indeedEasyApply();
-    if (/breezy\.hr|breezyhr\.com/i.test(url)) return await breezyhrAutomation();
-    if (/ats\.rippling\.com/i.test(url)) return await ripplingAutomation();
-    if (/adp\.com|workforcenow\.adp/i.test(url)) return await adpAutomation();
-    if (/successfactors\.com/i.test(url)) return await successFactorsAutomation();
-    if (/jazz\.co|applytojob\.com/i.test(url)) return await jazzhrAutomation();
-    if (/joinhandshake\.com/i.test(url)) return await handshakeAutomation();
-    if (/governmentjobs\.com|usajobs\.gov/i.test(url)) return await usajobsAutomation();
-    if (/eightfold\.ai/i.test(url)) return await eightfoldAutomation();
-    return await tailorFirstFlow();
+    // Route to the platform-specific flow…
+    if (isWorkday()) await workdayAutomation();
+    else if (/greenhouse\.io|boards\.greenhouse/i.test(url)) await greenhouseAutomation();
+    else if (/lever\.co|jobs\.lever/i.test(url)) await leverAutomation();
+    else if (/icims\.com/i.test(url)) await icimsAutomation();
+    else if (/linkedin\.com.*\/jobs/i.test(url)) await linkedinEasyApply();
+    else if (/ashbyhq\.com/i.test(url)) await ashbyAutomation();
+    else if (/bamboohr\.com/i.test(url)) await bamboohrAutomation();
+    else if (/smartrecruiters\.com/i.test(url)) await smartRecruitersAutomation();
+    else if (/taleo\.net|oraclecloud\.com.*Candidate/i.test(url)) await taleoAutomation();
+    else if (/jobvite\.com/i.test(url)) await jobviteAutomation();
+    else if (/workable\.com/i.test(url)) await workableAutomation();
+    else if (/indeed\.com/i.test(url)) await indeedEasyApply();
+    else if (/breezy\.hr|breezyhr\.com/i.test(url)) await breezyhrAutomation();
+    else if (/ats\.rippling\.com/i.test(url)) await ripplingAutomation();
+    else if (/adp\.com|workforcenow\.adp/i.test(url)) await adpAutomation();
+    else if (/successfactors\.com/i.test(url)) await successFactorsAutomation();
+    else if (/jazz\.co|applytojob\.com/i.test(url)) await jazzhrAutomation();
+    else if (/joinhandshake\.com/i.test(url)) await handshakeAutomation();
+    else if (/governmentjobs\.com|usajobs\.gov/i.test(url)) await usajobsAutomation();
+    else if (/eightfold\.ai/i.test(url)) await eightfoldAutomation();
+    else await tailorFirstFlow();
+    // …then a UNIVERSAL completion driver for EVERY ATS: if the application isn't
+    // confirmed submitted yet, self-navigate the remaining steps (account walls,
+    // multi-page forms, review/confirm screens) until it is.
+    if (!checkSuccess()) await multiPageLoop();
   }
 
   // ===================== INIT =====================
   async function init() {
     if (window.self !== window.top) return;
+    // Show the control panel IMMEDIATELY in the runner tab (before any awaits), so
+    // Skip/Pause/Quit are available the instant each job page renders — no gap.
+    if (isRunnerTab()) ensureOverlay();
     // Load queue state FIRST so we know whether a bulk run is in progress.
     await load();
     // Master gate: don't mount the sidebar UI / observers on heavy non-application
@@ -5436,13 +5817,14 @@
     // and drive automation on every imported job URL (listing pages included,
     // where we click "Apply" to reveal the form). Skipping was the #1 reason the
     // CSV queue "did nothing" on many sites.
-    if (!qActive && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
+    const runnerActive = qActive && isRunnerTab();
+    if (!runnerActive && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
-    // When a queue is active, keep Jobright's own sidebar open and our control
-    // overlay visible for the whole run.
-    if (qActive) { forceOpenSidebar(); updateCtrl(); }
+    // When a queue is active IN THIS (runner) tab, keep Jobright's own sidebar open
+    // and our control overlay visible for the whole run.
+    if (runnerActive) { forceOpenSidebar(); updateCtrl(); }
     // Update answer bank count in UI
     const ansCntEl = document.getElementById('ua-ans-cnt');
     if (ansCntEl) ansCntEl.textContent = `(${Object.keys(_answerBank).length} answers)`;
@@ -5456,7 +5838,7 @@
         await dispatchATSAutomation();
       }
     }
-    if (qActive) { await sleep(2000); processQ(); }
+    if (runnerActive) { await sleep(2000); processQ(); }
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
@@ -5472,6 +5854,18 @@
       if (val && val.trim() && val.trim().length > 1) learnAnswer(lbl, val.trim());
     }, true);
     window.addEventListener('beforeunload', () => { try { learnFromFilledFields(); } catch (_) {} });
+  }
+  // Runner tab: show the control panel at document_start and keep retrying for the
+  // first few seconds until init's watchdog takes over — removes the blank gap that
+  // appeared right after each job navigation.
+  if (isRunnerTab()) {
+    ensureOverlay();
+    let _earlyTries = 0;
+    const _early = setInterval(() => {
+      ensureOverlay();
+      const el = document.getElementById('ua-ctrl');
+      if (++_earlyTries > 25 || (el && el.isConnected)) clearInterval(_early);
+    }, 150);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
