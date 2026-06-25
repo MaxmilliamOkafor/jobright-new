@@ -1806,22 +1806,21 @@
     await clickApplyManually();
     await sleep(1500);
 
-    // Handle sign-in/create account pages with the shared saved-credentials flow
-    // (fills email + password + confirm, ticks consent, submits, and falls back to
-    // sign-in if the account already exists).
-    const signInBtn = $('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"]');
-    if (signInBtn && isVisible(signInBtn)) {
-      LOG('Workday sign-in/create-account page detected');
-      await handleAccountAuth();
-      await sleep(1500);
-    }
+    // STEP 1 of 7 — Create Account / Sign In — handled fully by SpeedyApply during
+    // the queue (fills email + password + verifyPassword + createAccountCheckbox and
+    // submits; signs in instead if this tenant already has an account). Manual use is
+    // untouched (this only runs inside the automation flow), so Jobright's own native
+    // Sign-up flow still works when you're not running the bulk queue.
+    await waitForApplyTarget(6000);
+    await fillWorkdayCreateAccount(true);
+    await sleep(1500);
 
     // Wait for form page
     const fp = await waitFor("[data-automation-id='quickApplyPage'],[data-automation-id='applyFlowAutoFillPage'],[data-automation-id='contactInformationPage'],[data-automation-id='applyFlowMyInfoPage'],[data-automation-id='ApplyFlowPage'],[data-automation-id='applyFlowContainer'],[data-automation-id='applyFlowForm']", 10000);
     if (!fp) { LOG('Workday form page not found'); return; }
     await sleep(1000);
 
-    // Phase 2: Workday-specific field filling (from SpeedyApply)
+    // STEP 2 of 7 — My Information — filled fully by SpeedyApply.
     await workdayFillName(p);
     await workdayFillContact(p);
     await workdayFillAddress(p);
@@ -1832,7 +1831,12 @@
     await workdayResumeUpload();
     await fixPhoneCountryCode();
 
-    // Phase 3: Tailor-first flow for first page
+    // Jobright autofill as a BACKUP — catches any field SpeedyApply missed on this page.
+    await triggerAutofill();
+    await sleep(2000);
+    await fallbackFill();
+
+    // Phase 3: continue (tailor + autofill) into the multi-page flow.
     await tailorFirstFlow();
 
     // Phase 4: Workday multi-page navigation (handles all Workday page types)
@@ -3596,29 +3600,21 @@
   // execCommand('insertText') so Workday's onChange fires and validation clears.
   // Setting .value alone leaves the field "invalid" (red dot) and the Create
   // Account button disabled — which is exactly what was happening.
+  // SpeedyApply's exact Workday setter `w`: click + focus, fire keydown/keypress/
+  // keyup, set .value, fire keydown/keypress/keyup again, then InputEvent + change.
+  // The surrounding keyboard events are what make Workday's React register the value.
   function reactTypeValue(el, value) {
     try {
-      el.focus(); el.click();
-      try { el.setSelectionRange(0, (el.value || '').length); } catch (_) { try { el.select(); } catch (_) {} }
-      let ok = false;
-      try { ok = document.execCommand('insertText', false, value); } catch (_) {}
-      if (!ok || el.value !== value) {
-        // Fallback: native setter + a real InputEvent.
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (setter) setter.call(el, value); else el.value = value;
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-      }
+      const KE = (t) => el.dispatchEvent(new KeyboardEvent(t, { bubbles: true, cancelable: false }));
+      el.click();
+      el.focus();
+      KE('keydown'); KE('keypress'); KE('keyup');
+      el.value = value;
+      KE('keydown'); KE('keypress'); KE('keyup');
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
     } catch (_) {
-      // Direct fallback (do NOT call nativeSet — it routes back here on Workday).
-      try {
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (setter) setter.call(el, value); else el.value = value;
-        ['input', 'change', 'blur'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true })));
-      } catch (_) {}
+      try { el.value = value; ['input', 'change'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true }))); } catch (_) {}
     }
   }
 
