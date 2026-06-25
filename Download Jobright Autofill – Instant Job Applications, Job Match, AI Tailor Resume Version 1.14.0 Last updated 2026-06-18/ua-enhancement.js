@@ -1377,25 +1377,49 @@
       return 'next_page';
     }
 
-    // Next/Continue selectors
+    // Next / Continue / Save-and-Continue — used by Workday + most multi-page ATS.
+    // We only click ENABLED buttons (Workday disables "Continue to the next page"
+    // until the page validates), scroll them into view, and if the only candidate
+    // is disabled we re-fill + fix validation and try once more so the page advances.
+    const enabled = el => el && isVisible(el) && !el.disabled &&
+      el.getAttribute('aria-disabled') !== 'true' &&
+      !/disabled/.test(el.className || '');
     const nextSels = [
       'button[data-automation-id="bottom-navigation-next-button"]',
       'button[data-automation-id="pageFooterNextButton"]',
       'button[data-automation-id="next-button"]',
+      'button[data-automation-id="continueButton"]',
+      'button[data-automation-id="wizardNextButton"]',
       'button[aria-label*="Next" i]', 'button[aria-label*="Continue" i]',
-      '[data-testid="next-step"]', '[data-testid="continue"]',
+      'button[aria-label*="Save and Continue" i]',
+      '[data-testid="next-step"]', '[data-testid="continue"]', '[data-testid="next"]',
+      'button[data-qa="btn-next"]', 'button[data-qa="continue"]', 'a.btn-next', 'button.btn-next',
     ];
-    for (const sel of nextSels) {
-      const btn = $(sel);
-      if (btn && isVisible(btn)) { LOG('Clicking next:', sel); await sleep(500); realClick(btn); return 'next_page'; }
+    const nextTextRe = /^(next|continue|proceed|save (and|&) continue|save (and|&) next|agree (and|&) continue|continue to|go to next|next step|save (and|&) submit|review)\b/i;
+
+    const findNext = () => {
+      for (const sel of nextSels) { const b = $(sel); if (enabled(b)) return b; }
+      return $$('button,a[role="button"],input[type="submit"],input[type="button"]')
+        .filter(enabled)
+        .find(b => { const t = (b.textContent || b.value || '').trim(); return nextTextRe.test(t) && !/cancel|back|previous|\bprev\b|close|sign ?out|log ?out/i.test(t); }) || null;
+    };
+
+    let nextBtn = findNext();
+    if (!nextBtn) {
+      // Maybe a "Continue" exists but is disabled — re-fill required fields, fix
+      // validation, and look again so it becomes clickable.
+      await guaranteeRequiredFields();
+      await handleValidationErrors();
+      await sleep(800);
+      nextBtn = findNext();
     }
-    // Fallback: next by text
-    const allBtns = $$('button,a[role="button"]').filter(isVisible);
-    const nextBtn = allBtns.find(b => {
-      const t = (b.textContent || b.value || '').trim().toLowerCase();
-      return /^(next|continue|proceed|save.*continue|review)\b/i.test(t) && !/cancel|back|prev|close/i.test(t);
-    });
-    if (nextBtn) { LOG('Clicking next (text):', nextBtn.textContent?.trim()); await sleep(500); realClick(nextBtn); return 'next_page'; }
+    if (nextBtn) {
+      LOG('Clicking next/continue: ' + (nextBtn.textContent || nextBtn.value || '').trim().slice(0, 40));
+      nextBtn.scrollIntoView?.({ block: 'center' });
+      await sleep(300);
+      realClick(nextBtn);
+      return 'next_page';
+    }
 
     LOG('No submit/next button found');
     return false;
@@ -2447,17 +2471,13 @@
       await sleep(500);
       await handleValidationErrors();
 
-      // Click Next
-      const nextBtn = $('button[data-automation-id="bottom-navigation-next-button"], button[data-automation-id="pageFooterNextButton"], button[data-automation-id="btnNext"]');
-      if (nextBtn && isVisible(nextBtn)) {
-        realClick(nextBtn);
-        await sleep(2500);
-      } else {
-        const sub = $('button[data-automation-id="btnSubmit"]');
-        if (sub && isVisible(sub)) { realClick(sub); await sleep(2000); break; }
-        LOG('Workday: no next/submit button found');
-        break;
-      }
+      // Advance via the robust shared handler (skips disabled buttons, scrolls into
+      // view, re-fills + fixes validation if "Continue to the next page" is disabled,
+      // and submits on the final review page).
+      const action = await autoSubmitOrNext();
+      if (action === 'submitted') { await sleep(2500); if (checkSuccess()) break; }
+      else if (action === 'next_page') { await sleep(2500); }
+      else { LOG('Workday: no next/submit button found'); break; }
     }
   }
 
