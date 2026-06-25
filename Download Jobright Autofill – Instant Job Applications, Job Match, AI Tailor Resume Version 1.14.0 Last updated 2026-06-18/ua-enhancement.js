@@ -4430,7 +4430,7 @@
 .ua-scrape-btn:hover{background:linear-gradient(135deg,#2563eb,#1d4ed8)}
 .ua-scrape-btn:disabled{background:#e5e7eb;color:#9ca3af;cursor:default}
     `;
-    document.head.appendChild(s);
+    (document.head || document.documentElement).appendChild(s);
   }
 
   // ===================== SVG (inline, sized) =====================
@@ -4449,6 +4449,59 @@
   }
 
   // ===================== UI BUILD =====================
+  // Build (or re-build) the "Automation In Progress" control panel. Idempotent and
+  // safe to call very early (document_start) and repeatedly — this is what keeps the
+  // Skip/Pause/Quit controls constantly visible across every page navigation.
+  function ensureOverlay() {
+    try {
+      if (window.self !== window.top) return null;
+      const host = document.body || document.documentElement;
+      if (!host) return null;
+      let ctrl = document.getElementById('ua-ctrl');
+      if (ctrl && ctrl.isConnected) return ctrl;
+      injectCSS(); // ensure .uc-* styles exist
+      ctrl = document.createElement('div'); ctrl.id = 'ua-ctrl';
+      ctrl.innerHTML = `<div id="ua-ctrl-card">
+        <div class="uc-top">
+          <div class="uc-title">Automation In Progress</div>
+          <div class="uc-count" id="uc-count">Job 0 of 0</div>
+        </div>
+        <div class="uc-pos"><span id="uc-pos">Preparing…</span><span class="uc-pos-co" id="uc-pos-co" style="display:none"></span></div>
+        <div class="uc-bar"><div class="uc-bar-fill" id="uc-bar"></div></div>
+        <div class="uc-proc" id="uc-proc">Processing…</div>
+        <div class="uc-stats" id="uc-stats"><span class="uc-stat ok"><b id="uc-ok">0</b> applied</span><span class="uc-stat sk"><b id="uc-sk">0</b> skipped</span><span class="uc-stat fa"><b id="uc-fa">0</b> failed</span></div>
+        <div class="uc-speed">
+          <span class="uc-speed-l">Speed:</span>
+          <button class="uc-sp active" data-sp="1">1x</button>
+          <button class="uc-sp" data-sp="1.5">1.5x</button>
+          <button class="uc-sp" data-sp="2">2x</button>
+          <button class="uc-sp" data-sp="3">3x</button>
+        </div>
+        <div class="uc-actions">
+          <button class="uc-act pause" id="uc-pause">Pause</button>
+          <button class="uc-act skip" id="uc-skip">Skip</button>
+          <button class="uc-act quit" id="uc-quit">Quit</button>
+        </div>
+      </div>`;
+      host.appendChild(ctrl);
+      makeDraggableByHandle(ctrl, ctrl.querySelector('.uc-top'));
+      st.get('ua_ctrl_pos').then(p => {
+        if (!p || !p.left) return;
+        const left = Math.max(0, Math.min(window.innerWidth - 80, parseInt(p.left) || 0));
+        const top = Math.max(0, Math.min(window.innerHeight - 40, parseInt(p.top) || 0));
+        ctrl.style.left = left + 'px'; ctrl.style.top = top + 'px'; ctrl.style.right = 'auto';
+      });
+      ctrl.querySelector('#uc-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
+      ctrl.querySelector('#uc-skip').addEventListener('click', skipJob);
+      ctrl.querySelector('#uc-quit').addEventListener('click', stopQ);
+      ctrl.querySelectorAll('.uc-sp').forEach(btn => btn.addEventListener('click', () => setQueueSpeed(parseFloat(btn.dataset.sp) || 1)));
+      // If we already know a run is active in this runner tab, show immediately.
+      if (isRunnerTab()) ctrl.classList.add('show');
+      updateCtrl();
+      return ctrl;
+    } catch (_) { return null; }
+  }
+
   function buildUI() {
     if (window.self !== window.top) return;
 
@@ -4471,48 +4524,9 @@
     document.body.appendChild(af);
     af.addEventListener('click', () => addJob(location.href, document.title));
 
-    // --- Automation In Progress panel (matches Jobright 1.14.0 dark UI) ---
-    const ctrl = document.createElement('div'); ctrl.id = 'ua-ctrl';
-    ctrl.innerHTML = `<div id="ua-ctrl-card">
-      <div class="uc-top">
-        <div class="uc-title">Automation In Progress</div>
-        <div class="uc-count" id="uc-count">Job 0 of 0</div>
-      </div>
-      <div class="uc-pos"><span id="uc-pos">Preparing…</span><span class="uc-pos-co" id="uc-pos-co" style="display:none"></span></div>
-      <div class="uc-bar"><div class="uc-bar-fill" id="uc-bar"></div></div>
-      <div class="uc-proc" id="uc-proc">Processing…</div>
-      <div class="uc-stats" id="uc-stats"><span class="uc-stat ok"><b id="uc-ok">0</b> applied</span><span class="uc-stat sk"><b id="uc-sk">0</b> skipped</span><span class="uc-stat fa"><b id="uc-fa">0</b> failed</span></div>
-      <div class="uc-speed">
-        <span class="uc-speed-l">Speed:</span>
-        <button class="uc-sp active" data-sp="1">1x</button>
-        <button class="uc-sp" data-sp="1.5">1.5x</button>
-        <button class="uc-sp" data-sp="2">2x</button>
-        <button class="uc-sp" data-sp="3">3x</button>
-      </div>
-      <div class="uc-actions">
-        <button class="uc-act pause" id="uc-pause">Pause</button>
-        <button class="uc-act skip" id="uc-skip">Skip</button>
-        <button class="uc-act quit" id="uc-quit">Quit</button>
-      </div>
-    </div>`;
-    document.body.appendChild(ctrl);
-    // Drag the panel by its header so it never blocks the Jobright popup. Position
-    // persists across pages/jobs.
-    makeDraggableByHandle(ctrl, ctrl.querySelector('.uc-top'));
-    st.get('ua_ctrl_pos').then(p => {
-      if (!p || !p.left) return;
-      const left = Math.max(0, Math.min(window.innerWidth - 80, parseInt(p.left) || 0));
-      const top = Math.max(0, Math.min(window.innerHeight - 40, parseInt(p.top) || 0));
-      ctrl.style.left = left + 'px'; ctrl.style.top = top + 'px'; ctrl.style.right = 'auto';
-    });
-    document.getElementById('uc-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
-    document.getElementById('uc-skip').addEventListener('click', skipJob);
-    document.getElementById('uc-quit').addEventListener('click', stopQ);
-    // Speed selector (1x / 1.5x / 2x / 3x) — scales how fast each application is
-    // processed (waits) AND the delay between jobs.
-    ctrl.querySelectorAll('.uc-sp').forEach(btn => btn.addEventListener('click', () => {
-      setQueueSpeed(parseFloat(btn.dataset.sp) || 1);
-    }));
+    // --- Automation In Progress panel --- (created via ensureOverlay so it can be
+    // re-mounted instantly and kept alive throughout the run)
+    ensureOverlay();
 
     // --- Drawer ---
     const dw = document.createElement('div'); dw.id = 'ua-drawer';
@@ -5613,6 +5627,10 @@
     // we observed (e.g. inside a shadow root). Cheap — one querySelector per tick.
     // During a run, also keep Jobright's own popup open so you can watch it autofill.
     setInterval(() => { injectSidebarUI(); if (qActive && isRunnerTab()) forceOpenSidebar(); }, 1500);
+    // Watchdog: keep the control panel alive throughout the run. If anything removes
+    // it (page script, re-render), re-mount it within ~600ms so the controls never
+    // disappear while automation is in progress.
+    setInterval(() => { if (qActive && isRunnerTab()) { ensureOverlay(); } }, 600);
   }
 
   // ===================== APPLY-BUTTON OPENER (reveal the form on listing pages) =====================
@@ -5789,6 +5807,9 @@
   // ===================== INIT =====================
   async function init() {
     if (window.self !== window.top) return;
+    // Show the control panel IMMEDIATELY in the runner tab (before any awaits), so
+    // Skip/Pause/Quit are available the instant each job page renders — no gap.
+    if (isRunnerTab()) ensureOverlay();
     // Load queue state FIRST so we know whether a bulk run is in progress.
     await load();
     // Master gate: don't mount the sidebar UI / observers on heavy non-application
@@ -5833,6 +5854,18 @@
       if (val && val.trim() && val.trim().length > 1) learnAnswer(lbl, val.trim());
     }, true);
     window.addEventListener('beforeunload', () => { try { learnFromFilledFields(); } catch (_) {} });
+  }
+  // Runner tab: show the control panel at document_start and keep retrying for the
+  // first few seconds until init's watchdog takes over — removes the blank gap that
+  // appeared right after each job navigation.
+  if (isRunnerTab()) {
+    ensureOverlay();
+    let _earlyTries = 0;
+    const _early = setInterval(() => {
+      ensureOverlay();
+      const el = document.getElementById('ua-ctrl');
+      if (++_earlyTries > 25 || (el && el.isConnected)) clearInterval(_early);
+    }, 150);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
