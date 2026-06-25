@@ -230,7 +230,6 @@
   };
   let queue = [], qActive = false, qPaused = false, autoApply = false, selected = new Set();
   let qSpeedFactor = 1; // multiplies automation waits (set from queue speed); lower = faster
-  let qDailyLimit = 0;    // LazyApply-style cap: stop after N applications/day (0 = unlimited)
   let qSkipApplied = true; // LazyApply-style: skip URLs already applied to (across imports)
   // LazyApply-enhanced state tracking
   let qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0 };
@@ -249,7 +248,6 @@
     // "Generate Custom Resume + Autofill" combo depends on Jobright's resume
     // generator and can stall, so we don't use it automatically unless opted in.
     queueUseTailor = (await st.get('ua_queue_tailor')) === true;
-    qDailyLimit = parseInt(await st.get('ua_daily_limit')) || 0;
     qSkipApplied = (await st.get('ua_skip_applied')) !== false; // default ON
   }
   async function saveQ() { await st.set(SK.Q, queue); }
@@ -3557,17 +3555,11 @@
   function markRunnerTab() { try { if (window.name.indexOf(RUNNER_PREFIX) !== 0) window.name = RUNNER_PREFIX + (window.name || ''); } catch (_) {} }
   function unmarkRunnerTab() { try { if (typeof window.name === 'string' && window.name.indexOf(RUNNER_PREFIX) === 0) window.name = window.name.slice(RUNNER_PREFIX.length); } catch (_) {} }
 
-  // LazyApply-style: how many real applications were submitted in the last 24h.
-  function appliedTodayCount() {
-    const now = Date.now();
-    return (_appHistory || []).filter(a => a.status === 'applied' && now - a.appliedAt < 86400000).length;
-  }
   // Has this URL already been applied to in a previous session?
   function alreadyApplied(url) {
     const n = normalizeUrl(url);
     return (_appHistory || []).some(a => a.status === 'applied' && normalizeUrl(a.url) === n);
   }
-  function dailyLimitReached() { return qDailyLimit > 0 && appliedTodayCount() >= qDailyLimit; }
 
   // Are we on the page for the currently-applying job? Match the queued URL, OR
   // accept any page that now shows an application form / Apply button — because
@@ -3707,13 +3699,6 @@
 
   function goNext() {
     if (qPaused) return;
-    // LazyApply-style daily cap: stop the run once the limit is hit.
-    if (dailyLimitReached()) {
-      LOG(`Daily application limit reached (${qDailyLimit}) — stopping run`);
-      qActive = false; st.set(SK.QA, false); unmarkRunnerTab();
-      renderQ(); updateCtrl(); showCompletionSummary();
-      return;
-    }
     const n = queue.find(j => j.status === 'pending');
     if (n) {
       n.status = 'applying';
@@ -5355,11 +5340,7 @@
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none">
         <input type="checkbox" id="ua-sb-tailor" style="accent-color:#00f0a0;width:14px;height:14px"> Tailor resume for each job <span style="color:#6f6f76">(slower)</span>
       </label>
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4">
-        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none"><input type="checkbox" id="ua-sb-skipapplied" style="accent-color:#00f0a0;width:13px;height:13px"> Skip already-applied</label>
-        <span style="margin-left:auto">Daily limit</span>
-        <input id="ua-sb-limit" type="number" min="0" placeholder="0" title="0 = no limit" style="width:52px;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:7px;color:#e7e7ea;font-size:11px;padding:5px 6px">
-      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;color:#bfbfc4;cursor:pointer;user-select:none"><input type="checkbox" id="ua-sb-skipapplied" style="accent-color:#00f0a0;width:13px;height:13px"> Skip jobs already applied to</label>
       <button id="ua-sb-cred-toggle" style="${ghostBtn};width:100%;text-align:left;margin-bottom:8px">🔑 ATS account login (saved credentials)</button>
       <div id="ua-sb-cred-wrap" style="display:none;margin-bottom:10px">
         <input id="ua-sb-cred-email" type="text" placeholder="Email" autocomplete="off" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;margin-bottom:6px">
@@ -5438,9 +5419,6 @@
     const skipCb = wrap.querySelector('#ua-sb-skipapplied');
     skipCb.checked = qSkipApplied;
     skipCb.addEventListener('change', () => { qSkipApplied = skipCb.checked; try { st.set('ua_skip_applied', qSkipApplied); } catch (_) {} });
-    const limitIn = wrap.querySelector('#ua-sb-limit');
-    if (qDailyLimit) limitIn.value = String(qDailyLimit);
-    limitIn.addEventListener('change', () => { qDailyLimit = parseInt(limitIn.value) || 0; try { st.set('ua_daily_limit', qDailyLimit); } catch (_) {} LOG('Daily limit set to ' + (qDailyLimit || 'none')); });
     // --- saved ATS credentials ---
     const credWrap = wrap.querySelector('#ua-sb-cred-wrap');
     wrap.querySelector('#ua-sb-cred-toggle').addEventListener('click', async () => {
@@ -5492,7 +5470,6 @@
     const cnt = q('#ua-sb-count'); if (cnt) cnt.textContent = `${queue.length} job${queue.length === 1 ? '' : 's'}`;
     const tailorCb = q('#ua-sb-tailor'); if (tailorCb && tailorCb.checked !== queueUseTailor) tailorCb.checked = queueUseTailor;
     const skipCb = q('#ua-sb-skipapplied'); if (skipCb && skipCb.checked !== qSkipApplied) skipCb.checked = qSkipApplied;
-    const limitIn = q('#ua-sb-limit'); if (limitIn && document.activeElement !== limitIn) limitIn.value = qDailyLimit ? String(qDailyLimit) : '';
     paintSidebarSpeed();
     const start = q('#ua-sb-start'), stop = q('#ua-sb-stop'), runrow = q('#ua-sb-runrow'), status = q('#ua-sb-status');
     if (qActive) {

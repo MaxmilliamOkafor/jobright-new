@@ -85,8 +85,6 @@ you stop midway, **Resume** continues from where it left off.
 
 ### LazyApply-style controls
 
-- **Daily limit** — set a max number of applications (e.g. `50`); the run stops once it's
-  reached. `0` = no limit.
 - **Skip already-applied** (on by default) — never re-applies to a job you've already
   applied to, even across separate CSV imports.
 - **Live counters** in the panel — `applied · skipped · failed` tick up as it runs, and a
