@@ -1377,25 +1377,49 @@
       return 'next_page';
     }
 
-    // Next/Continue selectors
+    // Next / Continue / Save-and-Continue — used by Workday + most multi-page ATS.
+    // We only click ENABLED buttons (Workday disables "Continue to the next page"
+    // until the page validates), scroll them into view, and if the only candidate
+    // is disabled we re-fill + fix validation and try once more so the page advances.
+    const enabled = el => el && isVisible(el) && !el.disabled &&
+      el.getAttribute('aria-disabled') !== 'true' &&
+      !/disabled/.test(el.className || '');
     const nextSels = [
       'button[data-automation-id="bottom-navigation-next-button"]',
       'button[data-automation-id="pageFooterNextButton"]',
       'button[data-automation-id="next-button"]',
+      'button[data-automation-id="continueButton"]',
+      'button[data-automation-id="wizardNextButton"]',
       'button[aria-label*="Next" i]', 'button[aria-label*="Continue" i]',
-      '[data-testid="next-step"]', '[data-testid="continue"]',
+      'button[aria-label*="Save and Continue" i]',
+      '[data-testid="next-step"]', '[data-testid="continue"]', '[data-testid="next"]',
+      'button[data-qa="btn-next"]', 'button[data-qa="continue"]', 'a.btn-next', 'button.btn-next',
     ];
-    for (const sel of nextSels) {
-      const btn = $(sel);
-      if (btn && isVisible(btn)) { LOG('Clicking next:', sel); await sleep(500); realClick(btn); return 'next_page'; }
+    const nextTextRe = /^(next|continue|proceed|save (and|&) continue|save (and|&) next|agree (and|&) continue|continue to|go to next|next step|save (and|&) submit|review)\b/i;
+
+    const findNext = () => {
+      for (const sel of nextSels) { const b = $(sel); if (enabled(b)) return b; }
+      return $$('button,a[role="button"],input[type="submit"],input[type="button"]')
+        .filter(enabled)
+        .find(b => { const t = (b.textContent || b.value || '').trim(); return nextTextRe.test(t) && !/cancel|back|previous|\bprev\b|close|sign ?out|log ?out/i.test(t); }) || null;
+    };
+
+    let nextBtn = findNext();
+    if (!nextBtn) {
+      // Maybe a "Continue" exists but is disabled — re-fill required fields, fix
+      // validation, and look again so it becomes clickable.
+      await guaranteeRequiredFields();
+      await handleValidationErrors();
+      await sleep(800);
+      nextBtn = findNext();
     }
-    // Fallback: next by text
-    const allBtns = $$('button,a[role="button"]').filter(isVisible);
-    const nextBtn = allBtns.find(b => {
-      const t = (b.textContent || b.value || '').trim().toLowerCase();
-      return /^(next|continue|proceed|save.*continue|review)\b/i.test(t) && !/cancel|back|prev|close/i.test(t);
-    });
-    if (nextBtn) { LOG('Clicking next (text):', nextBtn.textContent?.trim()); await sleep(500); realClick(nextBtn); return 'next_page'; }
+    if (nextBtn) {
+      LOG('Clicking next/continue: ' + (nextBtn.textContent || nextBtn.value || '').trim().slice(0, 40));
+      nextBtn.scrollIntoView?.({ block: 'center' });
+      await sleep(300);
+      realClick(nextBtn);
+      return 'next_page';
+    }
 
     LOG('No submit/next button found');
     return false;
@@ -1776,12 +1800,11 @@
       const allBtns = $$('a, button');
       for (const b of allBtns) { if (/^\s*(Apply|Apply Now|Apply for Job)\s*$/i.test(b.textContent) && isVisible(b)) { clickEl(b); clicked = true; await sleep(2000); break; } }
     }
-    // Click Apply Manually (skip Easy Apply / external links)
-    const am = await waitFor("//*[@data-automation-id='applyManually']", 8000, true);
-    if (am) { await sleep(500); clickEl(am); await sleep(2000); }
-    // Handle "Use My Last Application" — skip it for fresh fill
-    const useLastApp = await findByText('button,a', /use my last application|autofill with/i, 3000);
-    if (useLastApp) { LOG('Skipping "Use My Last Application"'); }
+    // Always choose "Apply Manually" on Workday's "Start Your Application" modal —
+    // never "Autofill with Resume" or "Use My Last Application" — then fill ourselves.
+    await waitForApplyTarget(8000);
+    await clickApplyManually();
+    await sleep(1500);
 
     // Handle sign-in/create account pages with the shared saved-credentials flow
     // (fills email + password + confirm, ticks consent, submits, and falls back to
@@ -2447,17 +2470,13 @@
       await sleep(500);
       await handleValidationErrors();
 
-      // Click Next
-      const nextBtn = $('button[data-automation-id="bottom-navigation-next-button"], button[data-automation-id="pageFooterNextButton"], button[data-automation-id="btnNext"]');
-      if (nextBtn && isVisible(nextBtn)) {
-        realClick(nextBtn);
-        await sleep(2500);
-      } else {
-        const sub = $('button[data-automation-id="btnSubmit"]');
-        if (sub && isVisible(sub)) { realClick(sub); await sleep(2000); break; }
-        LOG('Workday: no next/submit button found');
-        break;
-      }
+      // Advance via the robust shared handler (skips disabled buttons, scrolls into
+      // view, re-fills + fixes validation if "Continue to the next page" is disabled,
+      // and submits on the final review page).
+      const action = await autoSubmitOrNext();
+      if (action === 'submitted') { await sleep(2500); if (checkSuccess()) break; }
+      else if (action === 'next_page') { await sleep(2500); }
+      else { LOG('Workday: no next/submit button found'); break; }
     }
   }
 
@@ -3428,10 +3447,16 @@
           const d = document.getElementById('ua-drawer');
           if (d) { d.classList.toggle('open'); positionDrawer(); }
           break;
-        case 'f': // Alt+F: Run fallback fill
+        case 'f': // Alt+F: Run a manual full pass (apply → account → fill → next)
           e.preventDefault();
-          LOG('Manual fallback fill triggered via Alt+F');
-          fallbackFill().catch(e => LOG('fallbackFill error:', e));
+          LOG('Manual full fill triggered via Alt+F');
+          (async () => {
+            await openApplicationForm();
+            await handleAccountAuth();
+            await fallbackFill();
+            await guaranteeRequiredFields();
+            await autoSubmitOrNext();
+          })().catch(err => LOG('Alt+F error:', err));
           break;
         case 's': // Alt+S: Start/stop queue
           e.preventDefault();
@@ -3561,8 +3586,48 @@
     return (_appHistory || []).some(a => a.status === 'applied' && normalizeUrl(a.url) === n);
   }
 
+  // ===================== WORKDAY CREATE-ACCOUNT AUTO-FILLER =====================
+  // Workday gates the application behind a Create Account step (email, password,
+  // verify password, "Agree to Privacy Notice"). Jobright pauses here asking you to
+  // "Set a password to continue" because that password lives in Jobright's own store.
+  // We fill the actual Workday fields with the saved credentials and submit so the
+  // flow moves past the account step — independent of Jobright's prompt.
+  let _wdAccountSubmitted = false;
+  async function fillWorkdayCreateAccount(submit) {
+    if (!isWorkday()) return false;
+    const pwFields = $$('input[type=password]').filter(isVisible);
+    if (!pwFields.length) return false; // not on a create-account / sign-in page
+    const p = await getProfile();
+    const email = p.email || '';
+    const pw = await getAppPassword();
+    if (!email) return false;
+    let did = false;
+    // Email
+    let emailField = $('input[data-automation-id="email"]') ||
+      $$('input[type=email],input[type=text]').filter(isVisible)
+        .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
+    if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); did = true; await sleep(120); }
+    // Password + Verify password
+    for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); did = true; await sleep(120); } }
+    // Agree to Privacy Notice / consent checkboxes
+    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
+    if (submit && !_wdAccountSubmitted) {
+      await sleep(700);
+      const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])') ||
+        findAuthSubmit('create');
+      if (btn && isVisible(btn) && !btn.disabled) {
+        LOG('Workday: submitting Create Account with saved credentials');
+        _wdAccountSubmitted = true;
+        btn.scrollIntoView?.({ block: 'center' });
+        await sleep(150);
+        clickEl(btn);
+        await sleep(2500);
+      }
+    }
+    return did;
+  }
+
   // Are we on the page for the currently-applying job? Match the queued URL, OR
-  // accept any page that now shows an application form / Apply button — because
   // clicking "Apply" often navigates us to an external ATS form whose URL differs
   // from the imported listing URL. Without this the queue would skip mid-apply.
   function onCurrentJobPage(c) {
@@ -3612,10 +3677,10 @@
           // page, skip it quickly instead of burning minutes on retries.
           await openApplicationForm();
           await handleAccountAuth();
-          if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+          if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess()) {
             await sleep(2500); // one short grace period for slow SPAs
             await openApplicationForm();
-            if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !checkSuccess()) {
+            if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess()) {
               LOG('No application form / Apply found — skipping as invalid job');
               clearTimeout(_qTimeoutId);
               c.status = 'skipped'; c.error = 'No application form found'; c.completedAt = Date.now();
@@ -5358,7 +5423,10 @@
       <button id="ua-sb-cred-toggle" style="${ghostBtn};width:100%;text-align:left;margin-bottom:8px">🔑 ATS account login (saved credentials)</button>
       <div id="ua-sb-cred-wrap" style="display:none;margin-bottom:10px">
         <input id="ua-sb-cred-email" type="text" placeholder="Email" autocomplete="off" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;margin-bottom:6px">
-        <input id="ua-sb-cred-pw" type="text" placeholder="Password (reused for ATS sign-ups)" autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px">
+        <div style="position:relative">
+          <input id="ua-sb-cred-pw" type="password" placeholder="Password (reused for ATS sign-ups)" autocomplete="new-password" spellcheck="false" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;padding-right:38px">
+          <button id="ua-sb-cred-eye" type="button" title="Show password" style="position:absolute;right:4px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:14px;line-height:1;color:#9aa0a6;padding:4px">👁</button>
+        </div>
         <button id="ua-sb-cred-save" style="${ghostBtn};width:100%;margin-top:6px">Save credentials</button>
         <div style="font-size:9px;color:#6f6f76;margin-top:5px;line-height:1.4">Used to auto-create / sign in to ATS accounts (Workday, iCIMS, Taleo, SuccessFactors…). The same email &amp; password are reused across sites.</div>
       </div>
@@ -5435,20 +5503,32 @@
     skipCb.addEventListener('change', () => { qSkipApplied = skipCb.checked; try { st.set('ua_skip_applied', qSkipApplied); } catch (_) {} });
     // --- saved ATS credentials ---
     const credWrap = wrap.querySelector('#ua-sb-cred-wrap');
+    const pwInput = wrap.querySelector('#ua-sb-cred-pw');
+    const eyeBtn = wrap.querySelector('#ua-sb-cred-eye');
+    const maskPw = () => { pwInput.type = 'password'; eyeBtn.textContent = '👁'; eyeBtn.title = 'Show password'; };
+    // View-password toggle.
+    eyeBtn.addEventListener('click', () => {
+      const hidden = pwInput.type === 'password';
+      pwInput.type = hidden ? 'text' : 'password';
+      eyeBtn.textContent = hidden ? '🙈' : '👁';
+      eyeBtn.title = hidden ? 'Hide password' : 'Show password';
+    });
     wrap.querySelector('#ua-sb-cred-toggle').addEventListener('click', async () => {
       const show = credWrap.style.display === 'none';
       credWrap.style.display = show ? 'block' : 'none';
       if (show) {
-        try { const pr = await getProfile(); wrap.querySelector('#ua-sb-cred-email').value = pr.email || ''; wrap.querySelector('#ua-sb-cred-pw').value = await getAppPassword(); } catch (_) {}
+        maskPw(); // always reveal-hidden when opening
+        try { const pr = await getProfile(); wrap.querySelector('#ua-sb-cred-email').value = pr.email || ''; pwInput.value = await getAppPassword(); } catch (_) {}
       }
     });
     wrap.querySelector('#ua-sb-cred-save').addEventListener('click', async () => {
       const em = wrap.querySelector('#ua-sb-cred-email').value.trim();
-      const pw = wrap.querySelector('#ua-sb-cred-pw').value.trim();
+      const pw = pwInput.value.trim();
       try {
         if (pw) await st.set('ua_app_password', pw);
         if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); }
       } catch (_) {}
+      maskPw(); // re-hide the password after saving, for safety
       const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
       LOG('Saved ATS credentials');
     });
@@ -5663,21 +5743,55 @@
     while (Date.now() < dl) { if (hasApplicationForm()) return true; await sleep(400); }
     return hasApplicationForm();
   }
+  function findButtonByText(re, exclude) {
+    return $$('button,a,[role="button"],input[type=button],input[type=submit]').filter(isVisible)
+      .find(b => { const t = (b.textContent || b.value || '').trim(); return t && t.length < 60 && re.test(t) && (!exclude || !exclude.test(t)); }) || null;
+  }
+  // The "Apply Manually" choice on a Workday-style "Start Your Application" modal.
+  // We never pick "Autofill with Resume" or "Use My Last Application".
+  function findApplyManually() {
+    return $('[data-automation-id="applyManually"]') ||
+      findButtonByText(/^\s*apply manually\s*$|^apply without (a )?(resume|sign)|^fill (it )?out manually|^continue manually|^enter manually/i);
+  }
+  async function clickApplyManually() {
+    const am = findApplyManually();
+    if (am && isVisible(am)) {
+      LOG('Apply choice modal — clicking "Apply Manually"');
+      am.scrollIntoView?.({ block: 'center' });
+      clickEl(am);
+      await sleep(800);
+      return true;
+    }
+    return false;
+  }
+  // Resolve as soon as either a form OR the apply-choice modal appears (fast).
+  async function waitForApplyTarget(ms) {
+    const dl = Date.now() + (ms || 6000);
+    while (Date.now() < dl) {
+      if (hasApplicationForm()) return 'form';
+      if (findApplyManually()) return 'choice';
+      await sleep(250);
+    }
+    return hasApplicationForm() ? 'form' : null;
+  }
   async function openApplicationForm(maxClicks) {
-    const limit = maxClicks || 2;
+    const limit = maxClicks || 3;
     let clicks = 0;
     while (clicks < limit) {
-      if (hasApplicationForm()) return clicks > 0;
+      // If a "Start Your Application" choice modal is up, always pick Apply Manually.
+      if (await clickApplyManually()) { await waitForApplyTarget(6000); continue; }
+      if (hasApplicationForm()) return true;
       const btn = findApplyButton();
       if (!btn) return clicks > 0;
       // Keep apply links in the same tab so the queue can drive the form.
       if (btn.tagName === 'A' && btn.target === '_blank') btn.target = '_self';
-      LOG('Opening application form — clicking Apply: ' + (btn.textContent || btn.value || '').trim().slice(0, 30));
+      LOG('Clicking Apply: ' + (btn.textContent || btn.value || '').trim().slice(0, 30));
       btn.scrollIntoView?.({ block: 'center' });
       realClick(btn);
       clicks++;
-      await waitForFormOrModal(9000);
-      await sleep(1200);
+      // Condition-based wait — fires the moment a form OR the choice modal appears,
+      // instead of a fixed multi-second delay (faster Apply on every ATS).
+      await waitForApplyTarget(6000);
     }
     return clicks > 0;
   }
@@ -5704,9 +5818,10 @@
     const re = mode === 'signin' ? /^(sign ?in|log ?in|continue|submit)$/i
       : mode === 'create' ? /^(create account|create my account|register|sign ?up|continue|submit|next)$/i
         : /^(create account|create my account|register|sign ?up|sign ?in|log ?in|continue|submit|next)$/i;
+    const enabled = el => el && isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !/disabled/.test(el.className || '');
     const known = $('[data-automation-id="createAccountSubmitButton"],[data-automation-id="signInSubmitButton"]');
-    if (known && isVisible(known)) return known;
-    const btns = $$('button,a[role="button"],input[type=submit],input[type=button]').filter(isVisible);
+    if (enabled(known)) return known;
+    const btns = $$('button,a[role="button"],input[type=submit],input[type=button]').filter(enabled);
     return btns.find(b => re.test((b.textContent || b.value || '').trim())) ||
       btns.find(b => /^(submit|continue|next)$/i.test((b.textContent || b.value || '').trim())) || null;
   }
@@ -5716,6 +5831,8 @@
       // Never auto-fill credentials on the user's personal job-board / social logins —
       // only on ATS account walls. (Their LinkedIn/Indeed password isn't ours to set.)
       if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
+      // Workday create-account uses the dedicated, more reliable filler.
+      if (isWorkday() && await fillWorkdayCreateAccount(true)) return true;
       const p = await getProfile();
       const email = p.email || '';
       if (!email) return false;
@@ -5728,27 +5845,42 @@
       if (!looksLikeAuthPage()) return false;
       LOG('Account auth page detected — filling saved credentials');
       const pw = await getAppPassword();
-      // Email / username
-      let emailField = $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
+      // Email / username — Workday & most ATS expose specific ids first.
+      let emailField = $('input[data-automation-id="email"]') ||
+        $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
       if (!emailField) emailField = $$('input[type=text],input:not([type])').filter(isVisible)
-        .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '')));
-      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(200); }
-      // Password + confirm-password
+        .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '') + ' ' + (i.getAttribute('data-automation-id') || '')));
+      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(250); }
+      // Password + confirm/verify password (Workday: password + verifyPassword).
+      const fillPw = () => $$('input[type=password]').filter(isVisible).forEach(f => { if (!f.value) { f.focus(); nativeSet(f, pw); } });
+      fillPw();
+      await sleep(250);
       const pwFields = $$('input[type=password]').filter(isVisible);
-      for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); await sleep(150); } }
-      // Required consent / terms checkboxes
-      $$('input[type=checkbox]').filter(isVisible).forEach(c => {
-        const lbl = (getLabel(c) || '');
-        if (!c.checked && (isFieldRequired(c) || /agree|terms|privacy|consent|acknowledge|i have read/i.test(lbl))) realClick(c);
-      });
       const isCreate = pwFields.length > 1
-        || pwFields.some(f => /confirm|verify|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '')))
+        || pwFields.some(f => /confirm|verify|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '') + (f.getAttribute('data-automation-id') || '')))
         || /create (an )?account|register|sign ?up/i.test((document.body.innerText || '').toLowerCase().slice(0, 4000));
+      // Tick EVERY unchecked visible checkbox on an auth page — these are the consent /
+      // "Agree to Privacy Notice" boxes that keep the Create Account button disabled.
+      const tickConsents = () => $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+      tickConsents();
       await sleep(400);
-      const submit = findAuthSubmit(isCreate ? 'create' : 'signin') || findAuthSubmit();
+      // Wait for the submit button to actually ENABLE (Workday disables "Create
+      // Account" until email+password+verify+consent all validate). Re-fill and
+      // re-tick on each pass so it becomes clickable.
+      let submit = null;
+      for (let i = 0; i < 12; i++) {
+        submit = findAuthSubmit(isCreate ? 'create' : 'signin') || findAuthSubmit();
+        if (submit) break;
+        fillPw(); tickConsents();
+        const ef = $('input[data-automation-id="email"]') || emailField;
+        if (ef && !ef.value) { ef.focus(); nativeSet(ef, email); }
+        await sleep(450);
+      }
       if (submit) {
         LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in'));
-        realClick(submit);
+        submit.scrollIntoView?.({ block: 'center' });
+        await sleep(200);
+        clickEl(submit);
         await sleep(3500);
         // Account already exists → switch to sign-in with the same creds.
         const bodyTxt = (document.body.innerText || '').toLowerCase();
@@ -5756,14 +5888,16 @@
           LOG('Account exists — switching to sign-in');
           const toggle = $$('button,a,[role="button"]').filter(isVisible).find(b => /^(sign ?in|log ?in|already have)/i.test((b.textContent || '').trim()));
           if (toggle) { realClick(toggle); await sleep(1500); }
-          const ef = $$('input[type=email],input[type=text]').filter(isVisible)[0];
+          const ef = $('input[data-automation-id="email"]') || $$('input[type=email],input[type=text]').filter(isVisible)[0];
           if (ef && !ef.value) nativeSet(ef, email);
           const pf = $$('input[type=password]').filter(isVisible)[0];
           if (pf && !pf.value) nativeSet(pf, pw);
           await sleep(300);
           const si = findAuthSubmit('signin');
-          if (si) { realClick(si); await sleep(3500); }
+          if (si) { clickEl(si); await sleep(3500); }
         }
+      } else {
+        LOG('Account: submit button never enabled — leaving filled for manual review');
       }
       return true;
     } catch (e) { LOG('handleAccountAuth error:', e?.message || e); return false; }
@@ -5838,7 +5972,15 @@
         await dispatchATSAutomation();
       }
     }
-    if (runnerActive) { await sleep(2000); processQ(); }
+    if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
+    // Workday Create Account auto-filler: on a Workday apply flow, fill the
+    // email/password/verify/consent and submit so the account step completes on its
+    // own (resolves Jobright's "Set a password to continue"). Submits on /apply
+    // pages (clear apply intent) or during a queue run.
+    if (/myworkdayjobs\.com|myworkdaysite\.com|workday\.com/i.test(location.hostname)) {
+      const wdShouldSubmit = () => (qActive && isRunnerTab()) || /\/apply/i.test(location.pathname || '');
+      setInterval(() => { fillWorkdayCreateAccount(wdShouldSubmit()).catch(() => {}); }, 2500);
+    }
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
@@ -8125,6 +8267,92 @@ a[href*="/checkout" i],
   }
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+  // Repeated-section support: tabs like Education / Work Experience / Skill hold
+  // multiple entries ("Education 1", "Work Experience 2", …). A flat {label:value}
+  // map collapses them to one entry, which is why only the first was captured.
+  // These helpers group fields by their entry heading so we keep ALL of them.
+  const ENTRY_HEADING_RE = /^(education|work experience|employment|experience|skill|certification|certificate|project|language|publication|award|volunteer)\s*#?\s*\d+\b/i;
+  function isEntryHeading(el) {
+    const txt = (el.textContent || '').trim();
+    return !!txt && txt.length < 36 && ENTRY_HEADING_RE.test(txt) &&
+      !el.querySelector('input,textarea,select');
+  }
+  // Returns an array of entries (each {label:value}) for repeated tabs, or null
+  // when the tab has no entry headings (caller falls back to a flat snapshot).
+  function snapshotEntries(modal) {
+    const entries = []; let cur = null, lastHeading = null;
+    for (const el of modal.querySelectorAll('*')) {
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        if (!cur) continue;
+        if (['file', 'submit', 'button', 'hidden'].includes(el.type)) continue;
+        const r = el.getBoundingClientRect(); if (r.width === 0 && r.height === 0) continue;
+        const key = labelFor(el); if (!key) continue;
+        let val = (el.type === 'checkbox' || el.type === 'radio') ? !!el.checked : el.value;
+        if (val === '' || val == null) continue;
+        cur[key] = val;
+      } else if (isEntryHeading(el)) {
+        const txt = (el.textContent || '').trim();
+        if (txt !== lastHeading) { cur = {}; entries.push(cur); lastHeading = txt; }
+      }
+    }
+    const nonEmpty = entries.filter(e => Object.keys(e).length);
+    return nonEmpty.length ? nonEmpty : null;
+  }
+  function snapshotTab(modal) {
+    return snapshotEntries(modal) || snapshotVisible(modal);
+  }
+  // Group the current input elements by entry (for import filling).
+  function groupInputsByEntry(modal) {
+    const groups = []; let cur = null, lastHeading = null;
+    for (const el of modal.querySelectorAll('*')) {
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        if (!cur) continue;
+        if (['file', 'submit', 'button', 'hidden'].includes(el.type)) continue;
+        const r = el.getBoundingClientRect(); if (r.width === 0 && r.height === 0) continue;
+        cur.push(el);
+      } else if (isEntryHeading(el)) {
+        const txt = (el.textContent || '').trim();
+        if (txt !== lastHeading) { cur = []; groups.push(cur); lastHeading = txt; }
+      }
+    }
+    return groups.filter(g => g.length);
+  }
+  function findAddButton(modal, name) {
+    const re = new RegExp('add\\s+(another\\s+)?' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    return [...modal.querySelectorAll('button,a,[role="button"],div,span')]
+      .filter(b => { const t = (b.textContent || '').trim(); return t.length < 32 && /add/i.test(t) && !b.querySelector('input,textarea,select'); })
+      .find(b => re.test((b.textContent || '').trim())) || null;
+  }
+  // Fill an array of entries: create missing entry rows via the "Add …" button,
+  // then fill each group in order.
+  async function applyEntries(modal, name, entries) {
+    let groups = groupInputsByEntry(modal);
+    let guard = 0;
+    while (groups.length < entries.length && guard++ < entries.length + 4) {
+      const addBtn = findAddButton(modal, name);
+      if (!addBtn) break;
+      try { addBtn.click(); } catch (_) {}
+      await sleep(500);
+      groups = groupInputsByEntry(modal);
+    }
+    let filled = 0;
+    for (let i = 0; i < entries.length && i < groups.length; i++) {
+      const data = entries[i];
+      for (const el of groups[i]) {
+        const key = labelFor(el);
+        if (!key || !(key in data)) continue;
+        const v = data[key];
+        if (el.type === 'checkbox' || el.type === 'radio') { const want = !!v; if (el.checked !== want) el.click(); }
+        else setReactValue(el, String(v));
+        filled++;
+      }
+      await sleep(60);
+    }
+    return filled;
+  }
+
   async function exportProfile() {
     const modal = findModal();
     if (!modal) { alert('Open "Your Autofill information" first.'); return; }
@@ -8135,7 +8363,7 @@ a[href*="/checkout" i],
       if (!tab) continue;
       try { tab.click(); } catch (_) {}
       await sleep(220);
-      out[name] = snapshotVisible(modal);
+      out[name] = snapshotTab(modal);
     }
     if (original) { const t = findTabElement(modal, original); if (t) try { t.click(); } catch (_) {} }
     try { chrome.storage.local.set({ [STORAGE_KEY]: out }); } catch (_) {}
@@ -8153,7 +8381,9 @@ a[href*="/checkout" i],
     const tab = findTabElement(modal, name);
     if (!tab) return 0;
     try { tab.click(); } catch (_) {}
-    await sleep(260);
+    await sleep(300);
+    // Repeated section (Education / Work Experience / Skill) — restore every entry.
+    if (Array.isArray(fields)) return await applyEntries(modal, name, fields);
     let n = 0;
     const inputs = modal.querySelectorAll('input, textarea, select');
     for (const el of inputs) {
