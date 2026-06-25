@@ -3592,76 +3592,84 @@
   // "Set a password to continue" because that password lives in Jobright's own store.
   // We fill the actual Workday fields with the saved credentials and submit so the
   // flow moves past the account step — independent of Jobright's prompt.
-  // Exact SpeedyApply Workday input technique (their `w` function): click + focus,
-  // fire keydown/keypress/keyup, set .value, fire keydown/keypress/keyup again, then
-  // InputEvent("input") + change. The surrounding keyboard events are what make
-  // Workday's React register the value (so validation clears and Continue/Create
-  // enable) — plain .value assignment leaves the field "invalid" (red dot).
+  // SpeedyApply-style reliable setter for React/Workday inputs: real typing via
+  // execCommand('insertText') so Workday's onChange fires and validation clears.
+  // Setting .value alone leaves the field "invalid" (red dot) and the Create
+  // Account button disabled — which is exactly what was happening.
   function reactTypeValue(el, value) {
     try {
-      const KE = (t) => el.dispatchEvent(new KeyboardEvent(t, { bubbles: true, cancelable: false }));
-      el.click();
-      el.focus();
-      KE('keydown'); KE('keypress'); KE('keyup');
-      el.value = value;
-      KE('keydown'); KE('keypress'); KE('keyup');
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+      el.focus(); el.click();
+      try { el.setSelectionRange(0, (el.value || '').length); } catch (_) { try { el.select(); } catch (_) {} }
+      let ok = false;
+      try { ok = document.execCommand('insertText', false, value); } catch (_) {}
+      if (!ok || el.value !== value) {
+        // Fallback: native setter + a real InputEvent.
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, value); else el.value = value;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      }
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
     } catch (_) {
-      try { el.value = value; ['input', 'change'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true }))); } catch (_) {}
+      // Direct fallback (do NOT call nativeSet — it routes back here on Workday).
+      try {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, value); else el.value = value;
+        ['input', 'change', 'blur'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true })));
+      } catch (_) {}
     }
   }
 
   let _wdAccountSubmitted = false;
-  let _wdBusy = false;
-  // Mirror of SpeedyApply's gf(email, password): fill the exact Workday account
-  // fields (email / password / verifyPassword) + tick createAccountCheckbox.
+  let _wdFillPasses = 0;
   async function fillWorkdayCreateAccount(submit) {
-    if (!isWorkday() || _wdBusy) return false;
-    _wdBusy = true;
-    try { return await _fillWorkdayCreateAccount(submit); }
-    finally { _wdBusy = false; }
-  }
-  async function _fillWorkdayCreateAccount(submit) {
-    const emailEl = $("input[data-automation-id='email']");
-    const pwEl = $("input[data-automation-id='password']");
-    const verifyEl = $("input[data-automation-id='verifyPassword']");
-    const pwAny = pwEl || $$('input[type=password]').filter(isVisible)[0];
-    if (!pwAny && !$("[data-automation-id='createAccountSubmitButton']") && !$("[data-automation-id='signInSubmitButton']")) return false;
-    const p = await getProfile();
-    const email = p.email || '';
+    if (!isWorkday()) return false;
+    const pwFields = $$('input[type=password]').filter(isVisible);
+    if (!pwFields.length) return false; // not on a create-account / sign-in page
+    // Same locked credentials for every account/application.
+    const email = await getAppEmail();
     const pw = await getAppPassword();
     if (!email) return false;
-    // SpeedyApply gf(): always (re)type with the keyboard-event technique so
-    // Workday registers the values even if they were visually pre-filled.
-    if (emailEl) { reactTypeValue(emailEl, email); await sleep(160); }
-    else { const e2 = $$('input[type=email],input[type=text]').filter(isVisible).find(i => /e-?mail/i.test((getLabel(i) || '') + (i.getAttribute('data-automation-id') || ''))); if (e2) { reactTypeValue(e2, email); await sleep(160); } }
-    if (pwEl) { reactTypeValue(pwEl, pw); await sleep(160); }
-    if (verifyEl) { reactTypeValue(verifyEl, pw); await sleep(160); }
-    // Fallback: any remaining empty visible password fields.
-    if (!pwEl || !verifyEl) { for (const f of $$('input[type=password]').filter(isVisible)) { if (!f.value) { reactTypeValue(f, pw); await sleep(160); } } }
-    // SpeedyApply ce(): tick createAccountCheckbox; plus any other consent box.
-    const cb = $("input[data-automation-id='createAccountCheckbox']");
-    if (cb && !cb.checked) realClick(cb);
-    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+    // If this tenant already has an account, switch to Sign In and use the same creds.
+    const knownHost = await accountExistsFor(location.hostname);
+    if (knownHost) {
+      const signInToggle = $$('button,a,[role="button"]').filter(isVisible)
+        .find(b => /^(sign ?in|log ?in|already have an account)/i.test((b.textContent || '').trim()));
+      if (signInToggle && $$('input[type=password]').filter(isVisible).length > 1) { realClick(signInToggle); await sleep(1200); }
+    }
+    // The fields may already be visually filled but NOT registered by Workday, so
+    // for the first few passes we always re-type them with the reliable method.
+    const force = _wdFillPasses < 3;
+    _wdFillPasses++;
+    let did = false;
+    let emailField = $('input[data-automation-id="email"]') ||
+      $$('input[type=email],input[type=text]').filter(isVisible)
+        .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
+    if (emailField && (force || !emailField.value)) { reactTypeValue(emailField, email); did = true; await sleep(180); }
+    for (const f of $$('input[type=password]').filter(isVisible)) { if (force || !f.value) { reactTypeValue(f, pw); did = true; await sleep(180); } }
+    // Agree to Privacy Notice / consent checkboxes
+    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
     if (submit && !_wdAccountSubmitted) {
-      // Wait for the Create Account / Sign In button to enable, then click once.
+      // Give Workday a moment to validate, then click once the button enables.
       for (let i = 0; i < 8; i++) {
-        const btn = $("button[data-automation-id='createAccountSubmitButton']:not([disabled])") ||
-          $("button[data-automation-id='signInSubmitButton']:not([disabled])");
+        const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])');
         if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-          LOG('Workday: submitting account (SpeedyApply flow)');
+          LOG('Workday: submitting account with the same saved credentials');
           _wdAccountSubmitted = true;
           btn.scrollIntoView?.({ block: 'center' });
           await sleep(150);
           clickEl(btn);
+          // Remember this tenant so future visits sign in with the same creds.
+          markAccountCreated(location.hostname);
           await sleep(2500);
           break;
         }
         await sleep(450);
       }
     }
-    return true;
+    return did;
   }
 
   // Are we on the page for the currently-applying job? Match the queued URL, OR
@@ -5563,7 +5571,7 @@
       const pw = pwInput.value.trim();
       try {
         if (pw) await st.set('ua_app_password', pw);
-        if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); }
+        if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); await st.set('ua_app_email', em); }
       } catch (_) {}
       maskPw(); // re-hide the password after saving, for safety
       const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
@@ -5850,6 +5858,21 @@
     if (!pw) { pw = generateStrongPassword(); await st.set('ua_app_password', pw); LOG('Generated & saved a reusable ATS account password'); }
     return pw;
   }
+  // Lock the email after first use so the SAME credentials are reused for every
+  // future account/application (even if the profile email later changes).
+  async function getAppEmail() {
+    let e = await st.get('ua_app_email');
+    if (!e) { e = ((await getProfile()).email || '').trim(); if (e) await st.set('ua_app_email', e); }
+    return e;
+  }
+  // Remember which ATS hosts already have an account so return visits sign in with
+  // the same credentials instead of trying to create a duplicate.
+  async function markAccountCreated(host) {
+    try { const m = (await st.get('ua_created_accounts')) || {}; m[host] = Date.now(); await st.set('ua_created_accounts', m); } catch (_) {}
+  }
+  async function accountExistsFor(host) {
+    try { const m = (await st.get('ua_created_accounts')) || {}; return !!m[host]; } catch (_) { return false; }
+  }
   function looksLikeAuthPage() { return $$('input[type=password]').some(isVisible); }
   function findAuthSubmit(mode) {
     const re = mode === 'signin' ? /^(sign ?in|log ?in|continue|submit)$/i
@@ -5868,10 +5891,12 @@
       // Never auto-fill credentials on the user's personal job-board / social logins —
       // only on ATS account walls. (Their LinkedIn/Indeed password isn't ours to set.)
       if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
-      // Workday create-account uses the dedicated, more reliable filler.
-      if (isWorkday() && await fillWorkdayCreateAccount(true)) return true;
-      const p = await getProfile();
-      const email = p.email || '';
+      // Workday account creation is handled by Jobright's OWN native "Sign-up
+      // Information" flow (Your Autofill information → Sign-up Information). Stay out
+      // of the way entirely so it behaves exactly like the stock extension.
+      if (isWorkday()) return false;
+      // Same locked credentials for every ATS account/application.
+      const email = await getAppEmail();
       if (!email) return false;
       // If no password field yet, try to open a "Create account" form.
       if (!looksLikeAuthPage()) {
@@ -5914,10 +5939,11 @@
         await sleep(450);
       }
       if (submit) {
-        LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in'));
+        LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in') + ' (same saved credentials)');
         submit.scrollIntoView?.({ block: 'center' });
         await sleep(200);
         clickEl(submit);
+        markAccountCreated(location.hostname); // reuse these creds (sign in) on return
         await sleep(3500);
         // Account already exists → switch to sign-in with the same creds.
         const bodyTxt = (document.body.innerText || '').toLowerCase();
@@ -6010,14 +6036,8 @@
       }
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
-    // Workday Create Account auto-filler: on a Workday apply flow, fill the
-    // email/password/verify/consent and submit so the account step completes on its
-    // own (resolves Jobright's "Set a password to continue"). Submits on /apply
-    // pages (clear apply intent) or during a queue run.
-    if (/myworkdayjobs\.com|myworkdaysite\.com|workday\.com/i.test(location.hostname)) {
-      const wdShouldSubmit = () => (qActive && isRunnerTab()) || /\/apply/i.test(location.pathname || '');
-      setInterval(() => { fillWorkdayCreateAccount(wdShouldSubmit()).catch(() => {}); }, 2500);
-    }
+    // NOTE: Workday account creation is intentionally left to Jobright's own native
+    // "Sign-up Information" flow — we no longer run any Workday create-account watcher.
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
@@ -8493,18 +8513,13 @@ a[href*="/checkout" i],
       position: 'absolute', top: '14px', right: '60px', display: 'flex',
       alignItems: 'center', zIndex: '999999'
     });
+    // Only Import JSON + Export JSON for the profile fields (no Work Auth / AI Settings).
     const exp = document.createElement('button'); exp.type = 'button'; exp.textContent = '⬇ Export JSON';
     const imp = document.createElement('button'); imp.type = 'button'; imp.textContent = '⬆ Import JSON';
-    const auth = document.createElement('button'); auth.type = 'button'; auth.textContent = '🌍 Work Auth';
-    const ai = document.createElement('button'); ai.type = 'button'; ai.textContent = '🤖 AI Settings';
-    styleBtn(exp, true); styleBtn(imp, false); styleBtn(auth, false); styleBtn(ai, false);
+    styleBtn(exp, true); styleBtn(imp, false);
     exp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); exportProfile(); });
     imp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); importProfile(); });
-    auth.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation();
-      try { if (window.__uaOpenWorkAuth) window.__uaOpenWorkAuth(); } catch (_) {} });
-    ai.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation();
-      try { if (window.__uaOpenAiSettings) window.__uaOpenAiSettings(); } catch (_) {} });
-    wrap.appendChild(ai); wrap.appendChild(auth); wrap.appendChild(imp); wrap.appendChild(exp);
+    wrap.appendChild(imp); wrap.appendChild(exp);
     // Anchor the modal so absolute positioning works.
     const cs = getComputedStyle(modal);
     if (cs.position === 'static') modal.style.position = 'relative';
