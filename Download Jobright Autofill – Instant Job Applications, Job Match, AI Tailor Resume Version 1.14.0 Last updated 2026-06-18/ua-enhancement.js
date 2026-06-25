@@ -3709,7 +3709,7 @@
       st.get('ua_notif_enabled').then(enabled => {
         if (enabled) sendNotification('Queue Complete!', `${done} applied, ${failed} failed, ${skipped} skipped of ${queue.length} total`);
       });
-      renderQ(); updateCtrl();
+      renderQ(); updateCtrl(); showCompletionSummary();
     }
   }
 
@@ -4236,6 +4236,9 @@
 .uc-bar-fill{height:100%;width:0%;border-radius:4px;background:linear-gradient(90deg,#00a86b,#00e58f);transition:width .4s ease}
 .uc-proc{margin-top:11px;font-size:12px;font-weight:600;color:#4ea1ff}
 .uc-proc.paused{color:#fbbf24}
+.uc-stats{display:flex;gap:10px;margin-top:9px;font-size:11px;color:#9aa0a6}
+.uc-stat b{font-variant-numeric:tabular-nums;font-weight:800}
+.uc-stat.ok b{color:#34d399}.uc-stat.sk b{color:#9aa0a6}.uc-stat.fa b{color:#f87171}
 .uc-speed{display:flex;align-items:center;gap:6px;margin-top:14px}
 .uc-speed-l{font-size:12px;font-weight:600;color:#bfbfc4;margin-right:2px}
 .uc-sp{min-width:38px;height:28px;padding:0 9px;border-radius:14px;border:1px solid #34343a;background:transparent;color:#bfbfc4;font-size:11px;font-weight:700;cursor:pointer;transition:all .15s}
@@ -4458,6 +4461,7 @@
       <div class="uc-pos"><span id="uc-pos">Preparing…</span><span class="uc-pos-co" id="uc-pos-co" style="display:none"></span></div>
       <div class="uc-bar"><div class="uc-bar-fill" id="uc-bar"></div></div>
       <div class="uc-proc" id="uc-proc">Processing…</div>
+      <div class="uc-stats" id="uc-stats"><span class="uc-stat ok"><b id="uc-ok">0</b> applied</span><span class="uc-stat sk"><b id="uc-sk">0</b> skipped</span><span class="uc-stat fa"><b id="uc-fa">0</b> failed</span></div>
       <div class="uc-speed">
         <span class="uc-speed-l">Speed:</span>
         <button class="uc-sp active" data-sp="1">1x</button>
@@ -5487,6 +5491,29 @@
     LOG('Queue speed set to ' + qSpeed + 'x (wait factor ' + qSpeedFactor + ')');
   }
 
+  // LazyApply-style completion summary shown in the overlay when a run finishes.
+  let _summaryTimer = null;
+  function showCompletionSummary() {
+    const ctrl = document.getElementById('ua-ctrl');
+    if (!ctrl) return;
+    const done = queue.filter(j => j.status === 'done').length;
+    const skipped = queue.filter(j => j.status === 'skipped').length;
+    const failed = queue.filter(j => ['failed', 'timeout'].includes(j.status)).length;
+    const set = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+    const title = ctrl.querySelector('.uc-title'); if (title) title.textContent = '✅ Automation Complete';
+    set('uc-count', `${queue.length} total`);
+    set('uc-pos', 'All jobs processed');
+    const co = document.getElementById('uc-pos-co'); if (co) co.style.display = 'none';
+    const bar = document.getElementById('uc-bar'); if (bar) bar.style.width = '100%';
+    const proc = document.getElementById('uc-proc');
+    if (proc) { proc.textContent = `${done} applied · ${skipped} skipped · ${failed} failed`; proc.classList.remove('paused'); proc.style.color = '#34d399'; }
+    set('uc-ok', done); set('uc-sk', skipped); set('uc-fa', failed);
+    const runrow = ctrl.querySelector('.uc-actions'); // keep Quit to dismiss
+    ctrl.classList.add('show');
+    clearTimeout(_summaryTimer);
+    _summaryTimer = setTimeout(() => { ctrl.classList.remove('show'); }, 15000);
+  }
+
   function updateCtrl() {
     updateSidebarUI(); // keep the in-native-sidebar bulk-apply controls in sync
     const ctrl = document.getElementById('ua-ctrl');
@@ -5511,6 +5538,11 @@
       }
       const bar = document.getElementById('uc-bar');
       if (bar) bar.style.width = (total ? Math.round((dn / total) * 100) : 0) + '%';
+      // Live LazyApply-style counters.
+      const okEl = document.getElementById('uc-ok'), skEl = document.getElementById('uc-sk'), faEl = document.getElementById('uc-fa');
+      if (okEl) okEl.textContent = queue.filter(j => j.status === 'done').length;
+      if (skEl) skEl.textContent = queue.filter(j => j.status === 'skipped').length;
+      if (faEl) faEl.textContent = queue.filter(j => ['failed', 'timeout'].includes(j.status)).length;
       const proc = document.getElementById('uc-proc');
       if (proc) {
         if (qPaused) { proc.textContent = 'Paused'; proc.classList.add('paused'); }
