@@ -3447,10 +3447,16 @@
           const d = document.getElementById('ua-drawer');
           if (d) { d.classList.toggle('open'); positionDrawer(); }
           break;
-        case 'f': // Alt+F: Run fallback fill
+        case 'f': // Alt+F: Run a manual full pass (apply → account → fill → next)
           e.preventDefault();
-          LOG('Manual fallback fill triggered via Alt+F');
-          fallbackFill().catch(e => LOG('fallbackFill error:', e));
+          LOG('Manual full fill triggered via Alt+F');
+          (async () => {
+            await openApplicationForm();
+            await handleAccountAuth();
+            await fallbackFill();
+            await guaranteeRequiredFields();
+            await autoSubmitOrNext();
+          })().catch(err => LOG('Alt+F error:', err));
           break;
         case 's': // Alt+S: Start/stop queue
           e.preventDefault();
@@ -5772,9 +5778,10 @@
     const re = mode === 'signin' ? /^(sign ?in|log ?in|continue|submit)$/i
       : mode === 'create' ? /^(create account|create my account|register|sign ?up|continue|submit|next)$/i
         : /^(create account|create my account|register|sign ?up|sign ?in|log ?in|continue|submit|next)$/i;
+    const enabled = el => el && isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !/disabled/.test(el.className || '');
     const known = $('[data-automation-id="createAccountSubmitButton"],[data-automation-id="signInSubmitButton"]');
-    if (known && isVisible(known)) return known;
-    const btns = $$('button,a[role="button"],input[type=submit],input[type=button]').filter(isVisible);
+    if (enabled(known)) return known;
+    const btns = $$('button,a[role="button"],input[type=submit],input[type=button]').filter(enabled);
     return btns.find(b => re.test((b.textContent || b.value || '').trim())) ||
       btns.find(b => /^(submit|continue|next)$/i.test((b.textContent || b.value || '').trim())) || null;
   }
@@ -5796,27 +5803,42 @@
       if (!looksLikeAuthPage()) return false;
       LOG('Account auth page detected — filling saved credentials');
       const pw = await getAppPassword();
-      // Email / username
-      let emailField = $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
+      // Email / username — Workday & most ATS expose specific ids first.
+      let emailField = $('input[data-automation-id="email"]') ||
+        $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
       if (!emailField) emailField = $$('input[type=text],input:not([type])').filter(isVisible)
-        .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '')));
-      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(200); }
-      // Password + confirm-password
+        .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '') + ' ' + (i.getAttribute('data-automation-id') || '')));
+      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(250); }
+      // Password + confirm/verify password (Workday: password + verifyPassword).
+      const fillPw = () => $$('input[type=password]').filter(isVisible).forEach(f => { if (!f.value) { f.focus(); nativeSet(f, pw); } });
+      fillPw();
+      await sleep(250);
       const pwFields = $$('input[type=password]').filter(isVisible);
-      for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); await sleep(150); } }
-      // Required consent / terms checkboxes
-      $$('input[type=checkbox]').filter(isVisible).forEach(c => {
-        const lbl = (getLabel(c) || '');
-        if (!c.checked && (isFieldRequired(c) || /agree|terms|privacy|consent|acknowledge|i have read/i.test(lbl))) realClick(c);
-      });
       const isCreate = pwFields.length > 1
-        || pwFields.some(f => /confirm|verify|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '')))
+        || pwFields.some(f => /confirm|verify|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '') + (f.getAttribute('data-automation-id') || '')))
         || /create (an )?account|register|sign ?up/i.test((document.body.innerText || '').toLowerCase().slice(0, 4000));
+      // Tick EVERY unchecked visible checkbox on an auth page — these are the consent /
+      // "Agree to Privacy Notice" boxes that keep the Create Account button disabled.
+      const tickConsents = () => $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+      tickConsents();
       await sleep(400);
-      const submit = findAuthSubmit(isCreate ? 'create' : 'signin') || findAuthSubmit();
+      // Wait for the submit button to actually ENABLE (Workday disables "Create
+      // Account" until email+password+verify+consent all validate). Re-fill and
+      // re-tick on each pass so it becomes clickable.
+      let submit = null;
+      for (let i = 0; i < 12; i++) {
+        submit = findAuthSubmit(isCreate ? 'create' : 'signin') || findAuthSubmit();
+        if (submit) break;
+        fillPw(); tickConsents();
+        const ef = $('input[data-automation-id="email"]') || emailField;
+        if (ef && !ef.value) { ef.focus(); nativeSet(ef, email); }
+        await sleep(450);
+      }
       if (submit) {
         LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in'));
-        realClick(submit);
+        submit.scrollIntoView?.({ block: 'center' });
+        await sleep(200);
+        clickEl(submit);
         await sleep(3500);
         // Account already exists → switch to sign-in with the same creds.
         const bodyTxt = (document.body.innerText || '').toLowerCase();
@@ -5824,14 +5846,16 @@
           LOG('Account exists — switching to sign-in');
           const toggle = $$('button,a,[role="button"]').filter(isVisible).find(b => /^(sign ?in|log ?in|already have)/i.test((b.textContent || '').trim()));
           if (toggle) { realClick(toggle); await sleep(1500); }
-          const ef = $$('input[type=email],input[type=text]').filter(isVisible)[0];
+          const ef = $('input[data-automation-id="email"]') || $$('input[type=email],input[type=text]').filter(isVisible)[0];
           if (ef && !ef.value) nativeSet(ef, email);
           const pf = $$('input[type=password]').filter(isVisible)[0];
           if (pf && !pf.value) nativeSet(pf, pw);
           await sleep(300);
           const si = findAuthSubmit('signin');
-          if (si) { realClick(si); await sleep(3500); }
+          if (si) { clickEl(si); await sleep(3500); }
         }
+      } else {
+        LOG('Account: submit button never enabled — leaving filled for manual review');
       }
       return true;
     } catch (e) { LOG('handleAccountAuth error:', e?.message || e); return false; }
