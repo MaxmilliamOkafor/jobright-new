@@ -5891,8 +5891,10 @@
       // Never auto-fill credentials on the user's personal job-board / social logins —
       // only on ATS account walls. (Their LinkedIn/Indeed password isn't ours to set.)
       if (/(^|\.)(linkedin|indeed|glassdoor|ziprecruiter|dice|monster|google|facebook|apple|microsoft)\.[a-z.]+$/i.test(location.hostname)) return false;
-      // Workday create-account uses the dedicated, more reliable filler.
-      if (isWorkday() && await fillWorkdayCreateAccount(true)) return true;
+      // Workday account creation is handled by Jobright's OWN native "Sign-up
+      // Information" flow (Your Autofill information → Sign-up Information). Stay out
+      // of the way entirely so it behaves exactly like the stock extension.
+      if (isWorkday()) return false;
       // Same locked credentials for every ATS account/application.
       const email = await getAppEmail();
       if (!email) return false;
@@ -6034,13 +6036,8 @@
       }
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
-    // Workday Create Account auto-filler — ONLY during an active bulk run in the
-    // runner tab. When you're browsing/applying manually it stays out of the way so
-    // Jobright's own native account flow ("Set a password to continue") works exactly
-    // like the stock extension (it was the constant watcher that interfered before).
-    if (runnerActive && /myworkdayjobs\.com|myworkdaysite\.com|workday\.com/i.test(location.hostname)) {
-      setInterval(() => { if (qActive && isRunnerTab()) fillWorkdayCreateAccount(true).catch(() => {}); }, 2500);
-    }
+    // NOTE: Workday account creation is intentionally left to Jobright's own native
+    // "Sign-up Information" flow — we no longer run any Workday create-account watcher.
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
