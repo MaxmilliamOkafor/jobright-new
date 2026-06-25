@@ -5377,7 +5377,10 @@
       <button id="ua-sb-cred-toggle" style="${ghostBtn};width:100%;text-align:left;margin-bottom:8px">🔑 ATS account login (saved credentials)</button>
       <div id="ua-sb-cred-wrap" style="display:none;margin-bottom:10px">
         <input id="ua-sb-cred-email" type="text" placeholder="Email" autocomplete="off" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;margin-bottom:6px">
-        <input id="ua-sb-cred-pw" type="text" placeholder="Password (reused for ATS sign-ups)" autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px">
+        <div style="position:relative">
+          <input id="ua-sb-cred-pw" type="password" placeholder="Password (reused for ATS sign-ups)" autocomplete="new-password" spellcheck="false" style="width:100%;box-sizing:border-box;background:#0e0e0f;border:1px solid #34343a;border-radius:8px;color:#e7e7ea;font-size:12px;padding:8px;padding-right:38px">
+          <button id="ua-sb-cred-eye" type="button" title="Show password" style="position:absolute;right:4px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:14px;line-height:1;color:#9aa0a6;padding:4px">👁</button>
+        </div>
         <button id="ua-sb-cred-save" style="${ghostBtn};width:100%;margin-top:6px">Save credentials</button>
         <div style="font-size:9px;color:#6f6f76;margin-top:5px;line-height:1.4">Used to auto-create / sign in to ATS accounts (Workday, iCIMS, Taleo, SuccessFactors…). The same email &amp; password are reused across sites.</div>
       </div>
@@ -5454,20 +5457,32 @@
     skipCb.addEventListener('change', () => { qSkipApplied = skipCb.checked; try { st.set('ua_skip_applied', qSkipApplied); } catch (_) {} });
     // --- saved ATS credentials ---
     const credWrap = wrap.querySelector('#ua-sb-cred-wrap');
+    const pwInput = wrap.querySelector('#ua-sb-cred-pw');
+    const eyeBtn = wrap.querySelector('#ua-sb-cred-eye');
+    const maskPw = () => { pwInput.type = 'password'; eyeBtn.textContent = '👁'; eyeBtn.title = 'Show password'; };
+    // View-password toggle.
+    eyeBtn.addEventListener('click', () => {
+      const hidden = pwInput.type === 'password';
+      pwInput.type = hidden ? 'text' : 'password';
+      eyeBtn.textContent = hidden ? '🙈' : '👁';
+      eyeBtn.title = hidden ? 'Hide password' : 'Show password';
+    });
     wrap.querySelector('#ua-sb-cred-toggle').addEventListener('click', async () => {
       const show = credWrap.style.display === 'none';
       credWrap.style.display = show ? 'block' : 'none';
       if (show) {
-        try { const pr = await getProfile(); wrap.querySelector('#ua-sb-cred-email').value = pr.email || ''; wrap.querySelector('#ua-sb-cred-pw').value = await getAppPassword(); } catch (_) {}
+        maskPw(); // always reveal-hidden when opening
+        try { const pr = await getProfile(); wrap.querySelector('#ua-sb-cred-email').value = pr.email || ''; pwInput.value = await getAppPassword(); } catch (_) {}
       }
     });
     wrap.querySelector('#ua-sb-cred-save').addEventListener('click', async () => {
       const em = wrap.querySelector('#ua-sb-cred-email').value.trim();
-      const pw = wrap.querySelector('#ua-sb-cred-pw').value.trim();
+      const pw = pwInput.value.trim();
       try {
         if (pw) await st.set('ua_app_password', pw);
         if (em) { const pr = (await st.get(SK.PROF)) || {}; pr.email = em; await st.set(SK.PROF, pr); }
       } catch (_) {}
+      maskPw(); // re-hide the password after saving, for safety
       const btn = wrap.querySelector('#ua-sb-cred-save'); const t = btn.textContent; btn.textContent = 'Saved ✓'; setTimeout(() => { btn.textContent = t; }, 1500);
       LOG('Saved ATS credentials');
     });
