@@ -3592,39 +3592,76 @@
   // "Set a password to continue" because that password lives in Jobright's own store.
   // We fill the actual Workday fields with the saved credentials and submit so the
   // flow moves past the account step — independent of Jobright's prompt.
+  // Exact SpeedyApply Workday input technique (their `w` function): click + focus,
+  // fire keydown/keypress/keyup, set .value, fire keydown/keypress/keyup again, then
+  // InputEvent("input") + change. The surrounding keyboard events are what make
+  // Workday's React register the value (so validation clears and Continue/Create
+  // enable) — plain .value assignment leaves the field "invalid" (red dot).
+  function reactTypeValue(el, value) {
+    try {
+      const KE = (t) => el.dispatchEvent(new KeyboardEvent(t, { bubbles: true, cancelable: false }));
+      el.click();
+      el.focus();
+      KE('keydown'); KE('keypress'); KE('keyup');
+      el.value = value;
+      KE('keydown'); KE('keypress'); KE('keyup');
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (_) {
+      try { el.value = value; ['input', 'change'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true }))); } catch (_) {}
+    }
+  }
+
   let _wdAccountSubmitted = false;
+  let _wdBusy = false;
+  // Mirror of SpeedyApply's gf(email, password): fill the exact Workday account
+  // fields (email / password / verifyPassword) + tick createAccountCheckbox.
   async function fillWorkdayCreateAccount(submit) {
-    if (!isWorkday()) return false;
-    const pwFields = $$('input[type=password]').filter(isVisible);
-    if (!pwFields.length) return false; // not on a create-account / sign-in page
+    if (!isWorkday() || _wdBusy) return false;
+    _wdBusy = true;
+    try { return await _fillWorkdayCreateAccount(submit); }
+    finally { _wdBusy = false; }
+  }
+  async function _fillWorkdayCreateAccount(submit) {
+    const emailEl = $("input[data-automation-id='email']");
+    const pwEl = $("input[data-automation-id='password']");
+    const verifyEl = $("input[data-automation-id='verifyPassword']");
+    const pwAny = pwEl || $$('input[type=password]').filter(isVisible)[0];
+    if (!pwAny && !$("[data-automation-id='createAccountSubmitButton']") && !$("[data-automation-id='signInSubmitButton']")) return false;
     const p = await getProfile();
     const email = p.email || '';
     const pw = await getAppPassword();
     if (!email) return false;
-    let did = false;
-    // Email
-    let emailField = $('input[data-automation-id="email"]') ||
-      $$('input[type=email],input[type=text]').filter(isVisible)
-        .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
-    if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); did = true; await sleep(120); }
-    // Password + Verify password
-    for (const f of pwFields) { if (!f.value) { f.focus(); nativeSet(f, pw); did = true; await sleep(120); } }
-    // Agree to Privacy Notice / consent checkboxes
-    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
+    // SpeedyApply gf(): always (re)type with the keyboard-event technique so
+    // Workday registers the values even if they were visually pre-filled.
+    if (emailEl) { reactTypeValue(emailEl, email); await sleep(160); }
+    else { const e2 = $$('input[type=email],input[type=text]').filter(isVisible).find(i => /e-?mail/i.test((getLabel(i) || '') + (i.getAttribute('data-automation-id') || ''))); if (e2) { reactTypeValue(e2, email); await sleep(160); } }
+    if (pwEl) { reactTypeValue(pwEl, pw); await sleep(160); }
+    if (verifyEl) { reactTypeValue(verifyEl, pw); await sleep(160); }
+    // Fallback: any remaining empty visible password fields.
+    if (!pwEl || !verifyEl) { for (const f of $$('input[type=password]').filter(isVisible)) { if (!f.value) { reactTypeValue(f, pw); await sleep(160); } } }
+    // SpeedyApply ce(): tick createAccountCheckbox; plus any other consent box.
+    const cb = $("input[data-automation-id='createAccountCheckbox']");
+    if (cb && !cb.checked) realClick(cb);
+    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
     if (submit && !_wdAccountSubmitted) {
-      await sleep(700);
-      const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])') ||
-        findAuthSubmit('create');
-      if (btn && isVisible(btn) && !btn.disabled) {
-        LOG('Workday: submitting Create Account with saved credentials');
-        _wdAccountSubmitted = true;
-        btn.scrollIntoView?.({ block: 'center' });
-        await sleep(150);
-        clickEl(btn);
-        await sleep(2500);
+      // Wait for the Create Account / Sign In button to enable, then click once.
+      for (let i = 0; i < 8; i++) {
+        const btn = $("button[data-automation-id='createAccountSubmitButton']:not([disabled])") ||
+          $("button[data-automation-id='signInSubmitButton']:not([disabled])");
+        if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+          LOG('Workday: submitting account (SpeedyApply flow)');
+          _wdAccountSubmitted = true;
+          btn.scrollIntoView?.({ block: 'center' });
+          await sleep(150);
+          clickEl(btn);
+          await sleep(2500);
+          break;
+        }
+        await sleep(450);
       }
     }
-    return did;
+    return true;
   }
 
   // Are we on the page for the currently-applying job? Match the queued URL, OR
@@ -6509,6 +6546,13 @@ Result: Shipped my first production change in week three and my notes doc became
   }
 
   function nativeSet(el, val) {
+    // On Workday, plain .value assignment leaves fields "unregistered" (validation
+    // fails, Continue/Create stays disabled). Use real-typing there so React commits.
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+        el.type !== 'checkbox' && el.type !== 'radio' &&
+        typeof isWorkday === 'function' && isWorkday()) {
+      return reactTypeValue(el, String(val));
+    }
     try {
       const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
