@@ -8513,18 +8513,13 @@ a[href*="/checkout" i],
       position: 'absolute', top: '14px', right: '60px', display: 'flex',
       alignItems: 'center', zIndex: '999999'
     });
+    // Only Import JSON + Export JSON for the profile fields (no Work Auth / AI Settings).
     const exp = document.createElement('button'); exp.type = 'button'; exp.textContent = '⬇ Export JSON';
     const imp = document.createElement('button'); imp.type = 'button'; imp.textContent = '⬆ Import JSON';
-    const auth = document.createElement('button'); auth.type = 'button'; auth.textContent = '🌍 Work Auth';
-    const ai = document.createElement('button'); ai.type = 'button'; ai.textContent = '🤖 AI Settings';
-    styleBtn(exp, true); styleBtn(imp, false); styleBtn(auth, false); styleBtn(ai, false);
+    styleBtn(exp, true); styleBtn(imp, false);
     exp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); exportProfile(); });
     imp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); importProfile(); });
-    auth.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation();
-      try { if (window.__uaOpenWorkAuth) window.__uaOpenWorkAuth(); } catch (_) {} });
-    ai.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation();
-      try { if (window.__uaOpenAiSettings) window.__uaOpenAiSettings(); } catch (_) {} });
-    wrap.appendChild(ai); wrap.appendChild(auth); wrap.appendChild(imp); wrap.appendChild(exp);
+    wrap.appendChild(imp); wrap.appendChild(exp);
     // Anchor the modal so absolute positioning works.
     const cs = getComputedStyle(modal);
     if (cs.position === 'static') modal.style.position = 'relative';
