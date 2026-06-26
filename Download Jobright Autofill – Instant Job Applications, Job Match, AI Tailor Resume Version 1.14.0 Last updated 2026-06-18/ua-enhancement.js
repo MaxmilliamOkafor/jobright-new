@@ -1806,22 +1806,21 @@
     await clickApplyManually();
     await sleep(1500);
 
-    // Handle sign-in/create account pages with the shared saved-credentials flow
-    // (fills email + password + confirm, ticks consent, submits, and falls back to
-    // sign-in if the account already exists).
-    const signInBtn = $('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"]');
-    if (signInBtn && isVisible(signInBtn)) {
-      LOG('Workday sign-in/create-account page detected');
-      await handleAccountAuth();
-      await sleep(1500);
-    }
+    // STEP 1 of 7 — Create Account / Sign In — handled fully by SpeedyApply during
+    // the queue (fills email + password + verifyPassword + createAccountCheckbox and
+    // submits; signs in instead if this tenant already has an account). Manual use is
+    // untouched (this only runs inside the automation flow), so Jobright's own native
+    // Sign-up flow still works when you're not running the bulk queue.
+    await waitForApplyTarget(6000);
+    await fillWorkdayCreateAccount(true);
+    await sleep(1500);
 
     // Wait for form page
     const fp = await waitFor("[data-automation-id='quickApplyPage'],[data-automation-id='applyFlowAutoFillPage'],[data-automation-id='contactInformationPage'],[data-automation-id='applyFlowMyInfoPage'],[data-automation-id='ApplyFlowPage'],[data-automation-id='applyFlowContainer'],[data-automation-id='applyFlowForm']", 10000);
     if (!fp) { LOG('Workday form page not found'); return; }
     await sleep(1000);
 
-    // Phase 2: Workday-specific field filling (from SpeedyApply)
+    // STEP 2 of 7 — My Information — filled fully by SpeedyApply.
     await workdayFillName(p);
     await workdayFillContact(p);
     await workdayFillAddress(p);
@@ -1832,7 +1831,12 @@
     await workdayResumeUpload();
     await fixPhoneCountryCode();
 
-    // Phase 3: Tailor-first flow for first page
+    // Jobright autofill as a BACKUP — catches any field SpeedyApply missed on this page.
+    await triggerAutofill();
+    await sleep(2000);
+    await fallbackFill();
+
+    // Phase 3: continue (tailor + autofill) into the multi-page flow.
     await tailorFirstFlow();
 
     // Phase 4: Workday multi-page navigation (handles all Workday page types)
@@ -3596,29 +3600,21 @@
   // execCommand('insertText') so Workday's onChange fires and validation clears.
   // Setting .value alone leaves the field "invalid" (red dot) and the Create
   // Account button disabled — which is exactly what was happening.
+  // SpeedyApply's exact Workday setter `w`: click + focus, fire keydown/keypress/
+  // keyup, set .value, fire keydown/keypress/keyup again, then InputEvent + change.
+  // The surrounding keyboard events are what make Workday's React register the value.
   function reactTypeValue(el, value) {
     try {
-      el.focus(); el.click();
-      try { el.setSelectionRange(0, (el.value || '').length); } catch (_) { try { el.select(); } catch (_) {} }
-      let ok = false;
-      try { ok = document.execCommand('insertText', false, value); } catch (_) {}
-      if (!ok || el.value !== value) {
-        // Fallback: native setter + a real InputEvent.
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (setter) setter.call(el, value); else el.value = value;
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-      }
+      const KE = (t) => el.dispatchEvent(new KeyboardEvent(t, { bubbles: true, cancelable: false }));
+      el.click();
+      el.focus();
+      KE('keydown'); KE('keypress'); KE('keyup');
+      el.value = value;
+      KE('keydown'); KE('keypress'); KE('keyup');
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
     } catch (_) {
-      // Direct fallback (do NOT call nativeSet — it routes back here on Workday).
-      try {
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (setter) setter.call(el, value); else el.value = value;
-        ['input', 'change', 'blur'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true })));
-      } catch (_) {}
+      try { el.value = value; ['input', 'change'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true }))); } catch (_) {}
     }
   }
 
@@ -7752,16 +7748,24 @@ Result: Shipped my first production change in week three and my notes doc became
         return origGet(keys, (items) => {
           try {
             items = items || {};
-            // READ-ONLY spoof: only inject a subscription/credit override key when it
-            // is genuinely ABSENT. We never mutate, overwrite, or persist Jobright's
-            // real stored data — doing so was wiping the saved Sign-up password (and
-            // anything Jobright stores). This keeps the password save identical to the
-            // stock extension while still unlocking when those keys aren't present.
+            // READ-TIME ONLY spoof (never persisted): unlock the subscription/credit
+            // keys without ever corrupting Jobright's real saved data. Primitives are
+            // forced; subscription objects get the PRO fields MERGED into a fresh CLONE
+            // (we never mutate the object Jobright handed back, so nothing we add can
+            // get persisted by a later set()). We only touch the fixed credit/plan keys
+            // in STORAGE_OVERRIDES and explicitly skip any profile / sign-up / password
+            // key, so the Sign-up password save stays identical to the stock extension.
             for (const k of Object.keys(STORAGE_OVERRIDES)) {
+              if (/signup|sign-?up|password|profile|autofill|candidate|registration/i.test(k)) continue; // safety: never touch profile/signup
               const requested = keys === null || keys === undefined || keys === k ||
                 (Array.isArray(keys) && keys.includes(k)) ||
                 (typeof keys === 'object' && keys && k in keys);
-              if (requested && items[k] === undefined) items[k] = structuredCloneSafe(STORAGE_OVERRIDES[k]);
+              if (!requested) continue;
+              const ov = STORAGE_OVERRIDES[k];
+              if (items[k] === undefined) items[k] = structuredCloneSafe(ov);                 // inject when absent
+              else if (ov === null || typeof ov !== 'object') items[k] = ov;                  // force primitive (credits/plan/flags)
+              else if (items[k] && typeof items[k] === 'object')                              // merge PRO fields into a fresh clone
+                items[k] = Object.assign({}, items[k], structuredCloneSafe(ov));
             }
           } catch (_) {}
           if (typeof cb === 'function') cb(items);
@@ -8506,30 +8510,11 @@ a[href*="/checkout" i],
     b.onmouseenter = () => { b.style.transform = 'translateY(-1px)'; b.style.boxShadow = '0 6px 16px rgba(0,0,0,0.25)'; };
     b.onmouseleave = () => { b.style.transform = 'none'; b.style.boxShadow = 'none'; };
   }
-  function injectButtons() {
-    const modal = findModal(); if (!modal) return;
-    if (modal.querySelector('#' + BTN_ID)) return;
-    const wrap = document.createElement('div');
-    wrap.id = BTN_ID;
-    Object.assign(wrap.style, {
-      position: 'absolute', top: '14px', right: '60px', display: 'flex',
-      alignItems: 'center', zIndex: '999999'
-    });
-    // Only Import JSON + Export JSON for the profile fields (no Work Auth / AI Settings).
-    const exp = document.createElement('button'); exp.type = 'button'; exp.textContent = '⬇ Export JSON';
-    const imp = document.createElement('button'); imp.type = 'button'; imp.textContent = '⬆ Import JSON';
-    styleBtn(exp, true); styleBtn(imp, false);
-    exp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); exportProfile(); });
-    imp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); importProfile(); });
-    wrap.appendChild(imp); wrap.appendChild(exp);
-    // Anchor the modal so absolute positioning works.
-    const cs = getComputedStyle(modal);
-    if (cs.position === 'static') modal.style.position = 'relative';
-    modal.appendChild(wrap);
-    log('buttons injected');
-  }
+  // Import/Export JSON removed — Jobright autofills the profile from your Jobright
+  // account, so these buttons are unnecessary (and irrelevant for Workday).
+  function injectButtons() { /* disabled */ }
 
-  function tick() { try { injectButtons(); } catch (_) {} }
+  function tick() { /* disabled — no Import/Export buttons injected */ }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tick, { once: true });
   else tick();
   try {
