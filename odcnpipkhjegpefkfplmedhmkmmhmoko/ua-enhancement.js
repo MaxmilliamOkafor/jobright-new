@@ -10,11 +10,71 @@
 // CSV upload -> import job URLs -> auto-apply each with Jobright autofill (LazyApply-style queue).
 (function () {
   'use strict';
-  const LOG = (...a) => console.log('[UA]', ...a);
+
+  // ===================== TEMP ON-SCREEN DEBUG LOGGER (toggle with Alt+D) =====================
+  // Captures every [UA] log + page errors into a draggable overlay so issues can be
+  // seen/copied right on the live ATS page (Workday etc.) without opening DevTools.
+  // It's read-only and self-contained — remove this block to drop the debugger.
+  const _dbgBuf = [];
+  let _dbgOn = false;
+  function _dbgFmt(a) { try { return typeof a === 'string' ? a : (a instanceof Error ? (a.message + '\n' + (a.stack || '')) : JSON.stringify(a)); } catch (_) { return String(a); } }
+  function _dbgPush(level, args) {
+    try {
+      const line = `[${new Date().toLocaleTimeString()}] ${level ? level + ' ' : ''}${args.map(_dbgFmt).join(' ')}`;
+      _dbgBuf.push(line);
+      if (_dbgBuf.length > 300) _dbgBuf.shift();
+      if (_dbgOn) _dbgRender();
+    } catch (_) {}
+  }
+  function _dbgRender() {
+    try {
+      let box = document.getElementById('ua-debug-box');
+      if (!box) {
+        box = document.createElement('div');
+        box.id = 'ua-debug-box';
+        box.style.cssText = 'position:fixed;left:12px;bottom:12px;width:440px;height:300px;z-index:2147483647;background:rgba(12,12,14,.96);color:#d6f5d6;border:1px solid #2bd66f;border-radius:10px;font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;box-shadow:0 8px 30px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden';
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'cursor:move;padding:6px 10px;background:#15351f;color:#5cf08a;font-weight:600;display:flex;align-items:center;gap:8px;flex:0 0 auto';
+        hdr.innerHTML = '<span style="flex:1">⚡ UA Debug (Alt+D to hide)</span>';
+        const copyBtn = document.createElement('button');
+        copyBtn.textContent = 'Copy'; copyBtn.style.cssText = 'background:#2bd66f;color:#063;border:0;border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer;font-weight:700';
+        copyBtn.onclick = () => { try { navigator.clipboard.writeText(_dbgBuf.join('\n')); copyBtn.textContent = 'Copied!'; setTimeout(() => copyBtn.textContent = 'Copy', 1200); } catch (_) {} };
+        const clrBtn = document.createElement('button');
+        clrBtn.textContent = 'Clear'; clrBtn.style.cssText = 'background:#3a3a42;color:#eee;border:0;border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer';
+        clrBtn.onclick = () => { _dbgBuf.length = 0; _dbgRender(); };
+        hdr.appendChild(copyBtn); hdr.appendChild(clrBtn);
+        const body = document.createElement('div');
+        body.id = 'ua-debug-body';
+        body.style.cssText = 'flex:1 1 auto;overflow:auto;padding:6px 10px;white-space:pre-wrap;word-break:break-word';
+        box.appendChild(hdr); box.appendChild(body);
+        (document.body || document.documentElement).appendChild(box);
+        // drag by header
+        let sx, sy, ox, oy, drag = false;
+        hdr.addEventListener('mousedown', (e) => { drag = true; sx = e.clientX; sy = e.clientY; const r = box.getBoundingClientRect(); ox = r.left; oy = r.top; e.preventDefault(); });
+        window.addEventListener('mousemove', (e) => { if (!drag) return; box.style.left = (ox + e.clientX - sx) + 'px'; box.style.top = (oy + e.clientY - sy) + 'px'; box.style.bottom = 'auto'; });
+        window.addEventListener('mouseup', () => { drag = false; });
+      }
+      box.style.display = _dbgOn ? 'flex' : 'none';
+      const body = box.querySelector('#ua-debug-body');
+      if (body && _dbgOn) {
+        const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 30;
+        body.textContent = _dbgBuf.slice(-300).join('\n');
+        if (atBottom) body.scrollTop = body.scrollHeight;
+      }
+    } catch (_) {}
+  }
+  function _dbgToggle() { _dbgOn = !_dbgOn; _dbgRender(); }
+  window.addEventListener('keydown', (e) => { if (e.altKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); _dbgToggle(); } }, true);
+  window.addEventListener('error', (e) => _dbgPush('ERROR', [e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')]), true);
+
+  const LOG = (...a) => { try { console.log('[UA]', ...a); } catch (_) {} _dbgPush('', a); };
+  // Expose a quick manual hook so you can pop the debugger from the console too.
+  try { window.__uaDebug = { show: () => { _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n') }; } catch (_) {}
 
   // ===================== GLOBAL ERROR HANDLER (prevent extension freeze on unhandled rejections) =====================
   window.addEventListener('unhandledrejection', (event) => {
     const msg = event.reason?.message || String(event.reason || '');
+    _dbgPush('REJECT', [msg]);
     // Suppress known non-critical extension errors that cause freeze loops
     if (/Could not establish connection|Receiving end does not exist|Extension context invalidated|useOriginalResume|No form fields found/i.test(msg)) {
       event.preventDefault();
@@ -3668,6 +3728,43 @@
     return did;
   }
 
+  // ===================== STANDALONE WORKDAY CREATE-ACCOUNT WATCHER =====================
+  // Runs on ANY Workday tab (not just the bulk queue). Jobright's native autofill
+  // pauses at the Create Account step asking you to "Set a password to continue"
+  // because that password lives in Jobright's own store. This watcher fills the
+  // actual Workday Email/Password/Verify fields with the saved ATS credentials and
+  // submits — so account creation passes whether or not you've set a Jobright
+  // sign-up password, and whether or not the bulk queue is running. It only TYPES
+  // into the Workday DOM; it never writes to Jobright's storage, so the native
+  // Sign-up password save is unaffected.
+  let _wdWatchStarted = false;
+  function startWorkdayAccountWatch() {
+    if (_wdWatchStarted || !isWorkday()) return;
+    _wdWatchStarted = true;
+    LOG('Workday account watcher armed for', location.hostname);
+    let ticks = 0;
+    let busy = false;
+    const iv = setInterval(async () => {
+      if (busy) return;
+      ticks++;
+      if (ticks > 60) { clearInterval(iv); LOG('Workday account watcher: stopped (timeout)'); return; }
+      try {
+        const pwFields = (typeof $$ === 'function' ? $$('input[type=password]').filter(isVisible) : []);
+        // Stop once we're past the account step (My Information / apply flow page shown).
+        if (document.querySelector("[data-automation-id='applyFlowMyInfoPage'],[data-automation-id='contactInformationPage'],[data-automation-id='quickApplyPage'],[data-automation-id='applyFlowAutoFillPage']")) {
+          clearInterval(iv); LOG('Workday account watcher: account step passed ✓'); return;
+        }
+        if (!pwFields.length) return; // not on a create-account / sign-in page yet
+        if (_wdAccountSubmitted) return; // already submitted this account
+        busy = true;
+        const btn = document.querySelector('button[data-automation-id="createAccountSubmitButton"],button[data-automation-id="signInSubmitButton"]');
+        LOG(`Workday account: pw fields=${pwFields.length}, filled=${pwFields.filter(f => f.value).length}, submitBtn=${btn ? (btn.disabled ? 'disabled' : 'enabled') : 'none'} — filling`);
+        await fillWorkdayCreateAccount(true);
+      } catch (e) { LOG('Workday account watcher error:', e?.message || e); }
+      finally { busy = false; }
+    }, 1500);
+  }
+
   // Are we on the page for the currently-applying job? Match the queued URL, OR
   // clicking "Apply" often navigates us to an external ATS form whose URL differs
   // from the imported listing URL. Without this the queue would skip mid-apply.
@@ -6032,8 +6129,10 @@
       }
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
-    // NOTE: Workday account creation is intentionally left to Jobright's own native
-    // "Sign-up Information" flow — we no longer run any Workday create-account watcher.
+    // Workday: fill the page's Create Account / Sign In fields directly with the saved
+    // ATS credentials so you never get stuck on Jobright's "Set a password to continue"
+    // prompt — works in the manual path too, not only the bulk queue.
+    if (isWorkday()) startWorkdayAccountWatch();
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
