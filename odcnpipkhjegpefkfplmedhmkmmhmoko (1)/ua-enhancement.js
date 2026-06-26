@@ -7994,32 +7994,50 @@ Result: Shipped my first production change in week three and my notes doc became
   try {
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local && !chrome.storage.local.__uaUnlockPatched) {
       const origGet = chrome.storage.local.get.bind(chrome.storage.local);
+      // READ-TIME ONLY spoof (never persisted): unlock the subscription/credit keys
+      // without ever corrupting Jobright's real saved data. Primitives are forced;
+      // subscription objects get the PRO fields MERGED into a fresh CLONE (we never
+      // mutate the object Jobright handed back, so nothing we add can get persisted by
+      // a later set()). We only touch the fixed credit/plan keys in STORAGE_OVERRIDES
+      // and explicitly skip any profile / sign-up / password key.
+      const augment = (items, keys) => {
+        try {
+          items = items || {};
+          for (const k of Object.keys(STORAGE_OVERRIDES)) {
+            if (/signup|sign-?up|password|profile|autofill|candidate|registration/i.test(k)) continue; // safety: never touch profile/signup
+            const requested = keys === null || keys === undefined || keys === k ||
+              (Array.isArray(keys) && keys.includes(k)) ||
+              (typeof keys === 'object' && keys && k in keys);
+            if (!requested) continue;
+            const ov = STORAGE_OVERRIDES[k];
+            if (items[k] === undefined) items[k] = structuredCloneSafe(ov);                 // inject when absent
+            else if (ov === null || typeof ov !== 'object') items[k] = ov;                  // force primitive (credits/plan/flags)
+            else if (items[k] && typeof items[k] === 'object')                              // merge PRO fields into a fresh clone
+              items[k] = Object.assign({}, items[k], structuredCloneSafe(ov));
+          }
+        } catch (_) {}
+        return items;
+      };
+      // CRITICAL: support BOTH the MV3 promise form (`await get(keys)`) and the legacy
+      // callback form. The old wrapper only ever used the callback form and returned
+      // its result — which is `undefined` under the promise form — so every
+      // `await chrome.storage.local.get(...)` Jobright does resolved to `undefined`
+      // and threw (e.g. "Cannot read properties of undefined (reading
+      // 'HIDDEN_ALL_WEBSITES')"), breaking the Workday Sign-up Information read too.
       chrome.storage.local.get = function (keys, cb) {
-        return origGet(keys, (items) => {
-          try {
-            items = items || {};
-            // READ-TIME ONLY spoof (never persisted): unlock the subscription/credit
-            // keys without ever corrupting Jobright's real saved data. Primitives are
-            // forced; subscription objects get the PRO fields MERGED into a fresh CLONE
-            // (we never mutate the object Jobright handed back, so nothing we add can
-            // get persisted by a later set()). We only touch the fixed credit/plan keys
-            // in STORAGE_OVERRIDES and explicitly skip any profile / sign-up / password
-            // key, so the Sign-up password save stays identical to the stock extension.
-            for (const k of Object.keys(STORAGE_OVERRIDES)) {
-              if (/signup|sign-?up|password|profile|autofill|candidate|registration/i.test(k)) continue; // safety: never touch profile/signup
-              const requested = keys === null || keys === undefined || keys === k ||
-                (Array.isArray(keys) && keys.includes(k)) ||
-                (typeof keys === 'object' && keys && k in keys);
-              if (!requested) continue;
-              const ov = STORAGE_OVERRIDES[k];
-              if (items[k] === undefined) items[k] = structuredCloneSafe(ov);                 // inject when absent
-              else if (ov === null || typeof ov !== 'object') items[k] = ov;                  // force primitive (credits/plan/flags)
-              else if (items[k] && typeof items[k] === 'object')                              // merge PRO fields into a fresh clone
-                items[k] = Object.assign({}, items[k], structuredCloneSafe(ov));
-            }
-          } catch (_) {}
-          if (typeof cb === 'function') cb(items);
-        });
+        // Forms: get(cb) | get(keys, cb) | get(keys) -> Promise | get() -> Promise
+        if (typeof keys === 'function') { cb = keys; keys = null; }
+        if (typeof cb === 'function') {
+          origGet(keys, (items) => { cb(augment(items, keys)); });
+          return; // callback form returns undefined, exactly like the native API
+        }
+        // Promise form (MV3): preserve the returned promise and augment its result.
+        try {
+          const r = origGet(keys);
+          if (r && typeof r.then === 'function') return r.then((items) => augment(items, keys));
+        } catch (_) {}
+        // Fallback if the native call didn't return a promise: wrap the callback form.
+        return new Promise((resolve) => origGet(keys, (items) => resolve(augment(items, keys))));
       };
       chrome.storage.local.__uaUnlockPatched = true;
       // NOTE: we intentionally do NOT chrome.storage.local.set() any overrides —
