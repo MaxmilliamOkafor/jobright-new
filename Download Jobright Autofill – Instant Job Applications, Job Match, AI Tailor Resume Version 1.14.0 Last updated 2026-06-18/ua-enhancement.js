@@ -3792,60 +3792,86 @@
       KE('keyup');
       el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true })); // Workday validates on blur
     } catch (_) {
       try { el.value = value; ['input', 'change'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true }))); } catch (_) {}
     }
   }
 
   let _wdLastSubmit = 0;
+  let _wdCreateAttempts = 0;
+  let _wdSignInAttempts = 0;
+  const WD_MAX_CREATE = 2;   // try Create Account at most twice — if the email already
+  const WD_MAX_SIGNIN = 3;   // exists it never advances, so fall through to Sign In.
+  // Returns: 'done' (advanced/handled), 'working' (keep trying), 'stop' (give up).
+  // IMPORTANT: this NEVER clicks the page-header "Sign In" link (utilityButtonSignIn).
+  // Doing so navigated away mid-flow and made the form bounce endlessly. It only ever
+  // clicks the IN-FORM createAccountSubmitButton / signInSubmitButton.
   async function fillWorkdayCreateAccount(submit) {
-    if (!isWorkday()) return false;
+    if (!isWorkday()) return 'stop';
     let pwFields = $$('input[type=password]').filter(isVisible);
-    if (!pwFields.length) return false; // not on a create-account / sign-in page
-    // Same locked credentials for every account/application.
+    if (!pwFields.length) return 'stop'; // not on a create-account / sign-in page
     const email = await getAppEmail();
     const pw = await getAppPassword();
-    if (!email || !pw) return false;
-    // If this tenant already has an account, switch to Sign In and use the same creds.
-    const knownHost = await accountExistsFor(location.hostname);
-    if (knownHost) {
-      const signInToggle = $$('button,a,[role="button"]').filter(isVisible)
-        .find(b => /^(sign ?in|log ?in|already have an account)/i.test((b.textContent || '').trim()));
-      if (signInToggle && $$('input[type=password]').filter(isVisible).length > 1) { realClick(signInToggle); await sleep(1200); }
-    }
-    // ATOMIC fill: type email + BOTH password fields (same value) + consent in one
-    // synchronous burst so Jobright's competing native autofill can't overwrite a
-    // field between the fill and the submit. We re-type every pass to DEFEND the
-    // value if Jobright clobbered it with its 3-char "•••" value.
-    pwFields = $$('input[type=password]').filter(isVisible);
+    if (!email || !pw) return 'working';
+
+    // Which form are we on? Create-account has a verify/confirm password field or the
+    // createAccount checkbox; sign-in is a single password with the signIn submit btn.
+    const createBtn = $('button[data-automation-id="createAccountSubmitButton"]');
+    const signInBtn = $('button[data-automation-id="signInSubmitButton"]');
+    const verifyField = pwFields.find(f => /verify|confirm|re-?enter|retype/i.test((getLabel(f) || '') + (f.name || '') + (f.id || '') + (f.getAttribute('data-automation-id') || '')));
+    const onSignIn = !!signInBtn && isVisible(signInBtn) && !verifyField;
+
+    // Fill (and DEFEND, against Jobright's clobber) email + password(s) + consent,
+    // using the React-committing setter so the values actually stick.
     let emailField = $('input[data-automation-id="email"]') ||
       $$('input[type=email],input[type=text]').filter(isVisible)
         .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
     if (emailField && emailField.value !== email) reactTypeValue(emailField, email);
     for (const f of pwFields) if (f.value !== pw) reactTypeValue(f, pw);
-    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
-    if (!submit) return true;
-    // VERIFY (synchronously, right now) before submitting: both password fields must
-    // hold our EXACT saved password (≥8 chars) and the email must be set. This is the
-    // guard that stops us ever submitting the mismatched / 3-char value that was
-    // failing Workday's password rules and leaving the form stuck.
-    const pwOK = pwFields.length >= 1 && pwFields.every(f => f.value === pw) && pw.length >= 8;
+    if (!onSignIn) $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+    if (!submit) return 'working';
+
+    // Verify the saved password is actually in every password field before submitting.
+    const pwOK = pwFields.every(f => f.value === pw) && pw.length >= 8;
     const emOK = !emailField || emailField.value === email;
+    if (!pwOK || !emOK) { LOG(`Workday: defending fields (pwOK=${pwOK} emailOK=${emOK})`); return 'working'; }
+    if (Date.now() - _wdLastSubmit < 3500) return 'working'; // let the previous submit settle
+
+    // --- SIGN IN path (account already exists) ---
+    if (onSignIn) {
+      if (_wdSignInAttempts >= WD_MAX_SIGNIN) { LOG('Workday: Sign In did not pass after retries — check the saved password under 🔑 ATS account login.'); return 'stop'; }
+      if (signInBtn && !signInBtn.disabled && signInBtn.getAttribute('aria-disabled') !== 'true') {
+        _wdLastSubmit = Date.now(); _wdSignInAttempts++;
+        LOG(`Workday: signing in with saved credentials (attempt ${_wdSignInAttempts}/${WD_MAX_SIGNIN})`);
+        clickEl(signInBtn);
+      }
+      return 'working';
+    }
+
+    // --- CREATE ACCOUNT path ---
     const consentOK = $$('input[type=checkbox]').filter(isVisible).every(c => c.checked);
-    if (!pwOK || !emOK || !consentOK) {
-      LOG(`Workday: not submitting yet — pwOK=${pwOK} emailOK=${emOK} consentOK=${consentOK} (pw ${pw.length} chars; defending fields)`);
-      return true;
+    if (!consentOK) { LOG('Workday: waiting for consent checkbox…'); return 'working'; }
+    if (_wdCreateAttempts >= WD_MAX_CREATE) {
+      // Create Account isn't advancing — the email is almost certainly already
+      // registered at this tenant. Switch to the IN-FORM Sign In (never the header
+      // link) and let the sign-in path above take over on the next ticks.
+      const switchLink = $$('a,button,[role="button"]').filter(isVisible).find(b => {
+        const aid = (b.getAttribute('data-automation-id') || '');
+        if (/utilityButtonSignIn|headerSignIn/i.test(aid)) return false;          // NOT the page-header link
+        const t = (b.textContent || '').trim();
+        return t.length < 40 && /sign ?in|log ?in|already have an account/i.test(t) && !!b.closest('form,[data-automation-id*="ignIn"],[data-automation-id*="ccount"]');
+      });
+      if (switchLink) { LOG('Workday: Create Account not advancing — switching to in-form Sign In (email likely already registered)'); realClick(switchLink); return 'working'; }
+      LOG('Workday: Create Account not advancing and no in-form Sign In link found — stopping auto-submit. Use the Sign In link with the saved password.');
+      return 'stop';
     }
-    const btn = $('button[data-automation-id="createAccountSubmitButton"],button[data-automation-id="signInSubmitButton"]');
-    if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-      // Cooldown so we don't spam-submit while Workday processes the previous click.
-      if (Date.now() - _wdLastSubmit < 4000) return true;
-      _wdLastSubmit = Date.now();
-      LOG(`Workday: submitting account — email + both password fields verified (${pw.length} chars, matched)`);
-      clickEl(btn);
-      markAccountCreated(location.hostname);
+    if (createBtn && isVisible(createBtn) && !createBtn.disabled && createBtn.getAttribute('aria-disabled') !== 'true') {
+      _wdLastSubmit = Date.now(); _wdCreateAttempts++;
+      LOG(`Workday: submitting Create Account (attempt ${_wdCreateAttempts}/${WD_MAX_CREATE}; pw ${pw.length} chars verified)`);
+      clickEl(createBtn);
     }
-    return true;
+    return 'working';
   }
 
   // ===================== STANDALONE WORKDAY CREATE-ACCOUNT WATCHER =====================
@@ -3872,17 +3898,19 @@
         const pwFields = (typeof $$ === 'function' ? $$('input[type=password]').filter(isVisible) : []);
         // Stop once we're past the account step (My Information / apply flow page shown).
         if (document.querySelector("[data-automation-id='applyFlowMyInfoPage'],[data-automation-id='contactInformationPage'],[data-automation-id='quickApplyPage'],[data-automation-id='applyFlowAutoFillPage']")) {
+          markAccountCreated(location.hostname); // confirmed: this tenant now has an account
           clearInterval(iv); LOG('Workday account watcher: account step passed ✓'); return;
         }
         if (!pwFields.length) return; // not on a create-account / sign-in page yet
-        // Keep defending + (re)submitting each tick until the page advances — the
-        // fill/verify/submit-cooldown logic inside fillWorkdayCreateAccount makes
-        // this safe (it only submits when both password fields match the saved one).
+        // Defend the fields + make a BOUNDED set of submit attempts. fillWorkdayCreateAccount
+        // returns 'stop' once it has exhausted Create-Account/Sign-In attempts, so we don't
+        // hammer the form (the old code spam-clicked ~30×, bouncing between the two forms).
         busy = true;
         const btn = document.querySelector('button[data-automation-id="createAccountSubmitButton"],button[data-automation-id="signInSubmitButton"]');
         const matchCnt = await (async () => { try { const pw = await getAppPassword(); return pwFields.filter(f => f.value === pw).length; } catch (_) { return 0; } })();
-        LOG(`Workday account: pw fields=${pwFields.length}, filled=${pwFields.filter(f => f.value).length}, matchSaved=${matchCnt}, submitBtn=${btn ? (btn.disabled ? 'disabled' : 'enabled') : 'none'} — filling`);
-        await fillWorkdayCreateAccount(true);
+        LOG(`Workday account: pw fields=${pwFields.length}, filled=${pwFields.filter(f => f.value).length}, matchSaved=${matchCnt}, submitBtn=${btn ? (btn.disabled ? 'disabled' : 'enabled') : 'none'}`);
+        const res = await fillWorkdayCreateAccount(true);
+        if (res === 'stop') { clearInterval(iv); LOG('Workday account watcher: stopped (attempts exhausted — manual Sign In may be needed).'); return; }
       } catch (e) { LOG('Workday account watcher error:', e?.message || e); }
       finally { busy = false; }
     }, 1500);
