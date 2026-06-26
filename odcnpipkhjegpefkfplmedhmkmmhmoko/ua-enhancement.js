@@ -7748,16 +7748,24 @@ Result: Shipped my first production change in week three and my notes doc became
         return origGet(keys, (items) => {
           try {
             items = items || {};
-            // READ-ONLY spoof: only inject a subscription/credit override key when it
-            // is genuinely ABSENT. We never mutate, overwrite, or persist Jobright's
-            // real stored data — doing so was wiping the saved Sign-up password (and
-            // anything Jobright stores). This keeps the password save identical to the
-            // stock extension while still unlocking when those keys aren't present.
+            // READ-TIME ONLY spoof (never persisted): unlock the subscription/credit
+            // keys without ever corrupting Jobright's real saved data. Primitives are
+            // forced; subscription objects get the PRO fields MERGED into a fresh CLONE
+            // (we never mutate the object Jobright handed back, so nothing we add can
+            // get persisted by a later set()). We only touch the fixed credit/plan keys
+            // in STORAGE_OVERRIDES and explicitly skip any profile / sign-up / password
+            // key, so the Sign-up password save stays identical to the stock extension.
             for (const k of Object.keys(STORAGE_OVERRIDES)) {
+              if (/signup|sign-?up|password|profile|autofill|candidate|registration/i.test(k)) continue; // safety: never touch profile/signup
               const requested = keys === null || keys === undefined || keys === k ||
                 (Array.isArray(keys) && keys.includes(k)) ||
                 (typeof keys === 'object' && keys && k in keys);
-              if (requested && items[k] === undefined) items[k] = structuredCloneSafe(STORAGE_OVERRIDES[k]);
+              if (!requested) continue;
+              const ov = STORAGE_OVERRIDES[k];
+              if (items[k] === undefined) items[k] = structuredCloneSafe(ov);                 // inject when absent
+              else if (ov === null || typeof ov !== 'object') items[k] = ov;                  // force primitive (credits/plan/flags)
+              else if (items[k] && typeof items[k] === 'object')                              // merge PRO fields into a fresh clone
+                items[k] = Object.assign({}, items[k], structuredCloneSafe(ov));
             }
           } catch (_) {}
           if (typeof cb === 'function') cb(items);
