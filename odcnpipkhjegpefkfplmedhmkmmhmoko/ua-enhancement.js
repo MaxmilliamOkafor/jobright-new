@@ -39,10 +39,13 @@
         const copyBtn = document.createElement('button');
         copyBtn.textContent = 'Copy'; copyBtn.style.cssText = 'background:#2bd66f;color:#063;border:0;border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer;font-weight:700';
         copyBtn.onclick = () => { try { navigator.clipboard.writeText(_dbgBuf.join('\n')); copyBtn.textContent = 'Copied!'; setTimeout(() => copyBtn.textContent = 'Copy', 1200); } catch (_) {} };
+        const expBtn = document.createElement('button');
+        expBtn.textContent = 'Export'; expBtn.style.cssText = 'background:#2b8cd6;color:#fff;border:0;border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer;font-weight:700';
+        expBtn.onclick = () => { _dbgExport(); expBtn.textContent = 'Saved!'; setTimeout(() => expBtn.textContent = 'Export', 1200); };
         const clrBtn = document.createElement('button');
         clrBtn.textContent = 'Clear'; clrBtn.style.cssText = 'background:#3a3a42;color:#eee;border:0;border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer';
         clrBtn.onclick = () => { _dbgBuf.length = 0; _dbgRender(); };
-        hdr.appendChild(copyBtn); hdr.appendChild(clrBtn);
+        hdr.appendChild(copyBtn); hdr.appendChild(expBtn); hdr.appendChild(clrBtn);
         const body = document.createElement('div');
         body.id = 'ua-debug-body';
         body.style.cssText = 'flex:1 1 auto;overflow:auto;padding:6px 10px;white-space:pre-wrap;word-break:break-word';
@@ -64,12 +67,26 @@
     } catch (_) {}
   }
   function _dbgToggle() { _dbgOn = !_dbgOn; _dbgRender(); }
+  // Export the captured log to a downloadable .txt file (with a page/URL header).
+  function _dbgExport() {
+    try {
+      const header = `UA Debug Log\nWhen: ${new Date().toISOString()}\nURL:  ${location.href}\nUA:   ${navigator.userAgent}\n${'-'.repeat(60)}\n`;
+      const blob = new Blob([header + _dbgBuf.join('\n') + '\n'], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ua-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+      (document.body || document.documentElement).appendChild(a);
+      a.click();
+      setTimeout(() => { try { a.remove(); URL.revokeObjectURL(url); } catch (_) {} }, 1000);
+    } catch (_) {}
+  }
   window.addEventListener('keydown', (e) => { if (e.altKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); _dbgToggle(); } }, true);
   window.addEventListener('error', (e) => _dbgPush('ERROR', [e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')]), true);
 
   const LOG = (...a) => { try { console.log('[UA]', ...a); } catch (_) {} _dbgPush('', a); };
   // Expose a quick manual hook so you can pop the debugger from the console too.
-  try { window.__uaDebug = { show: () => { _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n') }; } catch (_) {}
+  try { window.__uaDebug = { show: () => { _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n'), export: () => _dbgExport() }; } catch (_) {}
 
   // ===================== GLOBAL ERROR HANDLER (prevent extension freeze on unhandled rejections) =====================
   window.addEventListener('unhandledrejection', (event) => {
