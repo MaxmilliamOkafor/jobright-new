@@ -3774,21 +3774,22 @@
   // "Set a password to continue" because that password lives in Jobright's own store.
   // We fill the actual Workday fields with the saved credentials and submit so the
   // flow moves past the account step — independent of Jobright's prompt.
-  // SpeedyApply-style reliable setter for React/Workday inputs: real typing via
-  // execCommand('insertText') so Workday's onChange fires and validation clears.
-  // Setting .value alone leaves the field "invalid" (red dot) and the Create
-  // Account button disabled — which is exactly what was happening.
-  // SpeedyApply's exact Workday setter `w`: click + focus, fire keydown/keypress/
-  // keyup, set .value, fire keydown/keypress/keyup again, then InputEvent + change.
-  // The surrounding keyboard events are what make Workday's React register the value.
+  // Set a value on a React-controlled input so REACT actually commits it.
+  // Workday's inputs are React-controlled: assigning `el.value` directly bypasses
+  // React's value tracker, so on the next render React REVERTS the field to its
+  // own state (this is exactly why a typed 15-char password collapsed back to the
+  // 3-char "•••" value Jobright had put in state). Calling the *prototype* value
+  // setter is the documented workaround — React's tracker sees the change and the
+  // dispatched input event updates React state, so the value sticks.
   function reactTypeValue(el, value) {
     try {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value') && Object.getOwnPropertyDescriptor(proto, 'value').set;
       const KE = (t) => el.dispatchEvent(new KeyboardEvent(t, { bubbles: true, cancelable: false }));
-      el.click();
       el.focus();
-      KE('keydown'); KE('keypress'); KE('keyup');
-      el.value = value;
-      KE('keydown'); KE('keypress'); KE('keyup');
+      KE('keydown'); KE('keypress');
+      if (setter) setter.call(el, value); else el.value = value; // native setter → React registers the change
+      KE('keyup');
       el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
     } catch (_) {
@@ -3796,16 +3797,15 @@
     }
   }
 
-  let _wdAccountSubmitted = false;
-  let _wdFillPasses = 0;
+  let _wdLastSubmit = 0;
   async function fillWorkdayCreateAccount(submit) {
     if (!isWorkday()) return false;
-    const pwFields = $$('input[type=password]').filter(isVisible);
+    let pwFields = $$('input[type=password]').filter(isVisible);
     if (!pwFields.length) return false; // not on a create-account / sign-in page
     // Same locked credentials for every account/application.
     const email = await getAppEmail();
     const pw = await getAppPassword();
-    if (!email) return false;
+    if (!email || !pw) return false;
     // If this tenant already has an account, switch to Sign In and use the same creds.
     const knownHost = await accountExistsFor(location.hostname);
     if (knownHost) {
@@ -3813,37 +3813,39 @@
         .find(b => /^(sign ?in|log ?in|already have an account)/i.test((b.textContent || '').trim()));
       if (signInToggle && $$('input[type=password]').filter(isVisible).length > 1) { realClick(signInToggle); await sleep(1200); }
     }
-    // The fields may already be visually filled but NOT registered by Workday, so
-    // for the first few passes we always re-type them with the reliable method.
-    const force = _wdFillPasses < 3;
-    _wdFillPasses++;
-    let did = false;
+    // ATOMIC fill: type email + BOTH password fields (same value) + consent in one
+    // synchronous burst so Jobright's competing native autofill can't overwrite a
+    // field between the fill and the submit. We re-type every pass to DEFEND the
+    // value if Jobright clobbered it with its 3-char "•••" value.
+    pwFields = $$('input[type=password]').filter(isVisible);
     let emailField = $('input[data-automation-id="email"]') ||
       $$('input[type=email],input[type=text]').filter(isVisible)
         .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
-    if (emailField && (force || !emailField.value)) { reactTypeValue(emailField, email); did = true; await sleep(180); }
-    for (const f of $$('input[type=password]').filter(isVisible)) { if (force || !f.value) { reactTypeValue(f, pw); did = true; await sleep(180); } }
-    // Agree to Privacy Notice / consent checkboxes
-    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) { realClick(c); did = true; } });
-    if (submit && !_wdAccountSubmitted) {
-      // Give Workday a moment to validate, then click once the button enables.
-      for (let i = 0; i < 8; i++) {
-        const btn = $('button[data-automation-id="createAccountSubmitButton"]:not([disabled]),button[data-automation-id="signInSubmitButton"]:not([disabled])');
-        if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-          LOG('Workday: submitting account with the same saved credentials');
-          _wdAccountSubmitted = true;
-          btn.scrollIntoView?.({ block: 'center' });
-          await sleep(150);
-          clickEl(btn);
-          // Remember this tenant so future visits sign in with the same creds.
-          markAccountCreated(location.hostname);
-          await sleep(2500);
-          break;
-        }
-        await sleep(450);
-      }
+    if (emailField && emailField.value !== email) reactTypeValue(emailField, email);
+    for (const f of pwFields) if (f.value !== pw) reactTypeValue(f, pw);
+    $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+    if (!submit) return true;
+    // VERIFY (synchronously, right now) before submitting: both password fields must
+    // hold our EXACT saved password (≥8 chars) and the email must be set. This is the
+    // guard that stops us ever submitting the mismatched / 3-char value that was
+    // failing Workday's password rules and leaving the form stuck.
+    const pwOK = pwFields.length >= 1 && pwFields.every(f => f.value === pw) && pw.length >= 8;
+    const emOK = !emailField || emailField.value === email;
+    const consentOK = $$('input[type=checkbox]').filter(isVisible).every(c => c.checked);
+    if (!pwOK || !emOK || !consentOK) {
+      LOG(`Workday: not submitting yet — pwOK=${pwOK} emailOK=${emOK} consentOK=${consentOK} (pw ${pw.length} chars; defending fields)`);
+      return true;
     }
-    return did;
+    const btn = $('button[data-automation-id="createAccountSubmitButton"],button[data-automation-id="signInSubmitButton"]');
+    if (btn && isVisible(btn) && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+      // Cooldown so we don't spam-submit while Workday processes the previous click.
+      if (Date.now() - _wdLastSubmit < 4000) return true;
+      _wdLastSubmit = Date.now();
+      LOG(`Workday: submitting account — email + both password fields verified (${pw.length} chars, matched)`);
+      clickEl(btn);
+      markAccountCreated(location.hostname);
+    }
+    return true;
   }
 
   // ===================== STANDALONE WORKDAY CREATE-ACCOUNT WATCHER =====================
@@ -3873,10 +3875,13 @@
           clearInterval(iv); LOG('Workday account watcher: account step passed ✓'); return;
         }
         if (!pwFields.length) return; // not on a create-account / sign-in page yet
-        if (_wdAccountSubmitted) return; // already submitted this account
+        // Keep defending + (re)submitting each tick until the page advances — the
+        // fill/verify/submit-cooldown logic inside fillWorkdayCreateAccount makes
+        // this safe (it only submits when both password fields match the saved one).
         busy = true;
         const btn = document.querySelector('button[data-automation-id="createAccountSubmitButton"],button[data-automation-id="signInSubmitButton"]');
-        LOG(`Workday account: pw fields=${pwFields.length}, filled=${pwFields.filter(f => f.value).length}, submitBtn=${btn ? (btn.disabled ? 'disabled' : 'enabled') : 'none'} — filling`);
+        const matchCnt = await (async () => { try { const pw = await getAppPassword(); return pwFields.filter(f => f.value === pw).length; } catch (_) { return 0; } })();
+        LOG(`Workday account: pw fields=${pwFields.length}, filled=${pwFields.filter(f => f.value).length}, matchSaved=${matchCnt}, submitBtn=${btn ? (btn.disabled ? 'disabled' : 'enabled') : 'none'} — filling`);
         await fillWorkdayCreateAccount(true);
       } catch (e) { LOG('Workday account watcher error:', e?.message || e); }
       finally { busy = false; }
