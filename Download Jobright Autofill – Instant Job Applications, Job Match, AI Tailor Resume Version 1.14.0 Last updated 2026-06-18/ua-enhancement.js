@@ -8502,30 +8502,11 @@ a[href*="/checkout" i],
     b.onmouseenter = () => { b.style.transform = 'translateY(-1px)'; b.style.boxShadow = '0 6px 16px rgba(0,0,0,0.25)'; };
     b.onmouseleave = () => { b.style.transform = 'none'; b.style.boxShadow = 'none'; };
   }
-  function injectButtons() {
-    const modal = findModal(); if (!modal) return;
-    if (modal.querySelector('#' + BTN_ID)) return;
-    const wrap = document.createElement('div');
-    wrap.id = BTN_ID;
-    Object.assign(wrap.style, {
-      position: 'absolute', top: '14px', right: '60px', display: 'flex',
-      alignItems: 'center', zIndex: '999999'
-    });
-    // Only Import JSON + Export JSON for the profile fields (no Work Auth / AI Settings).
-    const exp = document.createElement('button'); exp.type = 'button'; exp.textContent = '⬇ Export JSON';
-    const imp = document.createElement('button'); imp.type = 'button'; imp.textContent = '⬆ Import JSON';
-    styleBtn(exp, true); styleBtn(imp, false);
-    exp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); exportProfile(); });
-    imp.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); importProfile(); });
-    wrap.appendChild(imp); wrap.appendChild(exp);
-    // Anchor the modal so absolute positioning works.
-    const cs = getComputedStyle(modal);
-    if (cs.position === 'static') modal.style.position = 'relative';
-    modal.appendChild(wrap);
-    log('buttons injected');
-  }
+  // Import/Export JSON removed — Jobright autofills the profile from your Jobright
+  // account, so these buttons are unnecessary (and irrelevant for Workday).
+  function injectButtons() { /* disabled */ }
 
-  function tick() { try { injectButtons(); } catch (_) {} }
+  function tick() { /* disabled — no Import/Export buttons injected */ }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tick, { once: true });
   else tick();
   try {
