@@ -11,19 +11,114 @@
 (function () {
   'use strict';
 
-  // ===================== TEMP ON-SCREEN DEBUG LOGGER (toggle with Alt+D) =====================
-  // Captures every [UA] log + page errors into a draggable overlay so issues can be
-  // seen/copied right on the live ATS page (Workday etc.) without opening DevTools.
-  // It's read-only and self-contained — remove this block to drop the debugger.
+  // ===================== TEMP IN-DEPTH DEBUG LOGGER (toggle with Alt+D) =====================
+  // A deep instrumentation layer that records, on the live ATS page, without DevTools:
+  //   • every console.* call (incl. [UA] logs)      • clicks (real + programmatic)
+  //   • input / change / focus on form fields        • form submits
+  //   • network (fetch + XHR: method, status, ms)    • navigation (pushState/url changes)
+  //   • validation / error nodes appearing in the DOM (e.g. Workday "Set a password")
+  //   • uncaught errors + unhandled promise rejections
+  // Passwords are masked (length only). Read-only + self-contained — delete this block
+  // and the _dbgInstall() call to remove the debugger entirely.
   const _dbgBuf = [];
   let _dbgOn = false;
+  const DBG_CAP = 3000;
   function _dbgFmt(a) { try { return typeof a === 'string' ? a : (a instanceof Error ? (a.message + '\n' + (a.stack || '')) : JSON.stringify(a)); } catch (_) { return String(a); } }
+  function _dbgShort(u) { try { u = String(u); if (u.length > 140) { const q = u.indexOf('?'); return (q > 0 ? u.slice(0, q) : u.slice(0, 140)) + '…'; } return u; } catch (_) { return String(u); } }
+  function _dbgSel(el) {
+    try {
+      if (!el || !el.tagName) return String(el);
+      let s = el.tagName.toLowerCase();
+      if (el.id) s += '#' + el.id;
+      const aid = el.getAttribute && el.getAttribute('data-automation-id');
+      if (aid) s += '[aid=' + aid + ']';
+      else if (typeof el.className === 'string' && el.className.trim()) s += '.' + el.className.trim().split(/\s+/)[0];
+      if (el.type) s += '{' + el.type + '}';
+      return s;
+    } catch (_) { return '?'; }
+  }
+  function _dbgDesc(el) { try { const t = (el && el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 48); return _dbgSel(el) + (t ? ' "' + t + '"' : ''); } catch (_) { return _dbgSel(el); } }
+  function _dbgField(el) {
+    try {
+      const lbl = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name)) || '';
+      let v;
+      if (el.type === 'password') v = '•••(' + (el.value ? el.value.length : 0) + ' chars)';
+      else if (el.type === 'checkbox' || el.type === 'radio') v = el.checked ? 'CHECKED' : 'unchecked';
+      else v = JSON.stringify(String(el.value != null ? el.value : '').slice(0, 64));
+      const inv = (el.getAttribute && el.getAttribute('aria-invalid') === 'true') ? ' aria-invalid!' : '';
+      return _dbgSel(el) + (lbl ? ' [' + lbl + ']' : '') + ' = ' + v + inv;
+    } catch (_) { return _dbgSel(el); }
+  }
   function _dbgPush(level, args) {
     try {
       const line = `[${new Date().toLocaleTimeString()}] ${level ? level + ' ' : ''}${args.map(_dbgFmt).join(' ')}`;
       _dbgBuf.push(line);
-      if (_dbgBuf.length > 300) _dbgBuf.shift();
+      if (_dbgBuf.length > DBG_CAP) _dbgBuf.shift();
       if (_dbgOn) _dbgRender();
+    } catch (_) {}
+  }
+  // Install the deep hooks ONCE. Capturing runs even while the panel is hidden so the
+  // exported log is always complete; rendering only happens when the panel is open.
+  let _dbgInstalled = false;
+  function _dbgInstall() {
+    if (_dbgInstalled) return; _dbgInstalled = true;
+    try {
+      // 1) console.* — captures [UA] logs and the page's own console output.
+      ['log', 'info', 'warn', 'error', 'debug'].forEach((m) => {
+        const orig = console[m];
+        if (typeof orig !== 'function') return;
+        console[m] = function (...a) { try { _dbgPush(m === 'log' ? '' : m.toUpperCase(), a); } catch (_) {} return orig.apply(this, a); };
+      });
+      // 2) Clicks (capture phase) — includes our own programmatic .click()/dispatch.
+      document.addEventListener('click', (e) => { try { _dbgPush('CLICK', [_dbgDesc(e.target)]); } catch (_) {} }, true);
+      // 3) Field activity — input / change / focus / submit.
+      const isDbgNode = (el) => { try { return !!(el && el.closest && el.closest('#ua-debug-box')); } catch (_) { return false; } };
+      document.addEventListener('input', (e) => { const el = e.target; if (!el || !el.tagName || isDbgNode(el)) return; if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) _dbgPush('INPUT', [_dbgField(el)]); }, true);
+      document.addEventListener('change', (e) => { const el = e.target; if (!el || !el.tagName || isDbgNode(el)) return; if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) _dbgPush('CHANGE', [_dbgField(el)]); }, true);
+      document.addEventListener('focusin', (e) => { const el = e.target; if (!el || !el.tagName || isDbgNode(el)) return; if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) _dbgPush('FOCUS', [_dbgSel(el)]); }, true);
+      document.addEventListener('submit', (e) => { try { _dbgPush('SUBMIT', [_dbgSel(e.target)]); } catch (_) {} }, true);
+      // 4) Network — fetch (wrap before the credit-unlock patch wraps it again).
+      try {
+        const of = window.fetch;
+        if (of) window.fetch = function (...a) {
+          const url = (a[0] && a[0].url) || a[0]; const method = ((a[1] && a[1].method) || (a[0] && a[0].method) || 'GET').toUpperCase(); const t0 = performance.now();
+          _dbgPush('NET', ['→ ' + method + ' ' + _dbgShort(url)]);
+          return of.apply(this, a).then((r) => { _dbgPush('NET', ['← ' + r.status + ' ' + method + ' ' + _dbgShort(url) + ' (' + ((performance.now() - t0) | 0) + 'ms)']); return r; })
+            .catch((e) => { _dbgPush('NET', ['✗ ' + method + ' ' + _dbgShort(url) + ' ' + (e && e.message || e)]); throw e; });
+        };
+      } catch (_) {}
+      // 5) Network — XHR.
+      try {
+        const xo = XMLHttpRequest.prototype.open, xs = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) { this.__uaM = (m || 'GET').toUpperCase(); this.__uaU = u; return xo.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function () { const t0 = performance.now(); try { this.addEventListener('loadend', () => { _dbgPush('NET', ['XHR ' + this.status + ' ' + this.__uaM + ' ' + _dbgShort(this.__uaU) + ' (' + ((performance.now() - t0) | 0) + 'ms)']); }); } catch (_) {} return xs.apply(this, arguments); };
+      } catch (_) {}
+      // 6) Navigation — SPA route changes (Workday is a SPA).
+      try {
+        ['pushState', 'replaceState'].forEach((m) => { const o = history[m]; if (o) history[m] = function () { const r = o.apply(this, arguments); _dbgPush('NAV', [m + ' → ' + _dbgShort(location.href)]); return r; }; });
+        window.addEventListener('popstate', () => _dbgPush('NAV', ['popstate → ' + _dbgShort(location.href)]));
+        window.addEventListener('hashchange', () => _dbgPush('NAV', ['hashchange → ' + _dbgShort(location.href)]));
+        let _lu = location.href; setInterval(() => { if (location.href !== _lu) { _dbgPush('NAV', ['url change → ' + _dbgShort(location.href)]); _lu = location.href; } }, 1000);
+      } catch (_) {}
+      // 7) Validation / error nodes appearing (Workday inline errors, role=alert, etc.).
+      try {
+        const errSel = '[role="alert"],[data-automation-id*="error" i],[data-automation-id*="Error"],[aria-live="assertive"],.error,.wd-Error,[data-automation-id="errorMessage"]';
+        const logErrNode = (n) => { try { const t = (n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 160); if (t) _dbgPush('VALID', [_dbgSel(n) + ' "' + t + '"']); } catch (_) {} };
+        const mo = new MutationObserver((muts) => {
+          for (const mu of muts) {
+            for (const n of mu.addedNodes) {
+              if (n.nodeType !== 1 || isDbgNode(n)) continue;
+              try { if (n.matches && n.matches(errSel)) logErrNode(n); else if (n.querySelector) { const e = n.querySelector(errSel); if (e) logErrNode(e); } } catch (_) {}
+            }
+            if (mu.type === 'attributes' && mu.attributeName === 'aria-invalid' && mu.target.getAttribute('aria-invalid') === 'true' && !isDbgNode(mu.target)) {
+              _dbgPush('VALID', ['aria-invalid → ' + _dbgSel(mu.target)]);
+            }
+          }
+        });
+        const startMO = () => { try { mo.observe(document.documentElement || document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-invalid'] }); } catch (_) {} };
+        if (document.documentElement) startMO(); else document.addEventListener('DOMContentLoaded', startMO);
+      } catch (_) {}
+      _dbgPush('', ['🟢 In-depth debugger installed — capturing console/clicks/input/network/nav/validation. Alt+D to view.']);
     } catch (_) {}
   }
   function _dbgRender() {
@@ -35,7 +130,7 @@
         box.style.cssText = 'position:fixed;left:12px;bottom:12px;width:440px;height:300px;z-index:2147483647;background:rgba(12,12,14,.96);color:#d6f5d6;border:1px solid #2bd66f;border-radius:10px;font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;box-shadow:0 8px 30px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden';
         const hdr = document.createElement('div');
         hdr.style.cssText = 'cursor:move;padding:6px 10px;background:#15351f;color:#5cf08a;font-weight:600;display:flex;align-items:center;gap:8px;flex:0 0 auto';
-        hdr.innerHTML = '<span style="flex:1">⚡ UA Debug (Alt+D to hide)</span>';
+        hdr.innerHTML = '<span style="flex:1">⚡ UA Debug (Alt+D)</span><span id="ua-debug-cnt" style="opacity:.7;font-weight:400;font-size:10px">0 lines</span>';
         const copyBtn = document.createElement('button');
         copyBtn.textContent = 'Copy'; copyBtn.style.cssText = 'background:#2bd66f;color:#063;border:0;border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer;font-weight:700';
         copyBtn.onclick = () => { try { navigator.clipboard.writeText(_dbgBuf.join('\n')); copyBtn.textContent = 'Copied!'; setTimeout(() => copyBtn.textContent = 'Copy', 1200); } catch (_) {} };
@@ -61,8 +156,9 @@
       const body = box.querySelector('#ua-debug-body');
       if (body && _dbgOn) {
         const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 30;
-        body.textContent = _dbgBuf.slice(-300).join('\n');
+        body.textContent = _dbgBuf.slice(-DBG_CAP).join('\n');
         if (atBottom) body.scrollTop = body.scrollHeight;
+        const cnt = box.querySelector('#ua-debug-cnt'); if (cnt) cnt.textContent = _dbgBuf.length + ' lines';
       }
     } catch (_) {}
   }
@@ -82,11 +178,16 @@
     } catch (_) {}
   }
   window.addEventListener('keydown', (e) => { if (e.altKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); _dbgToggle(); } }, true);
-  window.addEventListener('error', (e) => _dbgPush('ERROR', [e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')]), true);
+  // Uncaught errors (window.onerror) — not covered by the console.error hook.
+  window.addEventListener('error', (e) => _dbgPush('ERROR', [(e.message || e.type) + ' @ ' + (e.filename || '') + ':' + (e.lineno || '') + (e.error && e.error.stack ? '\n' + e.error.stack : '')]), true);
 
-  const LOG = (...a) => { try { console.log('[UA]', ...a); } catch (_) {} _dbgPush('', a); };
-  // Expose a quick manual hook so you can pop the debugger from the console too.
-  try { window.__uaDebug = { show: () => { _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n'), export: () => _dbgExport() }; } catch (_) {}
+  // LOG just writes to console with a [UA] tag; the console.* hook in _dbgInstall()
+  // captures it into the buffer (so there's no double-logging here).
+  const LOG = (...a) => { try { console.log('[UA]', ...a); } catch (_) {} };
+  // Expose manual hooks so you can drive the debugger from the console too.
+  try { window.__uaDebug = { show: () => { _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n'), export: () => _dbgExport(), clear: () => { _dbgBuf.length = 0; _dbgRender(); } }; } catch (_) {}
+  // Arm the deep instrumentation immediately so capture starts at document_start.
+  _dbgInstall();
 
   // ===================== GLOBAL ERROR HANDLER (prevent extension freeze on unhandled rejections) =====================
   window.addEventListener('unhandledrejection', (event) => {
