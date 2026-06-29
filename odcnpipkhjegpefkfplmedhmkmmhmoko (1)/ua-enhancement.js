@@ -6079,9 +6079,21 @@
     const limit = maxClicks || 3;
     let clicks = 0;
     while (clicks < limit) {
-      // If a "Start Your Application" choice modal is up, always pick Apply Manually.
-      if (await clickApplyManually()) { await waitForApplyTarget(6000); continue; }
       if (hasApplicationForm()) return true;
+      // If a "Start Your Application" choice modal is up, pick Apply Manually and WAIT
+      // for the form to load. CRITICAL: once that modal has appeared we must NOT click
+      // the page's "Apply" button again — doing so reopens the modal and makes it
+      // flicker in and out (and fights Jobright's own "Choose Apply Manually" click).
+      if (findApplyManually()) {
+        await clickApplyManually();
+        if ((await waitForApplyTarget(9000)) === 'form' || hasApplicationForm()) return true;
+        // Give the form a little more time instead of re-clicking Apply.
+        await sleep(1500);
+        if (hasApplicationForm()) return true;
+        // If the modal genuinely re-rendered, choose Apply Manually once more, then stop.
+        if (findApplyManually()) { await clickApplyManually(); await waitForApplyTarget(9000); }
+        return hasApplicationForm();
+      }
       const btn = findApplyButton();
       if (!btn) return clicks > 0;
       // Keep apply links in the same tab so the queue can drive the form.
