@@ -3619,10 +3619,9 @@
       if (!e.altKey) return;
 
       switch (e.key.toLowerCase()) {
-        case 'a': // Alt+A: Toggle auto-apply
+        case 'a': // Alt+A: Toggle Fully Automated
           e.preventDefault();
-          const tog = document.getElementById('ua-aa');
-          if (tog) { tog.checked = !tog.checked; tog.dispatchEvent(new Event('change')); }
+          setAutoApply(!autoApply, true);
           break;
         case 'q': // Alt+Q: Toggle drawer
           e.preventDefault();
@@ -3904,6 +3903,9 @@
     let busy = false;
     const iv = setInterval(async () => {
       if (busy) return;
+      // Respect the Fully Automated toggle — if it's switched OFF, pause (don't act),
+      // but keep the interval alive so flipping it back ON resumes without a reload.
+      if (!autoApply && !(qActive && isRunnerTab())) return;
       ticks++;
       if (ticks > 160) { clearInterval(iv); LOG('Workday account watcher: stopped (timeout)'); return; } // ~240s — multi-step create→signin needs headroom
       try {
@@ -5127,12 +5129,7 @@
   // ===================== DRAWER EVENTS =====================
   function bindDrawer() {
     const tog = document.getElementById('ua-aa'); tog.checked = autoApply;
-    tog.addEventListener('change', async e => {
-      autoApply = e.target.checked; await st.set(SK.AA, autoApply); updateStat();
-      if (autoApply && detectATS()) {
-        dispatchATSAutomation();
-      }
-    });
+    tog.addEventListener('change', e => { setAutoApply(e.target.checked, true); });
 
     const drop = document.getElementById('ua-drop'), csv = document.getElementById('ua-csv');
     drop.addEventListener('click', () => csv.click());
@@ -5842,18 +5839,79 @@
 
   // Ensure the bulk-apply section is present inside the native sidebar; React
   // re-renders can detach it, so we re-append the same node (preserves state).
+  // ===================== FULLY-AUTOMATED TOGGLE (standalone preference) =====================
+  // A single ON/OFF switch, separate from the Bulk Auto-Apply card. When ON, any page
+  // whose ATS we detect (Workday, Greenhouse, Lever, iCIMS, …) starts the full apply
+  // automation on its own — no clicking Apply, Apply Manually, account creation, or
+  // submit. The preference is persisted (SK.AA) and shared with the Alt+A shortcut and
+  // the advanced-drawer checkbox.
+  async function setAutoApply(val, startNow) {
+    autoApply = !!val;
+    try { await st.set(SK.AA, autoApply); } catch (_) {}
+    paintAutoToggle();
+    try { const d = document.getElementById('ua-aa'); if (d) d.checked = autoApply; } catch (_) {}
+    try { updateStat(); } catch (_) {}
+    if (autoApply && startNow && (detectATS() || isWorkday())) {
+      LOG('Fully Automated turned ON — starting full automation for ' + (detectATS() || 'Workday'));
+      if (isWorkday()) startWorkdayAccountWatch();
+      dispatchATSAutomation();
+    }
+  }
+  function paintAutoToggle() {
+    const t = document.getElementById('ua-fa-toggle');
+    if (t) {
+      t.setAttribute('aria-checked', autoApply ? 'true' : 'false');
+      t.style.background = autoApply ? '#00f0a0' : '#3a3a42';
+      const knob = t.querySelector('span');
+      if (knob) knob.style.transform = autoApply ? 'translateX(20px)' : 'translateX(0)';
+    }
+    const lbl = document.getElementById('ua-fa-state');
+    if (lbl) { lbl.textContent = autoApply ? 'ON' : 'OFF'; lbl.style.color = autoApply ? '#00f0a0' : '#9aa0a6'; }
+    const card = document.getElementById('ua-fa-card');
+    if (card) card.style.borderColor = autoApply ? '#1c8a5e' : '#1c5743';
+  }
+  let _faCard = null;
+  function buildFullAutoCard() {
+    if (_faCard && _faCard.isConnected) return _faCard;
+    const card = document.createElement('div');
+    card.id = 'ua-fa-card';
+    card.setAttribute('data-ua-keep', '1');
+    card.setAttribute('style', "margin:10px 12px;padding:11px 13px;background:#0c2118;border:1px solid #1c5743;border-radius:12px;font-family:'Inter',system-ui,-apple-system,sans-serif");
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div style="display:flex;flex-direction:column;line-height:1.3">
+          <span style="font-size:13px;font-weight:800;color:#9ff5d3">🤖 Fully Automated <span id="ua-fa-state" style="font-weight:800;color:#9aa0a6;margin-left:3px">OFF</span></span>
+          <span style="font-size:9px;color:#6f8f82;margin-top:2px">Auto-detect the ATS &amp; apply with zero clicks</span>
+        </div>
+        <button id="ua-fa-toggle" type="button" role="switch" aria-checked="false" title="Toggle fully-automated mode (Alt+A)" style="flex:0 0 auto;width:46px;height:24px;border-radius:13px;border:none;background:#3a3a42;cursor:pointer;position:relative;padding:0;transition:background .2s">
+          <span style="position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>
+        </button>
+      </div>`;
+    card.querySelector('#ua-fa-toggle').addEventListener('click', () => setAutoApply(!autoApply, true));
+    _faCard = card;
+    setTimeout(paintAutoToggle, 0);
+    return card;
+  }
+
   function injectSidebarUI() {
     const root = findSidebarRoot();
     if (!root) return;
+    const fa = buildFullAutoCard();
     const sec = buildSidebarSection();
-    // Already attached — do nothing here (state is synced by updateCtrl on real
-    // events). Avoids a feedback loop with the childList MutationObserver.
-    if (sec.isConnected && root.contains(sec)) return;
+    // Already attached — just make sure the Fully-Automated card is present too.
+    if (sec.isConnected && root.contains(sec)) {
+      if (fa && !root.contains(fa) && sec.parentElement) sec.parentElement.insertBefore(fa, sec);
+      paintAutoToggle();
+      return;
+    }
     const anchor = root.querySelector('.autofill-button-group') ||
       root.querySelector('.job-profile-container') ||
       (root.querySelector('.auto-fill-button') && root.querySelector('.auto-fill-button').parentElement);
-    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(sec, anchor.nextSibling);
-    else root.appendChild(sec);
+    if (anchor && anchor.parentElement) {
+      anchor.parentElement.insertBefore(sec, anchor.nextSibling);
+      if (fa && sec.parentElement) sec.parentElement.insertBefore(fa, sec); // Fully-Automated card above the bulk card
+    } else { root.appendChild(fa); root.appendChild(sec); }
+    paintAutoToggle();
     updateSidebarUI();
   }
 
@@ -6283,7 +6341,9 @@
     // where we click "Apply" to reveal the form). Skipping was the #1 reason the
     // CSV queue "did nothing" on many sites.
     const runnerActive = qActive && isRunnerTab();
-    if (!runnerActive && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
+    // Never bail on an ATS page when Fully Automated is ON — we must mount + drive there.
+    const fullAutoOnATS = autoApply && (detectATS() || isWorkday());
+    if (!runnerActive && !fullAutoOnATS && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
@@ -6295,19 +6355,20 @@
     if (ansCntEl) ansCntEl.textContent = `(${Object.keys(_answerBank).length} answers)`;
 
     const ats = detectATS();
-    if (ats) {
-      LOG(`ATS detected: ${ats}`);
-      // Auto-start ATS-specific flow when detected and auto-apply is on
-      if (autoApply) {
-        await sleep(2000);
-        await dispatchATSAutomation();
-      }
+    if (ats) LOG(`ATS detected: ${ats}`);
+    // FULLY AUTOMATED: on any detected ATS (incl. Workday), start the whole apply flow
+    // automatically — no clicks. dispatchATSAutomation reveals the form (Apply / Apply
+    // Manually), creates/sign-ins the account, fills, and self-navigates to submit.
+    if (autoApply && (ats || isWorkday())) {
+      LOG(`Fully Automated: starting full automation for ${ats || 'Workday'}`);
+      await sleep(1500);
+      await dispatchATSAutomation();
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
-    // Workday: fill the page's Create Account / Sign In fields directly with the saved
-    // ATS credentials so you never get stuck on Jobright's "Set a password to continue"
-    // prompt — works in the manual path too, not only the bulk queue.
-    if (isWorkday()) startWorkdayAccountWatch();
+    // Workday: when Fully Automated is ON (or a bulk run is active), auto-fill + submit
+    // the Create Account / Sign In step. When OFF we stay out of the way and let
+    // Jobright's native flow handle it, so the toggle is the single source of truth.
+    if (isWorkday() && (autoApply || runnerActive)) startWorkdayAccountWatch();
     if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
