@@ -1544,11 +1544,70 @@
     LOG(`Learned answers from ${inputs.length} fields`);
   }
 
-  // ===================== SUCCESS DETECTION =====================
+  // ===================== SUCCESS / FAILURE / STABILITY DETECTION =====================
+  // (Robustness techniques adapted from the OptimHire auto-applier for 100% reliability.)
+  const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful|you['’]ve\s+applied|you['’]re\s+all\s+set|application\s+is\s+under\s+review/i;
+  const SUCCESS_URL_RE = /(thanks|thank.?you|success|confirm|complete|received|submitted|done|applied)/i;
+  const FAILURE_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+(closed|no\s+longer)|posting\s+is\s+closed|application\s+window\s+has\s+closed|page\s+not\s+found|404\s+error)/i;
+  let _lastSubmitAt = 0;            // set when our flow clicks a submit/apply button
+  const SUBMIT_GRACE_MS = 8000;    // after a submit with no validation error, treat as success
+  // A persistent inline validation error means a required field couldn't be satisfied.
+  function pageHasValidationError() {
+    try {
+      const el = $('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"],[role="alert"]');
+      if (!el || !isVisible(el)) return false;
+      // [role=alert] is also used for success toasts — only count it if the text looks like an error.
+      if (el.matches('[role="alert"]') && !/error|required|invalid|please|must|cannot|missing/i.test(el.textContent || '')) return false;
+      return true;
+    } catch (_) { return false; }
+  }
+  function pageHasFailure() {
+    try { return FAILURE_TEXT_RE.test((document.body && document.body.innerText || '').slice(0, 4000)); } catch (_) { return false; }
+  }
+  // Resolve once the DOM has been quiet for ~300ms (or after `timeout`) — so we act on a
+  // settled page instead of mid-render. Cuts races on multi-step / React forms.
+  function waitForFormStable(timeout = 3000) {
+    return new Promise(resolve => {
+      let timer = null;
+      const done = () => { try { mo.disconnect(); } catch (_) {} resolve(); };
+      const mo = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(done, 300); });
+      try { mo.observe(document.body || document.documentElement, { childList: true, subtree: true }); } catch (_) {}
+      setTimeout(done, timeout);
+      timer = setTimeout(done, 300);
+    });
+  }
+  // Same-host, segment-by-segment path match; tolerates a final apply→thanks step word so
+  // a post-submit redirect still counts as the same job, but two different job ids don't.
+  function urlsRoughlyMatch(a, b) {
+    try {
+      const ua = new URL(a), ub = new URL(b);
+      if (ua.hostname.toLowerCase() !== ub.hostname.toLowerCase()) return false;
+      const pa = ua.pathname.split('/').filter(Boolean), pb = ub.pathname.split('/').filter(Boolean);
+      if (!pa.length || !pb.length) return true;
+      const ACTION = /^(apply|application|apply-now|start|step\d*|thanks|thank-you|thankyou|success|confirm|confirmation|complete|completed|received|submitted|submit|done|review|finish)$/i;
+      const n = Math.min(pa.length, pb.length);
+      for (let i = 0; i < n; i++) {
+        if (pa[i] === pb[i]) continue;
+        if (i === n - 1 && (ACTION.test(pa[i]) || ACTION.test(pb[i]))) continue;
+        return false;
+      }
+      return true;
+    } catch (_) { return false; }
+  }
+  // Confirmed submission: an explicit success signal, OR we clicked submit, waited out the
+  // grace period, and no validation error came back (handles ATS with no success page).
+  function confirmSubmitted() {
+    if (checkSuccess()) return true;
+    if (_lastSubmitAt && Date.now() - _lastSubmitAt > SUBMIT_GRACE_MS && !pageHasValidationError() && !hasApplicationForm()) return true;
+    return false;
+  }
+
   function checkSuccess() {
     const href = location.href.toLowerCase();
+    if (SUCCESS_URL_RE.test(new URL(location.href).pathname.toLowerCase())) return true;
     if (/\/thanks|\/thank.you|\/success|\/confirmation|\/submitted|\/done|\/complete|\/applied/i.test(href)) return true;
     const body = document.body?.innerText || '';
+    if (SUCCESS_TEXT_RE.test(body)) return true;
     if (/application submitted|thank you for applying|application received|we.ve received your|successfully submitted|application complete|thanks for applying|your application has been|application was submitted|you.ve applied|we have received|you.re all set|application is under review/i.test(body)) return true;
     if ($('#application_confirmation,.application-confirmation,.confirmation-text,.posting-confirmation,.success-message,.submission-confirmation')) return true;
     if ($('[data-automation-id="congratulationsMessage"],[data-automation-id="confirmationMessage"],[data-automation-id="applicationSubmittedPage"]')) return true;
@@ -1606,7 +1665,7 @@
       // Try submit
       for (const sel of submitSels) {
         const btn = $(sel);
-        if (btn && isVisible(btn)) { LOG('Clicking submit:', sel); await sleep(500); realClick(btn); return 'submitted'; }
+        if (btn && isVisible(btn)) { LOG('Clicking submit:', sel); await sleep(500); realClick(btn); _lastSubmitAt = Date.now(); return 'submitted'; }
       }
       // Fallback: button by text
       const btns = $$('button,a[role="button"],input[type="submit"]').filter(isVisible);
@@ -1614,7 +1673,7 @@
         const t = (b.textContent || b.value || '').trim().toLowerCase();
         return /^(submit|apply|send|complete|finish)\b/i.test(t) && !/cancel|back|prev|close/i.test(t);
       });
-      if (submitBtn) { LOG('Clicking submit (text):', submitBtn.textContent?.trim()); await sleep(500); realClick(submitBtn); return 'submitted'; }
+      if (submitBtn) { LOG('Clicking submit (text):', submitBtn.textContent?.trim()); await sleep(500); realClick(submitBtn); _lastSubmitAt = Date.now(); return 'submitted'; }
     }
 
     // Also try Jobright's continue-button
@@ -1837,7 +1896,7 @@
       if (action === 'submitted') {
         LOG('Submitted on page ' + page);
         await sleep(3000);
-        if (checkSuccess()) { LOG('Success confirmed after submit'); break; }
+        if (confirmSubmitted()) { LOG('Success confirmed after submit'); break; }
         // Some ATS show a final review/confirm step after the first "submit" —
         // keep looping so we click it too instead of stopping prematurely.
         continue;
@@ -2729,7 +2788,7 @@
       // view, re-fills + fixes validation if "Continue to the next page" is disabled,
       // and submits on the final review page).
       const action = await autoSubmitOrNext();
-      if (action === 'submitted') { await sleep(2500); if (checkSuccess()) break; }
+      if (action === 'submitted') { await sleep(2500); if (confirmSubmitted()) break; }
       else if (action === 'next_page') { await sleep(2500); }
       else { LOG('Workday: no next/submit button found'); break; }
     }
@@ -4007,6 +4066,8 @@
   // clicking "Apply" often navigates us to an external ATS form whose URL differs
   // from the imported listing URL. Without this the queue would skip mid-apply.
   function onCurrentJobPage(c) {
+    // Segment-wise URL match (tolerates apply→thanks redirects, rejects different job ids).
+    try { if (urlsRoughlyMatch(location.href, c.url)) return true; } catch (_) {}
     try {
       const p = new URL(c.url).pathname;
       if (location.href.includes(p.slice(0, Math.min(p.length, 25)))) return true;
@@ -4068,33 +4129,50 @@
             }
           }
 
+          // Already applied / posting closed → skip fast (don't burn retries).
+          if (pageHasFailure()) {
+            LOG('Failure signal (already-applied / closed) — skipping');
+            clearTimeout(_qTimeoutId);
+            c.status = 'skipped'; c.error = 'Already applied / posting closed'; c.completedAt = Date.now();
+            qStats.skipped++;
+            await saveQ(); await saveStats(); renderQ(); updateCtrl();
+            await sleep(500); goNext(); return;
+          }
+
           // Drive the application to a CONFIRMED submission before moving on.
-          // The user requirement: each job must be fully autofilled AND submitted
-          // before the queue advances. We attempt fill+submit, verify, and retry
-          // (re-opening the form / filling gaps / re-submitting) until confirmed or
-          // the per-job timeout fires. Only a confirmed submission counts as done.
-          let success = false;
+          // Each job must be fully autofilled AND submitted before the queue advances.
+          // Verification uses OptimHire-style signals: an explicit success page/text, OR
+          // a submit-click followed by an 8s grace window with no validation error. A
+          // persistent validation error fast-fails instead of waiting the whole timeout.
+          _lastSubmitAt = 0; // reset the grace timer for this job
+          let success = false, validationStuck = false;
           for (let attempt = 0; attempt < 2 && !success; attempt++) {
             await withRetry(async () => { await dispatchATSAutomation(); }, 'Queue job automation');
             // Verify submission (poll for a confirmation signal).
             for (let check = 0; check < 6; check++) {
               await sleep(2000);
-              if (checkSuccess()) { success = true; break; }
+              if (confirmSubmitted()) { success = true; break; }
+              if (pageHasFailure()) { LOG('Failure signal during verify — stopping'); break; }
             }
             if (success) break;
             // Not confirmed — fill any remaining gaps and force another submit.
-            LOG(`Submission not confirmed (attempt ${attempt + 1}/3) — retrying fill + submit`);
+            LOG(`Submission not confirmed (attempt ${attempt + 1}/2) — retrying fill + submit`);
             try {
               await openApplicationForm();
+              await waitForFormStable(2500);
               await fallbackFill();
               await guaranteeRequiredFields();
               const r = await autoSubmitOrNext();
               if (r === 'next_page') { await sleep(2500); await multiPageLoop(); }
             } catch (e) { LOG('Retry pass error:', e?.message || e); }
-            for (let check = 0; check < 4; check++) {
+            for (let check = 0; check < 5; check++) {
               await sleep(2000);
-              if (checkSuccess()) { success = true; break; }
+              if (confirmSubmitted()) { success = true; break; }
+              // Validation error that persists across the whole poll → the form can't be
+              // satisfied automatically; stop retrying and mark failed.
+              if (check >= 3 && pageHasValidationError() && !success) { validationStuck = true; break; }
             }
+            if (validationStuck) break;
           }
 
           // Clear timeout — job finished (confirmed or exhausted retries)
@@ -4111,9 +4189,9 @@
             // Could not confirm submission — mark failed (not a false "done") so the
             // user can see it didn't complete, and don't silently skip it as applied.
             c.status = 'failed';
-            c.error = 'Could not confirm submission after retries';
+            c.error = validationStuck ? 'Validation errors could not be resolved' : 'Could not confirm submission after retries';
             qStats.failed++;
-            LOG('Queue job: submission NOT confirmed after retries — marked failed');
+            LOG('Queue job: submission NOT confirmed' + (validationStuck ? ' (validation stuck)' : '') + ' — marked failed');
             await recordApplication(c.url, c.title, 'failed', c.jobBoard, c.duration);
           }
           qStats.totalTime += c.duration;
