@@ -1121,10 +1121,66 @@
     return committed;
   }
 
+  // WORKAROUND for the fields Jobright's autofill commonly leaves blank (and that then
+  // block submission): visa-sponsorship / work-authorization questions and the EEO /
+  // demographic questions, which are usually RADIO groups (guaranteeRequiredFields only
+  // covered selects + text). Map the question text to a safe default and tick it.
+  function chooseChoiceAnswer(q) {
+    q = (q || '').toLowerCase();
+    if (!q) return null;
+    if (/sponsor|visa|work\s?permit|immigration|h-?1b/.test(q)) return 'no';   // "require sponsorship?" → No
+    if (/authori[sz]ed|eligible to work|legally\s+(work|authorized|able)|right to work|currently.*authorized|are you.*authorized/.test(q)) return 'yes';
+    if (/hispanic|latino|latina|latinx/.test(q)) return 'decline';
+    if (/veteran/.test(q)) return 'decline';
+    if (/disab/.test(q)) return 'decline';
+    if (/\bgender\b|\bsex\b|how do you identify/.test(q)) return 'decline';
+    if (/\brace\b|ethnic/.test(q)) return 'decline';
+    if (/at least 18|over 18|18 years|age of 18|are you.*\b18\b/.test(q)) return 'yes';
+    if (/agree|consent|terms|certif|acknowledge|read and understood/.test(q)) return 'yes';
+    return null;
+  }
+  function choiceLabel(r) {
+    return (getLabel(r) || r.value || (r.nextElementSibling && r.nextElementSibling.textContent) || (r.closest('label') && r.closest('label').textContent) || '').trim().toLowerCase();
+  }
+  function pickChoice(radios, want) {
+    const isYes = r => /^\s*(yes|y|true|1|i (am|do|will)|authorized|eligible)\b/.test(choiceLabel(r));
+    const isNo = r => /^\s*(no|n|false|0|i (am not|do not|don'?t|will not)|not require|do not require)\b/.test(choiceLabel(r));
+    const isDecline = r => /decline|prefer not|don'?t wish|do not wish|not to (answer|disclose|identify)|choose not/.test(choiceLabel(r));
+    let target = want === 'yes' ? radios.find(isYes)
+      : want === 'no' ? radios.find(isNo)
+        : radios.find(isDecline) || radios.find(isNo);
+    if (!target) return false;
+    realClick(target);
+    if (!target.checked) { try { target.checked = true; } catch (_) {} target.dispatchEvent(new Event('input', { bubbles: true })); target.dispatchEvent(new Event('change', { bubbles: true })); }
+    return true;
+  }
+  async function answerChoiceGroups() {
+    let n = 0;
+    const groups = new Map();
+    for (const r of $$('input[type=radio],[role="radio"]').filter(isVisible)) {
+      const key = r.name || r.closest('fieldset,[role=group],.form-group,.field,.question,li') || r;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    for (const radios of groups.values()) {
+      if (radios.some(r => r.checked || r.getAttribute('aria-checked') === 'true')) continue; // already answered
+      const fs = radios[0].closest('fieldset,[role=group],.question,[class*="question" i],.form-group,.field,li');
+      let q = '';
+      if (fs) { const lab = fs.querySelector('legend,label,[class*="label" i],[class*="title" i],[class*="question" i]'); q = (lab && lab.textContent) || fs.textContent || ''; }
+      if (!q) q = getLabel(radios[0]) || '';
+      const want = chooseChoiceAnswer(q);
+      if (!want) continue;
+      if (pickChoice(radios, want)) { n++; await sleep(120); }
+    }
+    if (n) LOG(`Workaround: answered ${n} choice group(s) Jobright left blank (sponsorship/auth/EEO)`);
+    return n;
+  }
+
   // FULL-AUTO GUARANTOR: ensure no required field is left blank so the form is always submittable
   // and the queue never waits on a human. Runs location commit first, then a best-effort sweep.
   async function guaranteeRequiredFields() {
     await resolveLocationFields();
+    await answerChoiceGroups();
     const p = await getProfile();
     const required = $$('input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),textarea,select')
       .filter(el => isVisible(el) && isFieldRequired(el) && !hasFieldValue(el));
@@ -5905,8 +5961,15 @@
         <button id="ua-fa-toggle" type="button" role="switch" aria-checked="false" title="Toggle fully-automated mode (Alt+A)" style="flex:0 0 auto;width:46px;height:24px;border-radius:13px;border:none;background:#3a3a42;cursor:pointer;position:relative;padding:0;transition:background .2s">
           <span style="position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>
         </button>
-      </div>`;
+      </div>
+      <button id="ua-fa-gaps" type="button" title="Fill the location / visa-sponsorship / EEO fields Jobright left blank (Alt+F)" style="width:100%;margin-top:9px;padding:7px;border:1px solid #1c5743;border-radius:8px;background:transparent;color:#9ff5d3;font-size:11px;font-weight:600;cursor:pointer">🩹 Fill gaps Jobright missed</button>`;
     card.querySelector('#ua-fa-toggle').addEventListener('click', () => setAutoApply(!autoApply, true));
+    card.querySelector('#ua-fa-gaps').addEventListener('click', async (ev) => {
+      const b = ev.currentTarget; const t = b.textContent; b.textContent = 'Filling…'; b.disabled = true;
+      try { await resolveLocationFields(); await answerChoiceGroups(); await fallbackFill(); await guaranteeRequiredFields(); }
+      catch (e) { LOG('Fill-gaps error:', e?.message || e); }
+      b.textContent = 'Done ✓'; setTimeout(() => { b.textContent = t; b.disabled = false; }, 1400);
+    });
     _faCard = card;
     setTimeout(paintAutoToggle, 0);
     return card;
