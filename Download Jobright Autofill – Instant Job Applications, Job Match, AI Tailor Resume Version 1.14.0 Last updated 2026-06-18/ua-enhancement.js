@@ -1021,7 +1021,7 @@
 
   // Type a value char-by-char so JS-driven autocompletes fire their keyup handlers.
   async function typeInto(el, value) {
-    el.focus();
+    el.focus({ preventScroll: true });
     nativeSet(el, '');
     await sleep(60);
     // Set full value, then emit a trailing keystroke so frameworks open the dropdown.
@@ -1055,7 +1055,7 @@
       if (pac.length) {
         const search = value.toLowerCase();
         const best = pac.find(it => (it.textContent || '').toLowerCase().includes(search.split(',')[0].trim())) || pac[0];
-        best.scrollIntoView?.({ block: 'center' });
+        scrollIfNeeded(best);
         realClick(best);
         await sleep(400);
         // Google Places needs ArrowDown+Enter on some builds — do it as a reinforcement.
@@ -1070,7 +1070,7 @@
       // Generic typeahead / react-select / listbox.
       if (generItems.length) {
         const match = findBestDropdownMatch(generic, value.split(',')[0].trim()) || generItems[0];
-        match.scrollIntoView?.({ block: 'center' });
+        scrollIfNeeded(match);
         realClick(match);
         await sleep(300);
         el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1151,7 +1151,7 @@
         else if (el.tagName === 'TEXTAREA') val = 'N/A';
         else if (el.type === 'number') val = '0';
       }
-      if (val) { el.focus(); await sleep(60); nativeSet(el, val); el.dispatchEvent(new Event('change', { bubbles: true })); fixed++; await sleep(120); }
+      if (val) { el.focus({ preventScroll: true }); await sleep(60); nativeSet(el, val); el.dispatchEvent(new Event('change', { bubbles: true })); fixed++; await sleep(120); }
     }
     if (fixed) LOG(`Guarantor filled ${fixed} still-required field(s)`);
     return fixed;
@@ -1209,7 +1209,19 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  function clickEl(el) { if (!el) return false; el.scrollIntoView?.({ behavior: 'smooth', block: 'center' }); realClick(el); return true; }
+  // True if the element is already (roughly) within the viewport, so we don't need to
+  // scroll. Repeated scrollIntoView during autofill was making the page jump up/down.
+  function inView(el) {
+    try { const r = el.getBoundingClientRect(); return r.top >= 0 && r.bottom <= (window.innerHeight || document.documentElement.clientHeight); }
+    catch (_) { return true; }
+  }
+  // Scroll only when needed, and INSTANT + 'nearest' (no smooth animation, no forced
+  // centering) so the page doesn't bounce around while filling/clicking.
+  function scrollIfNeeded(el) { try { if (el && !inView(el)) el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {} }
+  function clickEl(el) { if (!el) return false; scrollIfNeeded(el); realClick(el); return true; }
+  // Automation should run only when Fully Automated is ON, or a bulk (CSV) run is active
+  // in this runner tab. Long loops poll this so flipping the toggle OFF halts them.
+  function autoStopped() { try { return !autoApply && !(qActive && isRunnerTab()); } catch (_) { return false; } }
 
   function waitFor(sel, ms, xpath) {
     return new Promise(res => {
@@ -1330,7 +1342,7 @@
       if (!lbl) continue;
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      inp.focus();
+      inp.focus({ preventScroll: true });
       await sleep(100); // Stabilize focus before setting value
       nativeSet(inp, val);
       inp.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1430,7 +1442,7 @@
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
       // Field was supposed to be filled but is empty — framework may have cleared it
-      inp.focus(); await sleep(100);
+      inp.focus({ preventScroll: true }); await sleep(100);
       nativeSet(inp, val);
       inp.dispatchEvent(new Event('input', { bubbles: true }));
       inp.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1593,7 +1605,7 @@
     }
     if (nextBtn) {
       LOG('Clicking next/continue: ' + (nextBtn.textContent || nextBtn.value || '').trim().slice(0, 40));
-      nextBtn.scrollIntoView?.({ block: 'center' });
+      scrollIfNeeded(nextBtn);
       await sleep(300);
       realClick(nextBtn);
       return 'next_page';
@@ -1725,6 +1737,7 @@
     const MAX_PAGES = 18;
     let prevPageHash = getPageHash();
     for (let page = 1; page <= MAX_PAGES; page++) {
+      if (autoStopped()) { LOG('Fully Automated turned off — stopping multi-page loop'); break; }
       if (checkSuccess()) { LOG('Success detected — stopping multi-page loop'); break; }
       LOG(`Multi-page: processing page ${page}`);
 
@@ -1936,7 +1949,7 @@
     if (!value) return false;
     const input = xpath(`${containerXPath}//input`);
     if (!input) return false;
-    input.focus(); nativeSet(input, value); await sleep(500);
+    input.focus({ preventScroll: true }); nativeSet(input, value); await sleep(500);
     const ul = xpath(`${containerXPath}//ul`);
     if (!ul) return false;
     await sleep(300);
@@ -2029,8 +2042,8 @@
     // Legal name
     const fnInput = $('input[data-automation-id="legalNameSection_firstName"], #name--legalName--firstName');
     const lnInput = $('input[data-automation-id="legalNameSection_lastName"], #name--legalName--lastName');
-    if (fnInput && !fnInput.value) { fnInput.focus(); nativeSet(fnInput, first); await sleep(100); }
-    if (lnInput && !lnInput.value) { lnInput.focus(); nativeSet(lnInput, last); await sleep(100); }
+    if (fnInput && !fnInput.value) { fnInput.focus({ preventScroll: true }); nativeSet(fnInput, first); await sleep(100); }
+    if (lnInput && !lnInput.value) { lnInput.focus({ preventScroll: true }); nativeSet(lnInput, last); await sleep(100); }
     // Preferred name (if checkbox or section exists)
     const prefFn = $('input[data-automation-id="preferredNameSection_firstName"], #name--preferredName--firstName');
     const prefLn = $('input[data-automation-id="preferredNameSection_lastName"], #name--preferredName--lastName');
@@ -2528,7 +2541,7 @@
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-      } else { inp.focus(); nativeSet(inp, val); }
+      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
     // Workday radio/checkbox groups — Master Knockout Question System
@@ -2600,6 +2613,7 @@
     let lastPageType = '';
 
     for (let page = 1; page <= MAX_PAGES; page++) {
+      if (autoStopped()) { LOG('Fully Automated turned off — stopping Workday flow'); break; }
       if (checkSuccess()) { LOG('Workday: success detected'); break; }
       await sleep(1500);
 
@@ -2680,7 +2694,7 @@
     };
     for (const [sel, val] of Object.entries(ghFields)) {
       const el = $(sel);
-      if (el && !el.value && val) { el.focus(); nativeSet(el, val); await sleep(80); }
+      if (el && !el.value && val) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); }
     }
 
     await fixPhoneCountryCode();
@@ -2720,7 +2734,7 @@
     for (const [name, val] of Object.entries(leverFields)) {
       if (!val) continue;
       const inp = $(`input[name="${name}"],textarea[name="${name}"]`);
-      if (inp && !inp.value?.trim()) { inp.focus(); nativeSet(inp, val); await sleep(50); }
+      if (inp && !inp.value?.trim()) { inp.focus({ preventScroll: true }); nativeSet(inp, val); await sleep(50); }
     }
 
     // Phase 2: Fill by label matching for custom Lever fields
@@ -2735,7 +2749,7 @@
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
       } else {
-        inp.focus(); nativeSet(inp, val);
+        inp.focus({ preventScroll: true }); nativeSet(inp, val);
       }
       await sleep(50);
     }
@@ -2747,7 +2761,7 @@
     });
     for (const loc of locInputs) {
       const locVal = p.city ? `${p.city}, ${p.state || p.country || ''}`.trim().replace(/,$/, '') : '';
-      if (locVal) { loc.focus(); nativeSet(loc, locVal); }
+      if (locVal) { loc.focus({ preventScroll: true }); nativeSet(loc, locVal); }
     }
 
     // Phase 4: Sponsorship / authorization questions (common on Lever)
@@ -2760,7 +2774,7 @@
         const opt = $$('option', sp).find(o => /no/i.test(o.text));
         if (opt) { sp.value = opt.value; sp.dispatchEvent(new Event('change', { bubbles: true })); }
       } else {
-        sp.focus(); nativeSet(sp, DEFAULTS.sponsorship);
+        sp.focus({ preventScroll: true }); nativeSet(sp, DEFAULTS.sponsorship);
       }
     }
 
@@ -2842,7 +2856,7 @@
         if (!val) continue;
         for (const sel of sels.split(',')) {
           const el = $(sel.trim());
-          if (el && !el.value?.trim()) { el.focus(); nativeSet(el, val); await sleep(80); break; }
+          if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
         }
       }
 
@@ -2924,7 +2938,7 @@
       if (!val) continue;
       for (const sel of sels.split(',')) {
         const el = $(sel.trim());
-        if (el && !el.value?.trim()) { el.focus(); nativeSet(el, val); await sleep(80); break; }
+        if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
       }
     }
 
@@ -2976,7 +2990,7 @@
       if (!val) continue;
       for (const sel of sels.split(',')) {
         const el = $(sel.trim());
-        if (el && !el.value?.trim()) { el.focus(); nativeSet(el, val); await sleep(80); break; }
+        if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
       }
     }
 
@@ -3010,7 +3024,7 @@
       if (!val) continue;
       for (const sel of sels.split(',')) {
         const el = $(sel.trim());
-        if (el && !el.value?.trim()) { el.focus(); nativeSet(el, val); await sleep(80); break; }
+        if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
       }
     }
 
@@ -3061,7 +3075,7 @@
         if (field.tagName === 'SELECT') {
           const opt = $$('option', field).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
           if (opt) { field.value = opt.value; field.dispatchEvent(new Event('change', { bubbles: true })); }
-        } else { field.focus(); nativeSet(field, val); }
+        } else { field.focus({ preventScroll: true }); nativeSet(field, val); }
         await sleep(80);
       }
 
@@ -3123,7 +3137,7 @@
       if (!val) continue;
       for (const sel of sels.split(',')) {
         const el = $(sel.trim());
-        if (el && !el.value?.trim()) { el.focus(); nativeSet(el, val); await sleep(80); break; }
+        if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
       }
     }
 
@@ -3154,7 +3168,7 @@
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-      } else { inp.focus(); nativeSet(inp, val); }
+      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
 
@@ -3166,7 +3180,7 @@
       const val = guessFieldValue(lbl, p, rs);
       if (!val) continue;
       const input = rs.querySelector('input');
-      if (input) { input.focus(); nativeSet(input, val); await sleep(500); }
+      if (input) { input.focus({ preventScroll: true }); nativeSet(input, val); await sleep(500); }
       const option = await waitFor('[class*="option"]', 1000);
       if (option && isVisible(option)) { realClick(option); await sleep(200); }
     }
@@ -3200,7 +3214,7 @@
       if (!val) continue;
       for (const sel of sels.split(',')) {
         const el = $(sel.trim());
-        if (el && !el.value?.trim()) { el.focus(); nativeSet(el, val); await sleep(80); break; }
+        if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
       }
     }
 
@@ -3231,7 +3245,7 @@
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-      } else { inp.focus(); nativeSet(inp, val); }
+      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
 
@@ -3281,7 +3295,7 @@
         if (el.tagName === 'SELECT') {
           const opt = $$('option', el).find(o => o.text.toLowerCase().includes(val.toLowerCase()) || /prefer not|decline/i.test(o.text));
           if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
-        } else { el.focus(); nativeSet(el, val); }
+        } else { el.focus({ preventScroll: true }); nativeSet(el, val); }
         await sleep(80);
         break;
       }
@@ -3314,7 +3328,7 @@
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-      } else { inp.focus(); nativeSet(inp, val); }
+      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
 
@@ -3348,7 +3362,7 @@
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-      } else { inp.focus(); nativeSet(inp, val); }
+      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
 
@@ -3379,7 +3393,7 @@
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-      } else { inp.focus(); nativeSet(inp, val); }
+      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
 
@@ -3456,7 +3470,7 @@
           const opt = $$('option', field).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
           if (opt) { field.value = opt.value; field.dispatchEvent(new Event('change', { bubbles: true })); }
         } else {
-          field.focus(); nativeSet(field, val);
+          field.focus({ preventScroll: true }); nativeSet(field, val);
         }
         await sleep(80);
       }
@@ -3573,7 +3587,7 @@
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
         if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); fixed++; }
       } else {
-        inp.focus(); nativeSet(inp, val); fixed++;
+        inp.focus({ preventScroll: true }); nativeSet(inp, val); fixed++;
       }
       await sleep(60);
     }
@@ -3584,7 +3598,7 @@
       const lbl = getLabel(inp);
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      inp.focus(); nativeSet(inp, val); fixed++;
+      inp.focus({ preventScroll: true }); nativeSet(inp, val); fixed++;
       await sleep(60);
     }
 
@@ -3785,7 +3799,7 @@
       const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value') && Object.getOwnPropertyDescriptor(proto, 'value').set;
       const KE = (t) => el.dispatchEvent(new KeyboardEvent(t, { bubbles: true, cancelable: false }));
-      el.focus();
+      el.focus({ preventScroll: true });
       KE('keydown'); KE('keypress');
       if (setter) setter.call(el, value); else el.value = value; // native setter → React registers the change
       KE('keyup');
@@ -5765,7 +5779,7 @@
     const pasteWrap = wrap.querySelector('#ua-sb-paste-wrap');
     wrap.querySelector('#ua-sb-paste-toggle').addEventListener('click', () => {
       pasteWrap.style.display = pasteWrap.style.display === 'none' ? 'block' : 'none';
-      if (pasteWrap.style.display === 'block') wrap.querySelector('#ua-sb-textarea').focus();
+      if (pasteWrap.style.display === 'block') wrap.querySelector('#ua-sb-textarea').focus({ preventScroll: true });
     });
     wrap.querySelector('#ua-sb-add').addEventListener('click', async () => {
       const ta = wrap.querySelector('#ua-sb-textarea');
@@ -5851,24 +5865,29 @@
     paintAutoToggle();
     try { const d = document.getElementById('ua-aa'); if (d) d.checked = autoApply; } catch (_) {}
     try { updateStat(); } catch (_) {}
+    LOG('Fully Automated toggled ' + (autoApply ? 'ON' : 'OFF'));
     if (autoApply && startNow && (detectATS() || isWorkday())) {
-      LOG('Fully Automated turned ON — starting full automation for ' + (detectATS() || 'Workday'));
+      LOG('Fully Automated ON — starting full automation for ' + (detectATS() || 'Workday'));
       if (isWorkday()) startWorkdayAccountWatch();
       dispatchATSAutomation();
     }
   }
   function paintAutoToggle() {
-    const t = document.getElementById('ua-fa-toggle');
-    if (t) {
-      t.setAttribute('aria-checked', autoApply ? 'true' : 'false');
-      t.style.background = autoApply ? '#00f0a0' : '#3a3a42';
-      const knob = t.querySelector('span');
-      if (knob) knob.style.transform = autoApply ? 'translateX(20px)' : 'translateX(0)';
+    // The card lives inside Jobright's SHADOW DOM, so document.getElementById can't see
+    // it — query within the card element reference instead.
+    const card = _faCard;
+    if (card) {
+      const t = card.querySelector('#ua-fa-toggle');
+      if (t) {
+        t.setAttribute('aria-checked', autoApply ? 'true' : 'false');
+        t.style.background = autoApply ? '#00f0a0' : '#3a3a42';
+        const knob = t.querySelector('span');
+        if (knob) knob.style.transform = autoApply ? 'translateX(20px)' : 'translateX(0)';
+      }
+      const lbl = card.querySelector('#ua-fa-state');
+      if (lbl) { lbl.textContent = autoApply ? 'ON' : 'OFF'; lbl.style.color = autoApply ? '#00f0a0' : '#9aa0a6'; }
+      card.style.borderColor = autoApply ? '#1c8a5e' : '#1c5743';
     }
-    const lbl = document.getElementById('ua-fa-state');
-    if (lbl) { lbl.textContent = autoApply ? 'ON' : 'OFF'; lbl.style.color = autoApply ? '#00f0a0' : '#9aa0a6'; }
-    const card = document.getElementById('ua-fa-card');
-    if (card) card.style.borderColor = autoApply ? '#1c8a5e' : '#1c5743';
   }
   let _faCard = null;
   function buildFullAutoCard() {
@@ -6116,7 +6135,7 @@
     const am = findApplyManually();
     if (am && isVisible(am)) {
       LOG('Apply choice modal — clicking "Apply Manually"');
-      am.scrollIntoView?.({ block: 'center' });
+      scrollIfNeeded(am);
       clickEl(am);
       await sleep(800);
       return true;
@@ -6157,7 +6176,7 @@
       // Keep apply links in the same tab so the queue can drive the form.
       if (btn.tagName === 'A' && btn.target === '_blank') btn.target = '_self';
       LOG('Clicking Apply: ' + (btn.textContent || btn.value || '').trim().slice(0, 30));
-      btn.scrollIntoView?.({ block: 'center' });
+      scrollIfNeeded(btn);
       realClick(btn);
       clicks++;
       // Condition-based wait — fires the moment a form OR the choice modal appears,
@@ -6238,9 +6257,9 @@
         $$('input[type=email],input[autocomplete="username"]').filter(isVisible)[0];
       if (!emailField) emailField = $$('input[type=text],input:not([type])').filter(isVisible)
         .find(i => /e-?mail|user.?name|user.?id|login/i.test((getLabel(i) || '') + ' ' + (i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '') + ' ' + (i.getAttribute('data-automation-id') || '')));
-      if (emailField && !emailField.value) { emailField.focus(); nativeSet(emailField, email); await sleep(250); }
+      if (emailField && !emailField.value) { emailField.focus({ preventScroll: true }); nativeSet(emailField, email); await sleep(250); }
       // Password + confirm/verify password (Workday: password + verifyPassword).
-      const fillPw = () => $$('input[type=password]').filter(isVisible).forEach(f => { if (!f.value) { f.focus(); nativeSet(f, pw); } });
+      const fillPw = () => $$('input[type=password]').filter(isVisible).forEach(f => { if (!f.value) { f.focus({ preventScroll: true }); nativeSet(f, pw); } });
       fillPw();
       await sleep(250);
       const pwFields = $$('input[type=password]').filter(isVisible);
@@ -6261,12 +6280,12 @@
         if (submit) break;
         fillPw(); tickConsents();
         const ef = $('input[data-automation-id="email"]') || emailField;
-        if (ef && !ef.value) { ef.focus(); nativeSet(ef, email); }
+        if (ef && !ef.value) { ef.focus({ preventScroll: true }); nativeSet(ef, email); }
         await sleep(450);
       }
       if (submit) {
         LOG('Account: submitting ' + (isCreate ? 'create-account' : 'sign-in') + ' (same saved credentials)');
-        submit.scrollIntoView?.({ block: 'center' });
+        scrollIfNeeded(submit);
         await sleep(200);
         clickEl(submit);
         markAccountCreated(location.hostname); // reuse these creds (sign in) on return
@@ -6294,6 +6313,7 @@
 
   // ===================== ATS DISPATCHER =====================
   async function dispatchATSAutomation() {
+    if (autoStopped()) { LOG('dispatchATSAutomation: Fully Automated is off — not running'); return; }
     // Reveal the application form first if we're on a listing/landing page.
     await openApplicationForm();
     // Create an account / sign in with saved credentials if the ATS requires it.
@@ -7607,10 +7627,11 @@ Result: Shipped my first production change in week three and my notes doc became
     return typeof window.__uaIsEligiblePage === 'function' ? window.__uaIsEligiblePage() : true;
   }
 
+  function inViewLocal(el) { try { const r = el.getBoundingClientRect(); return r.top >= 0 && r.bottom <= (window.innerHeight || document.documentElement.clientHeight); } catch (_) { return true; } }
   function realClick(el) {
     if (!el) return;
     try {
-      el.scrollIntoView({ block: 'center' });
+      if (!inViewLocal(el)) el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
       ['mouseover', 'mousedown', 'mouseup'].forEach(t => el.dispatchEvent(new MouseEvent(t, { bubbles: true })));
       el.click();
     } catch (_) {}
@@ -7620,7 +7641,7 @@ Result: Shipped my first production change in week three and my notes doc became
   // Must be called synchronously from within a user-gesture stack.
   function nativeClick(el) {
     if (!el) return;
-    try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+    try { if (!inViewLocal(el)) el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
     try { el.click(); } catch (_) {}
   }
 
@@ -9828,7 +9849,7 @@ a[href*="/checkout" i],
         const usr = buildUserPrompt(question, profile, jobCtx);
         const out = await callLLM(sys, usr);
         setReactValue(ta, out);
-        ta.focus();
+        ta.focus({ preventScroll: true });
         btn.textContent = '✓ Filled';
         setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1400);
       } catch (err) {
