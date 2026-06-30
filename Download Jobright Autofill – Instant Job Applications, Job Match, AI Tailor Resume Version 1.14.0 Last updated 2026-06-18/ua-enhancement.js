@@ -1130,7 +1130,7 @@
     if (!q) return null;
     if (/sponsor|visa|work\s?permit|immigration|h-?1b/.test(q)) return 'no';   // "require sponsorship?" → No
     if (/authori[sz]ed|eligible to work|legally\s+(work|authorized|able)|right to work|currently.*authorized|are you.*authorized/.test(q)) return 'yes';
-    if (/hispanic|latino|latina|latinx/.test(q)) return 'decline';
+    if (/hispanic|latino|latina|latinx/.test(q)) return 'no';   // "Are you Hispanic/Latino?" → No
     if (/veteran/.test(q)) return 'decline';
     if (/disab/.test(q)) return 'decline';
     if (/\bgender\b|\bsex\b|how do you identify/.test(q)) return 'decline';
@@ -1192,6 +1192,9 @@
         let val = guessFieldValue(lbl, p, el);
         const opts = $$('option', el).filter(o => o.value && o.index > 0);
         let opt = val ? opts.find(o => o.text.toLowerCase().includes(val.toLowerCase())) : null;
+        // "Are you Hispanic/Latino?" → No
+        if (!opt && /hispanic|latino|latina|latinx/i.test(lbl || ''))
+          opt = opts.find(o => /^\s*no\b/i.test(o.text));
         if (!opt && /gender|disability|veteran|race|ethnic|sex\b/i.test(lbl || ''))
           opt = opts.find(o => /prefer not|decline|not to/i.test(o.text));
         if (!opt) opt = opts[0];
