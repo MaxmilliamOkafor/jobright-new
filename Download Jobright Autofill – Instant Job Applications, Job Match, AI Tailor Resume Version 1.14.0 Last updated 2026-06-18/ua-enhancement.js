@@ -162,7 +162,7 @@
       }
     } catch (_) {}
   }
-  function _dbgToggle() { _dbgOn = !_dbgOn; _dbgRender(); }
+  function _dbgToggle() { _dbgOn = !_dbgOn; if (_dbgOn) _dbgInstall(); _dbgRender(); }
   // Export the captured log to a downloadable .txt file (with a page/URL header).
   function _dbgExport() {
     try {
@@ -185,9 +185,12 @@
   // captures it into the buffer (so there's no double-logging here).
   const LOG = (...a) => { try { console.log('[UA]', ...a); } catch (_) {} };
   // Expose manual hooks so you can drive the debugger from the console too.
-  try { window.__uaDebug = { show: () => { _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n'), export: () => _dbgExport(), clear: () => { _dbgBuf.length = 0; _dbgRender(); } }; } catch (_) {}
-  // Arm the deep instrumentation immediately so capture starts at document_start.
-  _dbgInstall();
+  try { window.__uaDebug = { show: () => { _dbgInstall(); _dbgOn = true; _dbgRender(); }, hide: () => { _dbgOn = false; _dbgRender(); }, dump: () => _dbgBuf.join('\n'), export: () => _dbgExport(), clear: () => { _dbgBuf.length = 0; _dbgRender(); } }; } catch (_) {}
+  // IMPORTANT: the deep instrumentation (wrapping console/fetch/XHR + a document-wide
+  // MutationObserver + capture-phase listeners) is EXPENSIVE and must NOT run on every
+  // website — doing so was slowing down / crashing unrelated pages. It is installed
+  // LAZILY, only when you actually open the debugger (Alt+D / __uaDebug.show()). Until
+  // then we only keep the cheap [UA] log buffer + error listeners.
 
   // ===================== GLOBAL ERROR HANDLER (prevent extension freeze on unhandled rejections) =====================
   window.addEventListener('unhandledrejection', (event) => {
@@ -304,7 +307,11 @@
     }
     try {
       const r = await _fetch.apply(window, arguments);
-      if (r.status === 402 || r.status === 403 || r.status === 429) return new Response(JSON.stringify({ success: true, code: 200, result: {} }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      // Only rewrite paywall/rate-limit statuses for JOBRIGHT's OWN endpoints — never
+      // for unrelated websites (turning their legitimate 401/403/429 into a fake 200
+      // was breaking auth/loading on sites that have nothing to do with this extension).
+      if ((r.status === 402 || r.status === 403 || r.status === 429) && /jobright|\/swan\/|\/api\/(credit|coin|token|subscription|usage|quota|entitlement)/i.test(u))
+        return new Response(JSON.stringify({ success: true, code: 200, result: {} }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       return r;
     } catch (e) { throw e; }
   };
@@ -8094,6 +8101,12 @@ Result: Shipped my first production change in week three and my notes doc became
   const TAG = '[UA-UNLOCK]';
   const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
 
+  // PERF GUARD: this module's MutationObserver runs a full shadow-root + paywall sweep.
+  // Only run on Jobright / job-application pages — running it on unrelated websites was
+  // slowing/crashing normal browsing.
+  if (!/(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i.test(location.hostname) &&
+      !(typeof window.__uaIsEligiblePage === 'function' && window.__uaIsEligiblePage())) return;
+
   // ---------- 1. Unlimited subscription payload ----------
   const FAR_FUTURE = '2099-12-31T23:59:59.000Z';
   const UNLIMITED = 999999;
@@ -8723,7 +8736,9 @@ a[href*="/checkout" i],
     applyAll();
   }
   try {
-    const mo = new MutationObserver(() => { applyAll(); });
+    // Debounced so a burst of DOM mutations triggers ONE sweep (not one per mutation).
+    let _t = null;
+    const mo = new MutationObserver(() => { if (_t) return; _t = setTimeout(() => { _t = null; applyAll(); }, 400); });
     mo.observe(document.documentElement, { childList: true, subtree: true });
   } catch (_) {}
 
@@ -8739,6 +8754,9 @@ a[href*="/checkout" i],
   'use strict';
   const TAG = '[UA-PROFILE]';
   const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
+  // PERF GUARD: only run on Jobright / job-application pages — never on unrelated sites.
+  if (!/(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i.test(location.hostname) &&
+      !(typeof window.__uaIsEligiblePage === 'function' && window.__uaIsEligiblePage())) return;
   const TAB_NAMES = ['Personal','Education','Work Experience','Skill','Equal Employment','Preference'];
   const STORAGE_KEY = 'ua_profile_snapshot';
   const BTN_ID = 'ua-profile-io';
@@ -9082,6 +9100,10 @@ a[href*="/checkout" i],
   'use strict';
   const TAG = '[UA-AUTH]';
   const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
+  // PERF GUARD: this module observes the whole document for question fields. Only run on
+  // Jobright / job-application pages — never on unrelated sites.
+  if (!/(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i.test(location.hostname) &&
+      !(typeof window.__uaIsEligiblePage === 'function' && window.__uaIsEligiblePage())) return;
   const STORAGE_KEY = 'ua_work_auth_regions';
   const PANEL_ID = 'ua-work-auth-panel';
 
@@ -9449,6 +9471,12 @@ a[href*="/checkout" i],
   const TAG = '[UA-NOPOPUP]';
   const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
 
+  // PERFORMANCE GUARD: this popup-suppressor scans the whole document (every
+  // div/span/p) on each DOM mutation + every 600ms. That is far too heavy to run on
+  // unrelated websites — it was freezing/crashing normal browsing. The Jobright
+  // out-of-credit popups only appear on jobright.ai, so run this ONLY there.
+  if (!/(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i.test(location.hostname)) return;
+
   // ---- 1. Intercept iframe → parent message that triggers the popup ----
   // Capture-phase listeners run before normal-phase ones. Because this
   // file is a content_script with run_at: document_start, it registers
@@ -9602,6 +9630,10 @@ a[href*="/checkout" i],
   'use strict';
   const TAG = '[UA-AI]';
   const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
+  // PERF GUARD: this module observes the whole document to inject AI buttons on answer
+  // fields. Only run on Jobright / job-application pages — never on unrelated sites.
+  if (!/(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i.test(location.hostname) &&
+      !(typeof window.__uaIsEligiblePage === 'function' && window.__uaIsEligiblePage())) return;
   const PANEL_ID = 'ua-ai-settings-panel';
   const BTN_CLASS = 'ua-ai-gen-btn';
 
