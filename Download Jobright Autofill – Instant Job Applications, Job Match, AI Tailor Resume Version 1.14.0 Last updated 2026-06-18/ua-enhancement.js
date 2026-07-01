@@ -550,7 +550,9 @@
       }
       return p.city || '';
     }
-    if (/state|province|region/.test(l)) return p.state || '';
+    // "state" was matching as a SUBSTRING of "statement" — a "Personal Statement" essay
+    // field was getting the literal US-state value stuffed into it. Word-bounded now.
+    if (/\bstate\b|province|region/.test(l) && !/statement/.test(l)) return p.state || '';
     if (/zip|postal/.test(l)) return p.postal_code || p.zip || '';
     if (/country/.test(l) && !/code|phone|dial/.test(l)) return p.country || DEFAULTS.country;
     if (/address|street/.test(l)) return p.address || '';
@@ -560,14 +562,27 @@
     if (/website|portfolio|personal.?url/.test(l)) return p.website_url || p.website || '';
     if (/twitter|x\.com/.test(l)) return p.twitter_url || p.twitter || '';
     if (/university|school|college|alma.?mater/.test(l)) return p.school || p.university || '';
-    if (/\bdegree\b|qualification/.test(l)) return p.degree || "Bachelor's";
+    // "qualification" alone was matching essay fields like "Additional Qualifications"
+    // and stuffing the literal string "Bachelor's" into them — dropped; a genuine
+    // degree field is virtually always labeled with the word "degree" itself.
+    if (/\bdegree\b/.test(l)) return p.degree || "Bachelor's";
     if (/major|field.?of.?study|concentration/.test(l)) return p.major || '';
     if (/gpa|grade.?point/.test(l)) return p.gpa || '';
     if (/graduation|grad.?date|grad.?year/.test(l)) return p.graduation_year || p.grad_year || '';
-    if (/title|position|role|current.?title|job.?title/.test(l) && !/company/.test(l)) return p.current_title || p.title || '';
-    if (/company|employer|org|current.?company/.test(l)) return p.current_company || p.company || '';
-    if (/\bfrom\b|start.?date|begin.?date/.test(l) && !/salary|pay/.test(l)) return p.work_start_year ? `01/${p.work_start_year}` : `01/${new Date().getFullYear() - 2}`;
-    if (/\bto\b|end.?date/.test(l) && !/salary|pay|email/.test(l)) return p.work_end_year ? `12/${p.work_end_year}` : `12/${new Date().getFullYear()}`;
+    // Excluded "position/title APPLIED FOR" (that's the JOB's title, not the
+    // candidate's) and "position type" (employment-type dropdown, e.g. Full-Time).
+    if (/title|position|role|current.?title|job.?title/.test(l) && !/company|applied.?for|applying.?for|position.?type|employment.?type/.test(l)) return p.current_title || p.title || '';
+    // Dropped bare "org" — a 3-letter fragment that could match unrelated labels
+    // (e.g. a "yourname.org" website hint) and stuff the company name into them.
+    if (/company|employer|current.?company/.test(l)) return p.current_company || p.company || '';
+    // CRITICAL: these were \bfrom\b / \bto\b — matching the word "from"/"to" ANYWHERE
+    // in a label, which fired on completely unrelated questions like "Are you willing
+    // TO relocate?" (turning a Yes/No question into a wrong end-date value) before the
+    // real relocation check further down the chain ever got a chance to run. Anchored
+    // to the label being (almost) exactly "From"/"To" — the actual real-world pattern
+    // for the bare From/To column headers on work-experience date ranges.
+    if (/^from$|start.?date|begin.?date/.test(l) && !/salary|pay/.test(l)) return p.work_start_year ? `01/${p.work_start_year}` : `01/${new Date().getFullYear() - 2}`;
+    if (/^to$|end.?date/.test(l) && !/salary|pay|email/.test(l)) return p.work_end_year ? `12/${p.work_end_year}` : `12/${new Date().getFullYear()}`;
     if (/salary|compensation|pay|desired.?pay/.test(l)) return p.expected_salary || DEFAULTS.salary;
     if (/cover.?letter|motivation|additional.?info|message.?to/.test(l)) return p.cover_letter || DEFAULTS.cover;
     if (/summary|about.?(yourself|you|me)|bio|objective/.test(l)) return p.summary || p.cover_letter || DEFAULTS.cover;
@@ -591,7 +606,15 @@
     if (/\breading\b|\bread\b|read.?proficiency/.test(l)) return p.language_proficiency || 'Advanced';
     if (/certif|license|credential/.test(l)) return p.certifications || '';
     if (/commute|travel|willing.*travel/.test(l)) return 'Yes';
-    if (/convicted|criminal|felony|background/.test(l)) return 'No';
+    // Bare "background" was matching "Educational/Professional Background" essay fields
+    // (which want real descriptive text, not Yes/No) AND "Background Check Authorization"
+    // (where the correct answer is actually "Yes", not "No") — require explicit criminal-
+    // history wording, and let a background-CHECK authorization fall through to the
+    // generic "agree/consent" => Yes rule further down instead.
+    if (/convicted|criminal|felony|(background.*(check|screening)).*(consent|authoriz|agree)/.test(l)) {
+      if (/consent|authoriz|agree/.test(l)) return 'Yes'; // authorizing the check itself
+      return 'No'; // "have you been convicted/have a criminal record" style question
+    }
     if (/drug.?test|screening/.test(l)) return 'Yes';
     if (/\bage\b|18.*years|over.*18|at.*least.*18/.test(l)) return 'Yes';
     if (/agree|acknowledge|certif|attest|confirm|consent/.test(l)) return 'Yes';
@@ -1236,7 +1259,10 @@
       let val = guessFieldValue(lbl, p, el);
       if (!val) {
         // Safe generic defaults so a required text box is never left empty.
-        if (el.type === 'tel' || /phone/i.test(lbl || '')) val = p.phone || '';
+        // Never assign the phone number to an "extension" field, regardless of its input
+        // type (some sites use type=tel for the extension box too) — see the phone/
+        // extension duplication bug fixed above in guessValue().
+        if (!/ext(ension)?\b/i.test(lbl || '') && (el.type === 'tel' || /phone/i.test(lbl || ''))) val = p.phone || '';
         else if (el.type === 'email' || /email/i.test(lbl || '')) val = p.email || '';
         else if (el.tagName === 'TEXTAREA') val = 'N/A';
         else if (el.type === 'number') val = '0';
