@@ -1161,22 +1161,43 @@
     if (!target.checked) { try { target.checked = true; } catch (_) {} target.dispatchEvent(new Event('input', { bubbles: true })); target.dispatchEvent(new Event('change', { bubbles: true })); }
     return true;
   }
+  // Questions we've already decided an answer for, keyed by normalized question TEXT
+  // (not DOM node identity). Some ATS forms re-render the radio inputs as fresh DOM
+  // nodes on every state change, which reset WeakSet/`.checked`-based "already
+  // answered" tracking to appear unanswered again — that was causing us to re-click
+  // the same question repeatedly (visible as the Q&A checklist "flickering"). Keying
+  // on the question text survives DOM node churn, and the cooldown below caps how
+  // often we'll re-attempt any single question even if it keeps getting reset.
+  const _choiceAnsweredAt = new Map();
+  const CHOICE_RETRY_MS = 6000;
+  function normalizeQ(q) { return (q || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 200); }
   async function answerChoiceGroups() {
     let n = 0;
     const groups = new Map();
     for (const r of $$('input[type=radio],[role="radio"]').filter(isVisible)) {
-      const key = r.name || r.closest('fieldset,[role=group],.form-group,.field,.question,li') || r;
+      // Group by (in order of preference): native radio name, the closest shared
+      // question/fieldset container, or the immediate parent element. We deliberately
+      // never fall back to the radio ITSELF as a key — that split a single Yes/No
+      // pair (two radios with no name/container in common) into two bogus 1-radio
+      // "groups", which could answer/read the wrong one.
+      const key = r.name || r.closest('fieldset,[role=group],.form-group,.field,.question,li') || r.parentElement || r;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
     }
     for (const radios of groups.values()) {
-      if (radios.some(r => r.checked || r.getAttribute('aria-checked') === 'true')) continue; // already answered
       const fs = radios[0].closest('fieldset,[role=group],.question,[class*="question" i],.form-group,.field,li');
       let q = '';
       if (fs) { const lab = fs.querySelector('legend,label,[class*="label" i],[class*="title" i],[class*="question" i]'); q = (lab && lab.textContent) || fs.textContent || ''; }
       if (!q) q = getLabel(radios[0]) || '';
+      const nq = normalizeQ(q);
+      if (radios.some(r => r.checked || r.getAttribute('aria-checked') === 'true')) { _choiceAnsweredAt.set(nq, Date.now()); continue; } // already answered
+      // Skip if we already attempted this exact question recently — stops an
+      // infinite re-click loop on ATS forms that keep resetting the radio state.
+      const lastTry = _choiceAnsweredAt.get(nq);
+      if (lastTry && Date.now() - lastTry < CHOICE_RETRY_MS) continue;
       const want = chooseChoiceAnswer(q);
       if (!want) continue;
+      _choiceAnsweredAt.set(nq, Date.now());
       if (pickChoice(radios, want)) { n++; await sleep(120); }
     }
     if (n) LOG(`Workaround: answered ${n} choice group(s) Jobright left blank (sponsorship/auth/EEO)`);
@@ -1655,7 +1676,8 @@
     }
     LOG(`Missing required: ${missing.length}`, missing);
 
-    // Submit selectors (try if no required missing)
+    // Submit selectors (informational `missing` log above; actual gating below is on the
+    // button's own enabled/disabled state, not on our heuristic missing-field count)
     const submitSels = [
       'button[type="submit"]', 'input[type="submit"]',
       'button[data-automation-id="submit"]', 'button[data-automation-id="submitButton"]',
@@ -1668,14 +1690,23 @@
       'button[data-qa="submit-application"]',
     ];
 
-    if (missing.length === 0) {
-      // Try submit
-      for (const sel of submitSels) {
-        const btn = $(sel);
-        if (btn && isVisible(btn)) { LOG('Clicking submit:', sel); await sleep(500); realClick(btn); _lastSubmitAt = Date.now(); return 'submitted'; }
-      }
-      // Fallback: button by text
-      const btns = $$('button,a[role="button"],input[type="submit"]').filter(isVisible);
+    // Try submit — ALWAYS attempt this (do NOT gate on our own `missing` heuristic).
+    // getMissingRequired() is a best-effort guess and can false-positive (e.g. on
+    // custom radio/checkbox widgets it doesn't fully recognize) — gating submit on it
+    // was silently blocking the click FOREVER even when Jobright itself showed the
+    // form 100% complete. Instead we trust the SITE's own validation: only click an
+    // ENABLED submit button. A disabled one means the site itself still thinks
+    // something's missing (clicking does nothing); if the site allows the click but
+    // something really was missing, the post-submit validation-error / retry logic in
+    // the queue's verification loop catches it and re-runs the guarantor sweep.
+    const submitEnabled = el => el && isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+    for (const sel of submitSels) {
+      const btn = $(sel);
+      if (submitEnabled(btn)) { LOG('Clicking submit:', sel); await sleep(500); realClick(btn); _lastSubmitAt = Date.now(); return 'submitted'; }
+    }
+    // Fallback: button by text
+    {
+      const btns = $$('button,a[role="button"],input[type="submit"]').filter(submitEnabled);
       const submitBtn = btns.find(b => {
         const t = (b.textContent || b.value || '').trim().toLowerCase();
         return /^(submit|apply|send|complete|finish)\b/i.test(t) && !/cancel|back|prev|close/i.test(t);
@@ -1743,12 +1774,20 @@
   function getMissingRequired() {
     const required = $$('input:not([type=hidden]),textarea,select').filter(el => isVisible(el) && isFieldRequired(el));
     const missing = [];
+    // Dedupe named radio groups — without this, an unanswered Yes/No question reported
+    // BOTH of its radio options as separate "missing" entries (inflating the count and,
+    // via getMissingRequired's use elsewhere, misleading the UI's missing-fields list).
+    const seenRadioGroups = new Set();
     for (const el of required) {
-      if (el.type === 'radio' && el.name) {
-        const group = $$(`input[type="radio"][name="${CSS.escape(el.name)}"]`).filter(isVisible);
-        if (group.some(r => r.checked)) continue;
-      } else if (el.type === 'checkbox' && !el.checked) {
-        // required checkbox must be checked
+      if (el.type === 'radio') {
+        if (el.name) {
+          if (seenRadioGroups.has(el.name)) continue; // this group already evaluated
+          seenRadioGroups.add(el.name);
+          const group = $$(`input[type="radio"][name="${CSS.escape(el.name)}"]`).filter(isVisible);
+          if (group.some(r => r.checked)) continue;
+        } else if (el.checked) continue;
+      } else if (el.type === 'checkbox') {
+        if (el.checked) continue;
       } else if (hasFieldValue(el)) continue;
       const lbl = getLabel(el) || el.name || el.id || 'Required field';
       if (!missing.includes(lbl)) missing.push(lbl);
