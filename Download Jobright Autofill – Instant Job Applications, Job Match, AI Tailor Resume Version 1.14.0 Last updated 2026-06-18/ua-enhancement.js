@@ -6530,7 +6530,11 @@
     // FULLY AUTOMATED: on any detected ATS (incl. Workday), start the whole apply flow
     // automatically — no clicks. dispatchATSAutomation reveals the form (Apply / Apply
     // Manually), creates/sign-ins the account, fills, and self-navigates to submit.
-    if (autoApply && (ats || isWorkday())) {
+    // IMPORTANT: skip this when a bulk queue job is running in THIS tab — processQ()
+    // below already drives dispatchATSAutomation itself (with its own verify/retry
+    // loop). Running both would fire the whole apply flow TWICE on the same page,
+    // risking a double submit / race between the two runs.
+    if (autoApply && !runnerActive && (ats || isWorkday())) {
       LOG(`Fully Automated: starting full automation for ${ats || 'Workday'}`);
       await sleep(1500);
       await dispatchATSAutomation();
