@@ -1434,7 +1434,29 @@
   async function clearQ() { queue = []; selected.clear(); await saveQ(); renderQ(); updateCtrl(); }
   async function removeSelected() { queue = queue.filter(j => !selected.has(j.id)); selected.clear(); await saveQ(); renderQ(); updateCtrl(); }
   function shortUrl(u) { try { const p = new URL(u); return p.hostname.replace('www.', '') + p.pathname.slice(0, 30); } catch { return u.slice(0, 40); } }
-  function parseCSV(t) { const u = []; for (const l of t.split(/[\r\n]+/)) { const s = l.trim(); if (!s || /^(url|link|job|title|company)/i.test(s)) continue; for (const c of s.split(/[,\t]/)) { const v = c.trim().replace(/^["']|["']$/g, ''); if (/^https?:\/\//i.test(v)) { u.push(v); break; } } if (/^https?:\/\//i.test(s) && !u.includes(s)) u.push(s); } return [...new Set(u)]; }
+  // BUG FIXED: for a multi-column row "URL,Title,Location" the inner loop correctly
+  // isolated just the URL segment — but a second, UNCONDITIONAL check right after it
+  // ALSO tested the WHOLE raw line against /^https?:\/\//, which is true for any line
+  // that simply STARTS with a URL (i.e. every multi-column row). That pushed the
+  // entire "URL,Title,Location" string as a SECOND, separate "URL" into the queue —
+  // Chrome then percent-encoded the embedded spaces on navigation, producing exactly
+  // the malformed request ("...job-slug,Job%20Title...") that Workday's server
+  // rejected with an HTTP 406. The whole-line fallback must only run when the inner
+  // loop did NOT already find a clean URL segment (i.e. a genuinely bare-URL line).
+  function parseCSV(t) {
+    const u = [];
+    for (const l of t.split(/[\r\n]+/)) {
+      const s = l.trim();
+      if (!s || /^(url|link|job|title|company)/i.test(s)) continue;
+      let foundInLine = false;
+      for (const c of s.split(/[,\t]/)) {
+        const v = c.trim().replace(/^["']|["']$/g, '');
+        if (/^https?:\/\//i.test(v)) { u.push(v); foundInLine = true; break; }
+      }
+      if (!foundInLine && /^https?:\/\//i.test(s) && !u.includes(s)) u.push(s);
+    }
+    return [...new Set(u)];
+  }
 
   // ===================== ATS =====================
   function detectATS() { for (const a of ATS) if (a.p.test(location.href)) return a.n; return null; }
