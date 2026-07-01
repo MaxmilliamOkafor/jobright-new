@@ -1471,26 +1471,33 @@
     const selects = $$('select').filter(el => isVisible(el) && !hasFieldValue(el));
     for (const sel of selects) {
       const lbl = getLabel(sel);
+      const lblLower = (lbl || '').toLowerCase();
+      const isEEO = /gender|disability|veteran|race|ethnicity|sex\b|heritage/i.test(lblLower);
       const val = guessFieldValue(lbl, p, sel);
-      if (!val) {
-        // EEO fallback
-        const lblLower = (lbl || '').toLowerCase();
-        if (/gender|disability|veteran|race|ethnicity|sex\b|heritage/i.test(lblLower)) {
-          const opts = $$('option', sel).filter(o => o.value && o.index > 0);
-          const fb = opts.find(o => /prefer not|decline|not to|do not|don.t wish/i.test(o.text));
-          if (fb) { sel.value = fb.value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++; }
-        }
-        continue;
-      }
-      const valLower = val.toLowerCase().trim();
       const opts = $$('option', sel).filter(o => o.value && o.index > 0);
-      let opt = opts.find(o => o.text.trim().toLowerCase() === valLower);
-      if (!opt) opt = opts.find(o => o.text.trim().toLowerCase().includes(valLower));
-      if (!opt) opt = opts.find(o => o.value.toLowerCase() === valLower);
-      if (!opt) opt = opts.find(o => valLower.includes(o.text.trim().toLowerCase()) && o.text.trim().length > 1);
-      if (!opt) { const words = valLower.split(/\s+/).filter(w => w.length > 2); if (words.length) opt = opts.find(o => words.some(w => o.text.trim().toLowerCase().includes(w))); }
+      let opt = null;
+      if (val) {
+        const valLower = val.toLowerCase().trim();
+        opt = opts.find(o => o.text.trim().toLowerCase() === valLower)
+          || opts.find(o => o.text.trim().toLowerCase().includes(valLower))
+          || opts.find(o => o.value.toLowerCase() === valLower)
+          || opts.find(o => valLower.includes(o.text.trim().toLowerCase()) && o.text.trim().length > 1);
+        if (!opt) { const words = valLower.split(/\s+/).filter(w => w.length > 2); if (words.length) opt = opts.find(o => words.some(w => o.text.trim().toLowerCase().includes(w))); }
+      }
+      // EEO/demographic fields: if nothing matched (this also covers the common case
+      // where guessValue already returned the generic "Prefer not to say" default and
+      // it simply doesn't match the site's own wording), prefer a genuine "decline to
+      // answer" style option over guessing a SPECIFIC demographic value.
+      if (!opt && isEEO) opt = opts.find(o => /prefer not|decline|not to|do not|don.t wish/i.test(o.text));
       if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++; }
-      else if (opts.length) { sel.value = opts[0].value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++; }
+      else if (isFieldRequired(sel) && opts.length) {
+        // Blindly picking option[0] when we have NO confident match used to run
+        // unconditionally — including on OPTIONAL dropdowns and EEO fields, where it
+        // could select a wrong SPECIFIC value (e.g. a random gender/race) instead of
+        // leaving an optional field alone. Now this last resort only fires when the
+        // field is actually REQUIRED (so the form would otherwise be unsubmittable).
+        sel.value = opts[0].value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++;
+      }
     }
 
     // Radio buttons — Master Knockout Question System
