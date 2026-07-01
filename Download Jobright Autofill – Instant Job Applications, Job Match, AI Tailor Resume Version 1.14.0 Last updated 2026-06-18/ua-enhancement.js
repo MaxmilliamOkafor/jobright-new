@@ -539,7 +539,10 @@
     if (/preferred.?name|nick.?name/.test(l)) return p.preferred_name || p.first_name || '';
     if (/full.?name|your name|^name$/.test(l) && !/company|last|first|user/.test(l)) return `${p.first_name || ''} ${p.last_name || ''}`.trim();
     if (/\bemail\b/.test(l)) return p.email || '';
-    if (/phone|mobile|cell|telephone/.test(l)) return p.phone || '';
+    // Exclude "Phone Extension" — it was matching the generic phone regex and getting
+    // the FULL phone number stuffed into it too (Workday then displayed the number
+    // twice: "087 426 1508 x087 426 1508 (Mobile)"). Extension should stay blank.
+    if (/phone|mobile|cell|telephone/.test(l) && !/ext(ension)?\b/.test(l)) return p.phone || '';
     if (/^city$|\bcity\b|current.?city/.test(l)) {
       // SmartRecruiters uses "City, Region, Country" format for city fields
       if (/smartrecruiters/i.test(location.href) && p.city) {
@@ -2343,13 +2346,20 @@
     if (eduDateEndMonth && !eduDateEndMonth.value) nativeSet(eduDateEndMonth, '05');
 
     // Strategy 3: SpeedyApply indexed education sections (education-1, education-2, etc.)
+    // Prefer PER-ENTRY data captured from Jobright's own profile (p.education[i]) so each
+    // education row gets its OWN school/field, instead of the same single school repeated.
+    const eduEntries = Array.isArray(p.education) ? p.education : [];
     const eduSections = xpathAll('//div[starts-with(@data-automation-id,"education-")]');
     if (eduSections.length) {
-      for (const sec of eduSections) {
+      for (let i = 0; i < eduSections.length; i++) {
+        const sec = eduSections[i];
+        const entry = eduEntries[i] || {};
         const secSchool = sec.querySelector('input[data-automation-id="school"]');
-        if (secSchool && !secSchool.value && school) { nativeSet(secSchool, school); await sleep(100); }
+        if (secSchool && !secSchool.value && (entry.school || school)) { nativeSet(secSchool, entry.school || school); await sleep(100); }
         const secDegree = sec.querySelector('button[data-automation-id="degree"]:not([disabled])');
-        if (secDegree) await selectFromWorkdayDropdown(secDegree, degree);
+        if (secDegree) await selectFromWorkdayDropdown(secDegree, mapDegree(entry.degree || degree));
+        const secMajor = sec.querySelector('input[data-automation-id="fieldOfStudy"], input[data-automation-id="major"]');
+        if (secMajor && !secMajor.value && (entry.field || p.major)) nativeSet(secMajor, entry.field || p.major);
       }
     }
 
@@ -2470,15 +2480,23 @@
     if (fromLabel && !fromLabel.value) nativeSet(fromLabel, `01/${startYear}`);
     if (toLabel && !toLabel.value) nativeSet(toLabel, `12/${endYear}`);
 
-    // SpeedyApply indexed workExperience sections
+    // SpeedyApply indexed workExperience sections. Prefer the PER-ENTRY data captured
+    // from Jobright's own profile (p.work_experiences[i]) when available, so each of
+    // Workday's "Work Experience 1/2/3/4" rows gets its OWN correct title/company —
+    // instead of the same flat title/company being stamped into every row (or every
+    // row staying blank when the flat fields were empty).
+    const workEntries = Array.isArray(p.work_experiences) ? p.work_experiences : [];
     const expSections = xpathAll('//div[starts-with(@data-automation-id,"workExperience-")]');
-    for (const sec of expSections) {
+    expSections.forEach((sec, i) => {
+      const entry = workEntries[i] || {};
       const secTitle = sec.querySelector('input[data-automation-id="jobTitle"]');
       const secCompany = sec.querySelector('input[data-automation-id="company"]');
       const secLoc = sec.querySelector('input[data-automation-id="location"]');
-      if (secTitle && !secTitle.value && title) nativeSet(secTitle, title);
-      if (secCompany && !secCompany.value && company) nativeSet(secCompany, company);
-      if (secLoc && !secLoc.value && loc) nativeSet(secLoc, loc);
+      const secDesc = sec.querySelector('textarea[data-automation-id="description"], [data-automation-id="formField-description"] textarea');
+      if (secTitle && !secTitle.value && (entry.title || title)) nativeSet(secTitle, entry.title || title);
+      if (secCompany && !secCompany.value && (entry.company || company)) nativeSet(secCompany, entry.company || company);
+      if (secLoc && !secLoc.value && (entry.location || loc)) nativeSet(secLoc, entry.location || loc);
+      if (secDesc && !secDesc.value?.trim() && entry.description) nativeSet(secDesc, entry.description);
       // Fill From/To dates within each indexed experience section
       const secStartYear = sec.querySelector('[data-automation-id="formField-startDate"] [data-automation-id="dateSectionYear-input"]');
       const secStartMonth = sec.querySelector('[data-automation-id="formField-startDate"] [data-automation-id="dateSectionMonth-input"]');
@@ -2488,7 +2506,7 @@
       if (secStartMonth && !secStartMonth.value) nativeSet(secStartMonth, '01');
       if (secEndYear && !secEndYear.value) nativeSet(secEndYear, endYear);
       if (secEndMonth && !secEndMonth.value) nativeSet(secEndMonth, '12');
-    }
+    });
 
     LOG('Workday: experience fields filled (enhanced)');
   }
@@ -8193,31 +8211,52 @@ Result: Shipped my first production change in week three and my notes doc became
   function patchObject(obj, depth) {
     if (!obj || typeof obj !== 'object' || depth > 8) return obj;
     if (Array.isArray(obj)) { obj.forEach(v => patchObject(v, depth + 1)); return obj; }
+    // Only rewrite fields on an object that ACTUALLY looks like a subscription/
+    // credit/plan record (i.e. it already has at least one quota-shaped key).
+    // The old code ran the per-key rewrite rules (incl. a bare "role"/"level"/
+    // "userType" PREFIX match) on EVERY nested object in the response tree,
+    // regardless of what it was — so a candidate's work-experience entry with a
+    // field like "roleDescription" got its real text silently overwritten with
+    // the literal string "ultimate" (Jobright bundles subscription info and
+    // profile/candidate data in the same API response). Gating on
+    // looksLikeAccount first means we only ever touch genuine account/plan
+    // objects, never unrelated profile data.
+    const looksLikeAccount = Object.keys(obj).some(k => QUOTA_KEY_RE.test(k));
+    if (looksLikeAccount) {
+      for (const k of Object.keys(obj)) {
+        const v = obj[k];
+        if (v && typeof v === 'object') continue; // nested objects are walked below regardless
+        if (typeof v === 'boolean' && /^(is|has)/.test(k) &&
+            /(pro|premium|paid|ultimate|plus|vip|subscrib|active|unlimited|member|turbo|student)/i.test(k)) {
+          obj[k] = true;
+        } else if (typeof v === 'boolean' &&
+            /^(subscribed|turbo|paid|premium|pro|unlimited|active)$/i.test(k)) {
+          obj[k] = true;
+        } else if (typeof v === 'boolean' && /^(is|needs?|require|show)/.test(k) &&
+            /(trial|free|locked|paywall|upgrade|expired|disabled|limit)/i.test(k)) {
+          obj[k] = false;
+        } else if (typeof v === 'number' && COUNT_KEY_RE.test(k) && !/used|consumed|spent/i.test(k)) {
+          obj[k] = UNLIMITED;
+        } else if (typeof v === 'number' && /(used|consumed|spent)/i.test(k)) {
+          obj[k] = 0;
+        } else if (typeof v === 'string') {
+          // Narrowed to specific, unambiguously subscription-shaped key names —
+          // no more bare "role"/"level"/"userType" prefix matching, which was too
+          // generic and collided with real candidate/profile field names.
+          if (/^(plan|planName|planTier|planType|tier|subscriptionType|subscriptionTier|subscriptionPlan|subscriptionLevel|membershipLevel|membershipType|accountType|userRole|accountRole)$/i.test(k)) obj[k] = 'ultimate';
+          else if (/(status)$/i.test(k) && /(subscription|membership|trial|plan)/i.test(k)) obj[k] = 'active';
+        }
+      }
+      // Spread the canonical PRO profile fields (covers exact keys like `role`,
+      // `level`-style fields, etc. WITHOUT needing a risky generic prefix match).
+      Object.assign(obj, structuredCloneSafe(PRO_PROFILE));
+    }
+    // Recurse into nested objects/arrays regardless — a subscription record may be
+    // nested inside a larger response (e.g. { profile: {...}, subscription: {...} }).
     for (const k of Object.keys(obj)) {
       const v = obj[k];
-      if (v && typeof v === 'object') { patchObject(v, depth + 1); continue; }
-      if (typeof v === 'boolean' && /^(is|has)/.test(k) &&
-          /(pro|premium|paid|ultimate|plus|vip|subscrib|active|unlimited|member|turbo|student)/i.test(k)) {
-        obj[k] = true;
-      } else if (typeof v === 'boolean' &&
-          /^(subscribed|turbo|paid|premium|pro|unlimited|active)$/i.test(k)) {
-        obj[k] = true;
-      } else if (typeof v === 'boolean' && /^(is|needs?|require|show)/.test(k) &&
-          /(trial|free|locked|paywall|upgrade|expired|disabled|limit)/i.test(k)) {
-        obj[k] = false;
-      } else if (typeof v === 'number' && COUNT_KEY_RE.test(k) && !/used|consumed|spent/i.test(k)) {
-        obj[k] = UNLIMITED;
-      } else if (typeof v === 'number' && /(used|consumed|spent)/i.test(k)) {
-        obj[k] = 0;
-      } else if (typeof v === 'string') {
-        if (/^(plan|tier|subscription|membership|level|role|userType|accountType)/i.test(k)) obj[k] = 'ultimate';
-        else if (/(status)$/i.test(k) && /(subscription|membership|trial|plan)/i.test(k)) obj[k] = 'active';
-      }
+      if (v && typeof v === 'object') patchObject(v, depth + 1);
     }
-    // Spread the canonical PRO profile fields whenever the object looks like a
-    // user/subscription/quota record.
-    const looksLikeAccount = Object.keys(obj).some(k => QUOTA_KEY_RE.test(k));
-    if (looksLikeAccount) Object.assign(obj, structuredCloneSafe(PRO_PROFILE));
     return obj;
   }
   function structuredCloneSafe(o) { try { return structuredClone(o); } catch (_) { return JSON.parse(JSON.stringify(o)); } }
@@ -10115,3 +10154,129 @@ a[href*="/checkout" i],
 })();
 
 
+
+// ===================== PASSIVE CANDIDATE-PROFILE SNAPSHOT (read-only) =====================
+// Some of our OWN fallback fill logic (workdayFillExperience's per-entry Job Title/Company
+// loop, School/Degree defaults, etc.) needs real profile data. Since Import/Export was
+// intentionally removed (Jobright autofills the profile natively, per user preference), our
+// own ua_profile storage had no way to ever get populated — meaning fields like Job Title,
+// Company, and School stayed permanently empty, so Workday's multi-entry "Work Experience 1/
+// 2/3/4" rows showed "N/A" for those columns even though location/dates got filled fine.
+//
+// This module passively (READ-ONLY — it clones the response and never alters what the page
+// receives) observes Jobright's own candidate/profile API responses as they naturally occur
+// (e.g. whenever Jobright renders "Your Autofill Information" or runs its own autofill) and
+// mirrors recognizable fields into our own ua_profile storage, so our fallback fill code has
+// real data to draw from. It only ever WRITES a field that is currently empty in ua_profile —
+// it can never overwrite anything the user has already set.
+(function () {
+  'use strict';
+  const TAG = '[UA-Snapshot]';
+  const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
+  if (!/(^|\.)jobright(?:-internal)?\.(?:ai|com)$/i.test(location.hostname)) return;
+
+  function findArraysOfObjectsWithKeys(obj, keyRe, depth, out) {
+    if (!obj || typeof obj !== 'object' || depth > 8 || out.length > 20) return;
+    if (Array.isArray(obj)) {
+      if (obj.length && obj.every(o => o && typeof o === 'object' && !Array.isArray(o)) &&
+          obj.some(o => Object.keys(o).some(k => keyRe.test(k)))) {
+        out.push(obj);
+      }
+      obj.forEach(v => findArraysOfObjectsWithKeys(v, keyRe, depth + 1, out));
+      return;
+    }
+    for (const v of Object.values(obj)) if (v && typeof v === 'object') findArraysOfObjectsWithKeys(v, keyRe, depth + 1, out);
+  }
+  function pick(o, re) {
+    for (const k of Object.keys(o)) { if (re.test(k) && typeof o[k] === 'string' && o[k].trim()) return o[k].trim(); }
+    return '';
+  }
+  function findFirstMatch(obj, keyRe, depth) {
+    if (!obj || typeof obj !== 'object' || depth > 8) return null;
+    if (!Array.isArray(obj) && Object.keys(obj).some(k => keyRe.test(k))) return obj;
+    const vals = Array.isArray(obj) ? obj : Object.values(obj);
+    for (const v of vals) { if (v && typeof v === 'object') { const r = findFirstMatch(v, keyRe, depth + 1); if (r) return r; } }
+    return null;
+  }
+
+  function captureFromJson(data) {
+    try {
+      const patch = {};
+      // Top-level candidate fields — only from an object that plausibly IS the candidate
+      // record (has an email-shaped key nearby).
+      const person = findFirstMatch(data, /^email(.?address)?$/i, 0);
+      if (person) {
+        const first = pick(person, /^(first.?name|given.?name)$/i);
+        const last = pick(person, /^(last.?name|family.?name|surname)$/i);
+        const email = pick(person, /^email(.?address)?$/i);
+        const phone = pick(person, /^(phone|mobile|cell)(.?number)?$/i);
+        const city = pick(person, /^city$/i);
+        const country = pick(person, /^country$/i);
+        if (first) patch.first_name = first;
+        if (last) patch.last_name = last;
+        if (email) patch.email = email;
+        if (phone) patch.phone = phone;
+        if (city) patch.city = city;
+        if (country) patch.country = country;
+      }
+      // Work-experience array: objects that have a company/employer-ish key.
+      const workArrs = []; findArraysOfObjectsWithKeys(data, /company|employer/i, 0, workArrs);
+      for (const arr of workArrs) {
+        const mapped = arr.map(e => ({
+          title: pick(e, /^(job.?title|title|position|role.?title)$/i),
+          company: pick(e, /^(company(.?name)?|employer(.?name)?)$/i),
+          location: pick(e, /^(location|city)$/i),
+          from: pick(e, /^(start.?date|from|start.?year)$/i),
+          to: pick(e, /^(end.?date|to|end.?year)$/i),
+          description: pick(e, /^(description|summary|role.?description|responsibilit)/i),
+          current: !!(e.current || e.isCurrent || e.is_current || e.currentlyEmployed)
+        })).filter(e => e.title || e.company);
+        if (mapped.length) {
+          patch.work_experiences = mapped;
+          patch.current_title = mapped[0].title || '';
+          patch.current_company = mapped[0].company || '';
+          break;
+        }
+      }
+      // Education array: objects that have a school/university-ish key.
+      const eduArrs = []; findArraysOfObjectsWithKeys(data, /school|university|institution/i, 0, eduArrs);
+      for (const arr of eduArrs) {
+        const mapped = arr.map(e => ({
+          school: pick(e, /^(school(.?name)?|university|institution)$/i),
+          degree: pick(e, /^degree$/i),
+          field: pick(e, /^(field(.?of.?study)?|major)$/i),
+          gpa: pick(e, /^(gpa|overall.?result)$/i)
+        })).filter(e => e.school);
+        if (mapped.length) { patch.education = mapped; patch.school = mapped[0].school || ''; break; }
+      }
+      if (!Object.keys(patch).length) return;
+      chrome.storage.local.get('ua_profile', (d) => {
+        const existing = (d && d.ua_profile) || {};
+        let changed = false;
+        for (const k of Object.keys(patch)) {
+          const cur = existing[k];
+          if (cur === undefined || cur === '' || (Array.isArray(cur) && !cur.length)) { existing[k] = patch[k]; changed = true; }
+        }
+        if (changed) { chrome.storage.local.set({ ua_profile: existing }); log('captured profile fields:', Object.keys(patch).join(', ')); }
+      });
+    } catch (e) { log('capture error:', e && e.message); }
+  }
+
+  // READ-ONLY wrapper: clones the response purely for inspection and NEVER returns a
+  // modified response — this module can never break anything the page relies on.
+  try {
+    const origFetch = window.fetch;
+    if (origFetch && !window.__uaSnapshotFetchPatched) {
+      window.__uaSnapshotFetchPatched = true;
+      window.fetch = async function (input, init) {
+        const res = await origFetch.apply(this, arguments);
+        try {
+          const ct = res.headers.get('content-type') || '';
+          if (/json/i.test(ct)) res.clone().json().then(captureFromJson).catch(() => {});
+        } catch (_) {}
+        return res;
+      };
+    }
+  } catch (_) {}
+  log('candidate-profile snapshot watcher active');
+})();
