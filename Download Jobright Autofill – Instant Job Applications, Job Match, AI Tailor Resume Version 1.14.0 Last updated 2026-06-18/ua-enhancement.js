@@ -425,7 +425,10 @@
     qActive = (await st.get(SK.QA)) || false;
     qPaused = (await st.get(SK.QP)) || false;
     autoApply = (await st.get(SK.AA)) || false;
-    qStats = (await st.get('ua_q_stats')) || qStats;
+    // Merge stored stats onto the defaults (don't replace) so a stats object saved by
+    // an older build that lacks newer keys (e.g. timedOut) can't make `qStats.timedOut++`
+    // evaluate to NaN and poison the whole stats display.
+    qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0, ...((await st.get('ua_q_stats')) || {}) };
     qStoppedAt = (await st.get('ua_q_stopped_at')) || -1;
     qSpeed = (await st.get('ua_q_speed')) || 1; // persist speed across per-job navigations
     qSpeedFactor = speedFactorFor(qSpeed);
@@ -765,16 +768,37 @@
   // Smart Yes/No determination based on question context
   function determineYesNo(questionText) {
     const q = questionText.toLowerCase();
-    // Questions that should be "No"
-    const noPatterns = [
-      /require.*sponsor/, /need.*visa/, /need.*permit/, /need.*sponsorship/,
-      /previously.*worked.*for/, /former.*employee/, /current.*employee/, /worked.*before/,
-      /applied.*before/, /criminal|convicted|felony/, /non.?compete|restrictive/,
-      /conflict.*interest/, /family.*member.*work/, /relative.*work/,
-      /ever.*work.*for/, /ever.*employ/, /accommodation.*require/,
-      /restriction/, /pending.*charges/, /terminated|fired|dismissed/
+    // EEO/Diversity — prefer "Prefer not to say/answer"
+    if (/gender|sex\b|disability|veteran|military|ethnic|race|racial|heritage|hispanic|latino/.test(q)) return 'eeo';
+
+    // STRONG "No" intents. These MUST take precedence over the generic yes-trigger
+    // words ("will you", "can you", "do you"…) below. Previously a question like
+    // "WILL YOU now or in the future require sponsorship?" returned "yes" purely
+    // because /will you/ is a yes-word — which tells the employer the candidate NEEDS
+    // sponsorship when they don't, failing the knockout. A strong-no always wins here,
+    // EXCEPT when the sentence is actually an authorization/"without sponsorship"
+    // affirmation ("Are you authorized to work WITHOUT requiring sponsorship?" → Yes).
+    const strongNo = [
+      /require.*(sponsor|visa|work.?permit)/, /need.*(sponsor|visa|work.?permit)/,
+      /(require|requiring|need|needing).*sponsorship/, /sponsorship.*(required|needed)/,
+      /previously.*worked.*for/, /former.*employee/, /current.*employee/,
+      /worked.*(here|for us|for this|for the company).*before/, /applied.*before/,
+      /criminal|convicted|felony|misdemeanor/, /non.?compete|restrictive.*covenant/,
+      /conflict.*interest/, /(family|relative).*work/, /ever.*(work|employ).*(for|with).*(us|this|company)/,
+      /pending.*charges/, /terminated|fired|dismissed|discharged/, /debarred/
     ];
-    // Questions that should be "Yes"
+    if (strongNo.some(r => r.test(q))) {
+      // Word-bounded: a bare "no" here previously matched the "no" INSIDE "now"
+      // (as in "Will you NOW or in the future require sponsorship?"), wrongly
+      // flipping a No answer back to Yes.
+      if (/authoriz|eligible|\b(?:without|not|don.?t)\b[^.]*(?:requir|need)[^.]*sponsor|legally\s+\w*\s*(?:work|authorized|able)/.test(q)) return 'yes';
+      return 'no';
+    }
+
+    // Softer "No" intents — only applied when NO yes-word is present.
+    const softNo = [/accommodation.*require/, /\brestriction/, /do you have.*(disability|felony|conviction|criminal)/];
+
+    // Questions that should be "Yes".
     const yesPatterns = [
       /authorized|eligible|right.*work|legally|lawfully/, /proficien/, /experience.*have/,
       /comfortable/, /familiar/, /willing/, /\bable\b/, /available/, /can.*start/,
@@ -790,13 +814,9 @@
       /reliable.*transport/, /work.*(night|weekend|holiday|overtime|shift|flexible)/,
       /travel.*up.*to/, /submit.*to/, /complete.*assessment/
     ];
-    // EEO/Diversity — prefer "Prefer not to say/answer"
-    const eeoPatterns = [/gender|sex\b|disability|veteran|military|ethnic|race|racial|heritage|hispanic|latino/];
-    const isEEO = eeoPatterns.some(r => r.test(q));
-    if (isEEO) return 'eeo';
-    const shouldNo = noPatterns.some(r => r.test(q));
     const shouldYes = yesPatterns.some(r => r.test(q));
-    if (shouldNo && !shouldYes) return 'no';
+    const shouldSoftNo = softNo.some(r => r.test(q));
+    if (shouldSoftNo && !shouldYes) return 'no';
     if (shouldYes) return 'yes';
     return 'yes'; // Default to yes for unknown
   }
@@ -4206,6 +4226,10 @@
           // LazyApply: start timeout timer — auto-skip if job stalls
           clearTimeout(_qTimeoutId);
           _qTimeoutId = setTimeout(async () => {
+            // Guard: if the main flow already finalized this job (done/failed/skipped)
+            // in the meantime, do nothing — otherwise the timeout would also call
+            // goNext(), double-advancing and silently SKIPPING the next queued job.
+            if (c.status !== 'applying') return;
             LOG(`Queue: job timed out after ${qTimeout / 1000}s — auto-skipping`);
             c.status = 'timeout';
             c.error = `Timed out after ${qTimeout / 1000}s`;
@@ -4296,6 +4320,10 @@
 
           // Clear timeout — job finished (confirmed or exhausted retries)
           clearTimeout(_qTimeoutId);
+
+          // Guard: if the per-job timeout already fired and finalized this job while the
+          // fill/verify loop above was still running, don't finalize + goNext() again.
+          if (c.status !== 'applying') { return; }
 
           c.completedAt = Date.now();
           c.duration = c.completedAt - (c.startedAt || c.completedAt);
