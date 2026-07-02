@@ -2031,6 +2031,7 @@
   async function multiPageLoop() {
     const MAX_PAGES = 18;
     let prevPageHash = getPageHash();
+    let samePageRetries = 0;
     for (let page = 1; page <= MAX_PAGES; page++) {
       if (autoStopped()) { LOG('Fully Automated turned off — stopping multi-page loop'); break; }
       if (checkSuccess()) { LOG('Success detected — stopping multi-page loop'); break; }
@@ -2039,15 +2040,29 @@
       // Wait for page content to change
       await sleep(2000);
 
-      // Detect if page actually changed (URL hash, DOM content, or form fields)
+      // Detect whether the page actually advanced. getPageHash is URL + visible-field
+      // count + labels, which stays IDENTICAL when a Workday-style page rejects "Save
+      // and Continue" and just shows inline validation errors. Previously that made the
+      // loop give up after a single failed attempt. Now: if the page didn't advance but
+      // there's still something FIXABLE (a validation error or a missing required
+      // field), we re-fill and retry the same page (bounded) instead of bailing —
+      // clicking Continue re-validates, and the fill pass below re-answers anything we
+      // now know how to (e.g. the disclosure "No" defaults + the React select setter).
       const newHash = getPageHash();
       if (page > 1 && newHash === prevPageHash) {
-        LOG('Page did not change — waiting longer');
-        await sleep(3000);
-        if (getPageHash() === prevPageHash) {
-          LOG('Still no change — stopping multi-page loop');
-          break;
+        await sleep(2000);
+        const stillSame = getPageHash() === prevPageHash;
+        const fixable = pageHasValidationError() || getMissingRequired().length > 0;
+        if (stillSame) {
+          samePageRetries++;
+          if (!fixable || samePageRetries > 4) {
+            LOG(`Multi-page: page not advancing (${fixable ? 'unresolved after ' + samePageRetries + ' retries' : 'nothing left to fix'}) — stopping`);
+            break;
+          }
+          LOG(`Page did not advance — re-filling & retrying same page (attempt ${samePageRetries})`);
         }
+      } else {
+        samePageRetries = 0;
       }
       prevPageHash = getPageHash();
 
