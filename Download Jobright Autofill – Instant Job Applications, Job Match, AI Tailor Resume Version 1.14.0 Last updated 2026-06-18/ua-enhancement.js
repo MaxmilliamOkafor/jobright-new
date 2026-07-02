@@ -1388,7 +1388,13 @@
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) { const d = document.getElementById(labelledBy); if (d?.textContent?.trim()) return d.textContent.trim(); }
     if (el.id) { const lbl = $(`label[for="${CSS.escape(el.id)}"]`); if (lbl) return lbl.textContent.trim(); }
-    if (el.placeholder) return el.placeholder;
+    // A GENERIC placeholder ("Enter your answer", "Type here", "Select…") tells us nothing
+    // about the field and was previously returned here — shadowing the real question label
+    // from the fieldset/container below, so guessValue couldn't match and the field got the
+    // wrong value or none. Only use a placeholder if it's specific enough to be a real hint,
+    // and only AFTER trying the structural labels (fieldset legend / container label).
+    const GENERIC_PLACEHOLDER = /^\s*(enter|type|select|choose|pick|search|please|your answer|answer here|e\.?g\.?|example|start typing|--|\.\.\.|…)\b|^\s*(select|choose)\s*(an?\s+)?(option|one|value)?\s*\.*\s*$/i;
+    const specificPlaceholder = (el.placeholder && !GENERIC_PLACEHOLDER.test(el.placeholder)) ? el.placeholder : '';
     const autoId = el.getAttribute('data-automation-id') || el.getAttribute('data-testid') || el.getAttribute('data-qa');
     if (autoId) { const readable = splitCamelCase(autoId); if (readable.length > 2 && !/^(input|field|text|form|container)$/i.test(readable)) return readable; }
     const fieldset = el.closest('fieldset');
@@ -1398,6 +1404,8 @@
       const lbl = container.querySelector('label,[class*="label"],[class*="Label"],legend,[class*="title"],[class*="prompt"],[class*="question-text"]');
       if (lbl && lbl !== el && !lbl.contains(el)) return lbl.textContent.trim();
     }
+    // Fall back to a specific (non-generic) placeholder before the last-ditch sibling/name guesses.
+    if (specificPlaceholder) return specificPlaceholder;
     const prev = el.previousElementSibling;
     if (prev && (prev.tagName === 'LABEL' || prev.tagName === 'SPAN' || prev.tagName === 'DIV') && prev.textContent?.trim().length < 100) return prev.textContent.trim();
     const parentText = el.parentElement?.childNodes?.[0];
