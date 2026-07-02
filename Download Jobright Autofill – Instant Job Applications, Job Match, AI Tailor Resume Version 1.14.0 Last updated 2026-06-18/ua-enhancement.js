@@ -425,7 +425,10 @@
     qActive = (await st.get(SK.QA)) || false;
     qPaused = (await st.get(SK.QP)) || false;
     autoApply = (await st.get(SK.AA)) || false;
-    qStats = (await st.get('ua_q_stats')) || qStats;
+    // Merge stored stats onto the defaults (don't replace) so a stats object saved by
+    // an older build that lacks newer keys (e.g. timedOut) can't make `qStats.timedOut++`
+    // evaluate to NaN and poison the whole stats display.
+    qStats = { completed: 0, failed: 0, skipped: 0, timedOut: 0, totalTime: 0, ...((await st.get('ua_q_stats')) || {}) };
     qStoppedAt = (await st.get('ua_q_stopped_at')) || -1;
     qSpeed = (await st.get('ua_q_speed')) || 1; // persist speed across per-job navigations
     qSpeedFactor = speedFactorFor(qSpeed);
@@ -4223,6 +4226,10 @@
           // LazyApply: start timeout timer — auto-skip if job stalls
           clearTimeout(_qTimeoutId);
           _qTimeoutId = setTimeout(async () => {
+            // Guard: if the main flow already finalized this job (done/failed/skipped)
+            // in the meantime, do nothing — otherwise the timeout would also call
+            // goNext(), double-advancing and silently SKIPPING the next queued job.
+            if (c.status !== 'applying') return;
             LOG(`Queue: job timed out after ${qTimeout / 1000}s — auto-skipping`);
             c.status = 'timeout';
             c.error = `Timed out after ${qTimeout / 1000}s`;
@@ -4313,6 +4320,10 @@
 
           // Clear timeout — job finished (confirmed or exhausted retries)
           clearTimeout(_qTimeoutId);
+
+          // Guard: if the per-job timeout already fired and finalized this job while the
+          // fill/verify loop above was still running, don't finalize + goNext() again.
+          if (c.status !== 'applying') { return; }
 
           c.completedAt = Date.now();
           c.duration = c.completedAt - (c.startedAt || c.completedAt);
