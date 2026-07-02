@@ -1413,6 +1413,21 @@
     return splitCamelCase(el.name || el.id) || '';
   }
 
+  // A checkbox we should NOT auto-tick: marketing/newsletter/promotional opt-ins.
+  // Our account-creation flow ticks "every checkbox" to satisfy the required
+  // "agree to terms / privacy notice" consent — but that could also silently opt the
+  // user into job-alert / marketing emails. Skip anything that reads like marketing,
+  // UNLESS it's clearly a REQUIRED legal consent (terms/privacy/agree).
+  function isMarketingCheckbox(el) {
+    try {
+      const t = ((getLabel(el) || '') + ' ' + (el.name || '') + ' ' + (el.id || '')).toLowerCase();
+      if (!/market|newsletter|promotion|promotional|job.?alert|subscribe|keep me (updated|informed)|notify me|email me about|opt.?in|receive.*(email|update|offer)|similar (jobs|roles|opportunities)/.test(t)) return false;
+      // Don't treat a genuine legal consent as marketing even if it mentions "email".
+      if (/\b(terms|privacy|consent to the|agree to the|conditions|policy|acknowledge)\b/.test(t) && (el.required || el.getAttribute('aria-required') === 'true')) return false;
+      return true;
+    } catch (_) { return false; }
+  }
+
   function isFieldRequired(el) {
     if (!el) return false;
     if (el.required || el.getAttribute('aria-required') === 'true') return true;
@@ -4111,7 +4126,7 @@
         .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
     if (emailField && emailField.value !== email) reactTypeValue(emailField, email);
     for (const f of pwFields) if (f.value !== pw) reactTypeValue(f, pw);
-    if (onCreate) $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+    if (onCreate) $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked && !isMarketingCheckbox(c)) realClick(c); });
     if (!submit) return 'working';
 
     const pwOK = pwFields.every(f => f.value === pw) && pw.length >= 8;
@@ -6567,7 +6582,7 @@
         || /create (an )?account|register|sign ?up/i.test((document.body.innerText || '').toLowerCase().slice(0, 4000));
       // Tick EVERY unchecked visible checkbox on an auth page — these are the consent /
       // "Agree to Privacy Notice" boxes that keep the Create Account button disabled.
-      const tickConsents = () => $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+      const tickConsents = () => $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked && !isMarketingCheckbox(c)) realClick(c); });
       tickConsents();
       await sleep(400);
       // Wait for the submit button to actually ENABLE (Workday disables "Create
