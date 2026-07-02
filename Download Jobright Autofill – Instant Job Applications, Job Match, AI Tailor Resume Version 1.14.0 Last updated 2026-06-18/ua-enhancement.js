@@ -619,6 +619,17 @@
       return 'No'; // "have you been convicted/have a criminal record" style question
     }
     if (/drug.?test|screening/.test(l)) return 'Yes';
+    // Conditional "disclosure" knockout questions that should default to NO (they're the
+    // ones left unanswered on Workday questionnaires — non-compete, prior applicant/
+    // employee, prior engagement/client relationship, relative-at-company, conflicts).
+    // These must be checked BEFORE the generic "agree/consent → Yes" rule below, or a
+    // question like "...that would preclude your employment? If yes, please provide..."
+    // would wrongly return Yes. Note the earlier /agree/ rule is for consent CHECKBOXES.
+    if (/non.?compet|restrictive.?covenant|non.?solicit|would (preclude|restrict|prevent).*(employ|work)/.test(l)) return 'No';
+    if (/(ever|previously).*(applied|interview|offer|employ).*(with|at|for|by)|former.*(applicant|employee)|worked.*(here|for us|for this company).*before/.test(l)) return 'No';
+    if (/engagement team|worked.*(as|with).*(client|engagement)|independent.?contractor|third.?party.?labor/.test(l)) return 'No';
+    if (/(related|relative|family).*(partner|principal|employee|associate|work)|conflict.*interest/.test(l)) return 'No';
+    if (/terminated|dismissed|discharged|suspended.*(employ|job)|debarred|pending.*charge/.test(l)) return 'No';
     if (/\bage\b|18.*years|over.*18|at.*least.*18/.test(l)) return 'Yes';
     if (/agree|acknowledge|certif|attest|confirm|consent/.test(l)) return 'Yes';
     if (/please.?specify|other.?please/.test(l)) return p.city || p.state || '';
@@ -1272,7 +1283,7 @@
         if (!opt && /gender|disability|veteran|race|ethnic|sex\b/i.test(lbl || ''))
           opt = opts.find(o => /prefer not|decline|not to/i.test(o.text));
         if (!opt) opt = opts[0];
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); fixed++; }
+        if (opt) { setSelectValue(el, opt.value); fixed++; }
         continue;
       }
       if (isLocationField(el)) { continue; } // already handled by resolveLocationFields
@@ -1333,6 +1344,25 @@
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
     }
+    return true;
+  }
+
+  // Set a <select>'s value so REACT registers it. Assigning `sel.value = ...` directly
+  // is bypassed by React's controlled-input value tracker (exactly like the text-input
+  // bug we fixed earlier) — so on the next render React reverts the select and the field
+  // stays "required / must have a value" even though the option visibly shows selected.
+  // Calling the PROTOTYPE value setter + dispatching input & change is what makes it stick.
+  function setSelectValue(sel, value) {
+    if (!sel) return false;
+    try {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      if (setter) setter.call(sel, value); else sel.value = value;
+    } catch (_) { try { sel.value = value; } catch (__) {} }
+    // Some frameworks track by selectedIndex — keep it consistent with the value we set.
+    try { if (sel.value !== value) { for (let i = 0; i < sel.options.length; i++) { if (sel.options[i].value === value) { sel.selectedIndex = i; break; } } } } catch (_) {}
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    sel.dispatchEvent(new Event('blur', { bubbles: true }));
     return true;
   }
 
@@ -1554,14 +1584,14 @@
       // it simply doesn't match the site's own wording), prefer a genuine "decline to
       // answer" style option over guessing a SPECIFIC demographic value.
       if (!opt && isEEO) opt = opts.find(o => /prefer not|decline|not to|do not|don.t wish/i.test(o.text));
-      if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++; }
+      if (opt) { setSelectValue(sel, opt.value); filled++; }
       else if (isFieldRequired(sel) && opts.length) {
         // Blindly picking option[0] when we have NO confident match used to run
         // unconditionally — including on OPTIONAL dropdowns and EEO fields, where it
         // could select a wrong SPECIFIC value (e.g. a random gender/race) instead of
         // leaving an optional field alone. Now this last resort only fires when the
         // field is actually REQUIRED (so the form would otherwise be unsubmittable).
-        sel.value = opts[0].value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++;
+        setSelectValue(sel, opts[0].value); filled++;
       }
     }
 
@@ -1644,7 +1674,7 @@
       const val = guessFieldValue(lbl, p, sel);
       if (!val) continue;
       const opt = $$('option', sel).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-      if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); refilled++; }
+      if (opt) { setSelectValue(sel, opt.value); refilled++; }
     }
     if (refilled > 0) LOG(`Verification pass: re-filled ${refilled} fields that were cleared`);
 
@@ -2133,8 +2163,7 @@
         /ireland|\+353|353|IE\b/i.test(o.text) || o.value === 'IE' || o.value === '+353' || o.value === '353'
       );
       if (ieOpt) {
-        sel.value = ieOpt.value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        setSelectValue(sel, ieOpt.value);
         LOG('Phone country code set to Ireland via select');
       }
     }
@@ -2172,7 +2201,7 @@
     // Handle <select> elements directly
     if (btn.tagName === 'SELECT') {
       const opt = $$('option', btn).find(o => o.text.toLowerCase().includes(value.toLowerCase()));
-      if (opt) { btn.value = opt.value; btn.dispatchEvent(new Event('change', { bubbles: true })); return true; }
+      if (opt) { setSelectValue(btn, opt.value); return true; }
       return false;
     }
     realClick(btn);
@@ -2473,7 +2502,7 @@
 
     // Graduated status
     const gradSelect = xpath("//select[contains(@id,'CandProfileFields.IsGraduated')]") || $('select[data-automation-id="isGraduated"]');
-    if (gradSelect) { const opt = $$('option', gradSelect).find(o => /yes|complete|graduated/i.test(o.text)); if (opt) { gradSelect.value = opt.value; gradSelect.dispatchEvent(new Event('change', { bubbles: true })); } }
+    if (gradSelect) { const opt = $$('option', gradSelect).find(o => /yes|complete|graduated/i.test(o.text)); if (opt) { setSelectValue(gradSelect, opt.value); } }
 
     LOG('Workday: education fields filled (enhanced)');
   }
@@ -2820,7 +2849,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3027,7 +3056,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else {
         inp.focus({ preventScroll: true }); nativeSet(inp, val);
       }
@@ -3052,7 +3081,7 @@
     for (const sp of sponsorInputs) {
       if (sp.tagName === 'SELECT') {
         const opt = $$('option', sp).find(o => /no/i.test(o.text));
-        if (opt) { sp.value = opt.value; sp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(sp, opt.value); }
       } else {
         sp.focus({ preventScroll: true }); nativeSet(sp, DEFAULTS.sponsorship);
       }
@@ -3226,12 +3255,12 @@
     const countrySelect = $('select[id*="Country"],select[name*="country"]');
     if (countrySelect && !hasFieldValue(countrySelect)) {
       const opt = $$('option', countrySelect).find(o => new RegExp(p.country || DEFAULTS.country, 'i').test(o.text));
-      if (opt) { countrySelect.value = opt.value; countrySelect.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (opt) { setSelectValue(countrySelect, opt.value); }
     }
     const stateSelect = $('select[id*="State"],select[id*="Province"],select[name*="state"]');
     if (stateSelect && !hasFieldValue(stateSelect) && p.state) {
       const opt = $$('option', stateSelect).find(o => o.text.toLowerCase().includes(p.state.toLowerCase()));
-      if (opt) { stateSelect.value = opt.value; stateSelect.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (opt) { setSelectValue(stateSelect, opt.value); }
     }
 
     // Phase 3: Taleo multi-page navigation
@@ -3354,7 +3383,7 @@
         if (!val) continue;
         if (field.tagName === 'SELECT') {
           const opt = $$('option', field).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-          if (opt) { field.value = opt.value; field.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (opt) { setSelectValue(field, opt.value); }
         } else { field.focus({ preventScroll: true }); nativeSet(field, val); }
         await sleep(80);
       }
@@ -3447,7 +3476,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3524,7 +3553,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3574,7 +3603,7 @@
         if (!el || hasFieldValue(el)) continue;
         if (el.tagName === 'SELECT') {
           const opt = $$('option', el).find(o => o.text.toLowerCase().includes(val.toLowerCase()) || /prefer not|decline/i.test(o.text));
-          if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (opt) { setSelectValue(el, opt.value); }
         } else { el.focus({ preventScroll: true }); nativeSet(el, val); }
         await sleep(80);
         break;
@@ -3607,7 +3636,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3641,7 +3670,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3672,7 +3701,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3748,7 +3777,7 @@
         if (!val) continue;
         if (field.tagName === 'SELECT') {
           const opt = $$('option', field).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-          if (opt) { field.value = opt.value; field.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (opt) { setSelectValue(field, opt.value); }
         } else {
           field.focus({ preventScroll: true }); nativeSet(field, val);
         }
@@ -3865,7 +3894,7 @@
 
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); fixed++; }
+        if (opt) { setSelectValue(inp, opt.value); fixed++; }
       } else {
         inp.focus({ preventScroll: true }); nativeSet(inp, val); fixed++;
       }
