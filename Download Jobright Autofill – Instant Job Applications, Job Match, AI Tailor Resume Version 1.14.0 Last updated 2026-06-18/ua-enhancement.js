@@ -3901,7 +3901,27 @@
       const container = errEl.closest('.form-group,.field,.question,[class*="Field"],[class*="Question"],li,.form-item,.ant-form-item,.MuiFormControl-root,fieldset,div');
       if (!container) continue;
       const inp = container.querySelector('input:not([type=hidden]):not([type=file]),textarea,select');
-      if (!inp || hasFieldValue(inp)) continue;
+      if (!inp) continue;
+
+      // RADIO GROUP in the error container — previously this fell through to nativeSet()
+      // on a radio (a no-op), so radio-based questions with a validation error (common on
+      // Workday questionnaires) never got fixed. Route them through the knockout radio
+      // answerer (Yes/No/EEO/experience-range aware).
+      if (inp.type === 'radio') {
+        const radios = [...container.querySelectorAll('input[type=radio]')].filter(isVisible);
+        if (radios.length && !radios.some(r => r.checked)) {
+          if (answerKnockoutRadioGroup(radios, container, p)) fixed++;
+        }
+        await sleep(60);
+        continue;
+      }
+      // Required consent CHECKBOX with an error — tick it (unless it's a marketing opt-in).
+      if (inp.type === 'checkbox') {
+        if (!inp.checked && !isMarketingCheckbox(inp)) { realClick(inp); fixed++; }
+        await sleep(60);
+        continue;
+      }
+      if (hasFieldValue(inp)) continue;
 
       const lbl = getLabel(inp);
       const val = guessFieldValue(lbl, p, inp);
