@@ -485,13 +485,14 @@
     await st.set(SK.ANS, _answerBank);
   }
 
-  function getLearnedAnswer(label, el) {
+  function getLearnedAnswer(label, el, exactOnly) {
     const candidates = [label, el?.name, el?.id, el?.placeholder, el?.getAttribute?.('aria-label')];
     for (const c of candidates) {
       if (!c) continue;
       const k = normalizeKey(c);
       if (k && _answerBank[k]) return _answerBank[k];
     }
+    if (exactOnly) return '';
     // Safe word-overlap match (prevents cross-field contamination)
     const queryKey = normalizeKey(label || '');
     if (!queryKey || queryKey.length < 3) return '';
@@ -663,10 +664,12 @@
   }
 
   function guessFieldValue(label, p, el) {
-    // Try saved responses keyword match first, then guessValue, then learned answers
+    // Priority: saved responses → an EXACT learned answer (the user answered this very
+    // question before — their answer must beat any generic guess) → built-in guesses →
+    // fuzzy learned match as the last resort (kept last to avoid contamination).
     const questionText = el ? getFullQuestionText(el) : label;
     const fromSaved = findSavedResponseMatch(questionText);
-    return fromSaved || guessValue(label, p) || getLearnedAnswer(label, el) || '';
+    return fromSaved || getLearnedAnswer(label, el, true) || guessValue(label, p) || getLearnedAnswer(label, el) || '';
   }
 
   // ===================== SAVED RESPONSES SYSTEM (SpeedyApply-style) =====================
@@ -716,18 +719,62 @@
     saveSavedResponses();
   }
 
+  // The QUESTION an input answers. For a radio/checkbox getLabel(el) returns the OPTION's
+  // own label ("Yes"/"No") — useless to learn from — so climb to the group's question
+  // (fieldset legend / radiogroup label / container text minus the option labels).
+  function getQuestionForInput(el) {
+    try {
+      if (el && (el.type === 'radio' || el.type === 'checkbox')) {
+        const fs = el.closest('fieldset');
+        const legend = fs && fs.querySelector('legend');
+        if (legend?.textContent?.trim()) return legend.textContent.trim();
+        const grp = el.closest('[role="radiogroup"],[role="group"]');
+        if (grp) {
+          if (grp.getAttribute('aria-label')) return grp.getAttribute('aria-label');
+          const lb = grp.getAttribute('aria-labelledby');
+          if (lb) { const d = document.getElementById(lb); if (d?.textContent?.trim()) return d.textContent.trim(); }
+        }
+        const cont = el.closest('.question,[class*="question" i],.form-group,.field,[class*="Field"],li');
+        if (cont) {
+          let t = (cont.textContent || '').replace(/\s+/g, ' ').trim();
+          // Strip each option's own label so only the question text remains.
+          for (const r of cont.querySelectorAll('input[type=radio],input[type=checkbox]')) {
+            const ol = getLabel(r); if (ol) t = t.split(ol).join(' ');
+          }
+          t = t.replace(/\s+/g, ' ').trim();
+          if (t.length > 5) return t.slice(0, 200);
+        }
+      }
+      return getLabel(el);
+    } catch (_) { return getLabel(el); }
+  }
+
+  // Persist one manually-given Q&A into BOTH stores the fill paths read from:
+  // the answer bank (exact/fuzzy label match) and saved responses (keyword match,
+  // which is what answerKnockoutRadioGroup / choice groups consult).
+  function learnManualAnswer(question, answer) {
+    question = (question || '').replace(/\s+/g, ' ').trim();
+    answer = (answer || '').trim();
+    if (!question || question.length < 3 || !answer || answer.length > 300) return;
+    if (/ssn|social.?security|password|credit.?card|cvv|routing|iban|passport.?number/i.test(question)) return;
+    learnAnswer(question, answer);
+    const keywords = question.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2).slice(0, 12);
+    if (keywords.length >= 2) addSavedResponse(keywords, answer);
+    LOG(`Learned: "${question.slice(0, 70)}" → "${answer.slice(0, 40)}"`);
+  }
+
   function learnFromFilledFields() {
     $$('input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),textarea,select')
       .filter(el => isVisible(el) && hasFieldValue(el))
       .forEach(el => {
+        // Radio/checkbox: question is the GROUP's, answer is the checked option's label.
+        if (el.type === 'radio' || el.type === 'checkbox') {
+          if (el.checked) learnManualAnswer(getQuestionForInput(el), (getLabel(el) || el.value || '').trim());
+          return;
+        }
         const lbl = getLabel(el);
         const val = el.tagName === 'SELECT' ? (el.options[el.selectedIndex]?.text || el.value) : el.value;
-        if (lbl && val && val.trim()) {
-          learnAnswer(lbl, val.trim());
-          // Also learn as saved response with keywords
-          const keywords = lbl.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2);
-          if (keywords.length >= 2) addSavedResponse(keywords, val.trim());
-        }
+        if (lbl && val && val.trim()) learnManualAnswer(lbl, val.trim());
       });
   }
 
@@ -855,8 +902,9 @@
   function answerKnockoutRadioGroup(radios, parent, p) {
     const questionText = (parent?.textContent || '').toLowerCase().replace(/\s+/g, ' ');
 
-    // 1. Check saved responses first
-    const savedAnswer = findSavedResponseMatch(questionText);
+    // 1. Check saved responses first, then answers learned from the user's own manual
+    // corrections — a previously-given human answer always beats the heuristics below.
+    const savedAnswer = findSavedResponseMatch(questionText) || getLearnedAnswer(questionText);
     if (savedAnswer) {
       const match = radios.find(r => {
         const lbl = $(`label[for="${CSS.escape(r.id)}"]`, parent);
@@ -891,7 +939,10 @@
       if (decision === 'eeo') {
         // Try profile value first for EEO questions
         let eeoVal = '';
-        if (/gender|sex\b/i.test(questionText)) eeoVal = p.gender || '';
+        // "Are you Hispanic/Latino?" is a Yes/No EEO question with no ethnicity words —
+        // without this it fell through to the generic yes-default below and answered YES.
+        if (/hispanic|latino|latina|latinx/i.test(questionText)) eeoVal = p.hispanic || 'No';
+        else if (/gender|sex\b/i.test(questionText)) eeoVal = p.gender || '';
         else if (/ethnic|race|racial|heritage/i.test(questionText)) eeoVal = p.ethnicity || p.race || '';
         else if (/veteran|military/i.test(questionText)) eeoVal = p.veteran || '';
         else if (/disabilit/i.test(questionText)) eeoVal = p.disability || '';
@@ -1201,6 +1252,12 @@
     if (/\brace\b|ethnic/.test(q)) return 'decline';
     if (/at least 18|over 18|18 years|age of 18|are you.*\b18\b/.test(q)) return 'yes';
     if (/agree|consent|terms|certif|acknowledge|read and understood/.test(q)) return 'yes';
+    // Knockouts where anything but Yes ends the application: location/relocation
+    // commitment, in-office/hybrid attendance, commute, start availability.
+    if (/live in.*relocat|plan to relocate|willing to relocate|relocate to/.test(q)) return 'yes';
+    if (/in.?office|on.?site|onsite|hybrid|days per week|commute|report to.*office|work from the office/.test(q)) return 'yes';
+    if (/able to start|available to start|start (date|immediately|within)/.test(q)) return 'yes';
+    if (/background check|drug (test|screen)|reference check|pre.?employment screen/.test(q)) return 'yes';
     return null;
   }
   function choiceLabel(r) {
@@ -1252,6 +1309,13 @@
       // infinite re-click loop on ATS forms that keep resetting the radio state.
       const lastTry = _choiceAnsweredAt.get(nq);
       if (lastTry && Date.now() - lastTry < CHOICE_RETRY_MS) continue;
+      // An answer the user gave manually before (learned Q&A) wins over the defaults.
+      const learned = findSavedResponseMatch(q) || getLearnedAnswer(q);
+      if (learned) {
+        const lnorm = learned.toLowerCase().trim();
+        const lm = radios.find(r => { const cl = choiceLabel(r); return cl && (cl === lnorm || cl.includes(lnorm) || (lnorm.includes(cl) && cl.length > 1)); });
+        if (lm) { _choiceAnsweredAt.set(nq, Date.now()); realClick(lm); n++; await sleep(120); continue; }
+      }
       const want = chooseChoiceAnswer(q);
       if (!want) continue;
       _choiceAnsweredAt.set(nq, Date.now());
@@ -1272,6 +1336,18 @@
     let fixed = 0;
     for (const el of required) {
       const lbl = getLabel(el);
+      // A REQUIRED checkbox (privacy/processing consent, acknowledgements) must be ticked
+      // or the form can't submit — the text-default path below was a no-op on checkboxes.
+      // Marketing opt-ins are still skipped. Radios are handled by answerChoiceGroups.
+      if (el.type === 'checkbox') {
+        if (!isMarketingCheckbox(el)) {
+          realClick(el);
+          if (!el.checked) { try { el.checked = true; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {} }
+          if (el.checked) fixed++;
+        }
+        continue;
+      }
+      if (el.type === 'radio') continue;
       if (el.tagName === 'SELECT') {
         // Pick the first real option as a last resort (skips placeholder).
         let val = guessFieldValue(lbl, p, el);
@@ -6885,18 +6961,51 @@
       const roleGuess = ((document.querySelector('h1, [class*="job-title"], [class*="jobTitle"]')?.textContent) || '').trim().slice(0, 80);
       [1500, 4000, 8000].forEach(ms => setTimeout(() => stashInsidersFromJobright(roleGuess), ms));
     }
-    // Auto-learn: capture user-filled fields for future autofills
-    document.addEventListener('focusout', (e) => {
-      const el = e.target;
-      if (!el || !el.tagName) return;
-      const tag = el.tagName;
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return;
-      if (el.type === 'hidden' || el.type === 'file' || el.type === 'submit' || el.type === 'button' || el.type === 'password') return;
-      if (!hasFieldValue(el)) return;
-      const lbl = getLabel(el);
-      if (!lbl || /ssn|social.?security|password|credit.?card|cvv|routing|iban/i.test(lbl)) return;
-      const val = tag === 'SELECT' ? (el.options[el.selectedIndex]?.text || el.value) : el.value;
-      if (val && val.trim() && val.trim().length > 1) learnAnswer(lbl, val.trim());
+    // Auto-learn (MANUAL answers only): whenever YOU answer a question the autofill left
+    // blank, remember question→answer and auto-apply it the next time it appears.
+    // e.isTrusted filters out our own synthetic fills so we never cement our own guesses;
+    // composedPath() reaches inside open shadow DOM (Jobright sidebar, embedded widgets).
+    const _learnFrom = (e) => {
+      try {
+        if (!e.isTrusted) return;
+        const el = (e.composedPath ? e.composedPath()[0] : e.target);
+        if (!el || !el.tagName) return;
+        const tag = el.tagName;
+        if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return;
+        if (/^(hidden|file|submit|button|password)$/.test(el.type || '')) return;
+        if (el.type === 'radio' || el.type === 'checkbox') {
+          // Question = the GROUP's question, answer = the option label you picked.
+          if (e.type === 'change' && el.checked) learnManualAnswer(getQuestionForInput(el), (getLabel(el) || el.value || '').trim());
+          return;
+        }
+        if (!hasFieldValue(el)) return;
+        const val = tag === 'SELECT' ? (el.options[el.selectedIndex]?.text || el.value) : el.value;
+        if (val && val.trim().length > 1) learnManualAnswer(getLabel(el), val.trim());
+      } catch (_) {}
+    };
+    window.addEventListener('change', _learnFrom, true);
+    window.addEventListener('focusout', _learnFrom, true);
+    // Custom dropdowns (react-select / Workday / Greenhouse comboboxes): remember which
+    // question's dropdown you opened, then learn the option you click as its answer.
+    let _lastComboQ = '', _lastComboAt = 0;
+    window.addEventListener('click', (e) => {
+      try {
+        if (!e.isTrusted) return;
+        const t = (e.composedPath ? e.composedPath()[0] : e.target);
+        if (!t || !t.closest) return;
+        const opt = t.closest('[role="option"],.select__option,li[data-value]');
+        if (opt) {
+          const ans = (opt.textContent || '').replace(/\s+/g, ' ').trim();
+          if (ans && ans.length <= 120 && _lastComboQ && Date.now() - _lastComboAt < 20000) learnManualAnswer(_lastComboQ, ans);
+          return;
+        }
+        const combo = t.closest('[role="combobox"],[aria-haspopup="listbox"],input[aria-autocomplete],[class*="select__control"]');
+        if (combo) {
+          const inp = /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(combo.tagName) ? combo : (combo.querySelector('input,button') || combo);
+          const q = getLabel(inp) || getFullQuestionText(inp);
+          if (q) { _lastComboQ = q; _lastComboAt = Date.now(); }
+        }
+      } catch (_) {}
     }, true);
     window.addEventListener('beforeunload', () => { try { learnFromFilledFields(); } catch (_) {} });
   }
