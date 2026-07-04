@@ -10622,24 +10622,83 @@ a[href*="/checkout" i],
   // ---------- driver ----------
   let _lastSendAt = 0;
   let _busy = false;
+  // LazyApply-style: on a LinkedIn JOB page, LinkedIn's "Meet the hiring team" card
+  // explicitly names the recruiter/job-poster and gives a direct Message button. That's
+  // a far more reliable target than guessing from an arbitrary profile — so prefer it.
+  function jobPageCompany() {
+    const el = document.querySelector('.job-details-jobs-unified-top-card__company-name, .jobs-unified-top-card__company-name, [class*="company-name"] a, .topcard__org-name-link');
+    return el ? (el.textContent || '').trim() : '';
+  }
+  function hiringTeamCard() {
+    // The card lives in the right rail / details; find a container that mentions the
+    // hiring team and contains a profile link + a Message affordance.
+    const cards = [...document.querySelectorAll('.hirer-card__container, [class*="hirer-card"], .job-details-people-who-can-help__section, section')];
+    for (const card of cards) {
+      const t = (card.textContent || '').toLowerCase();
+      if (!/hiring team|job poster|meet the|who can help|recruiter/.test(t)) continue;
+      const profile = card.querySelector('a[href*="/in/"]');
+      if (profile) return { card, profile };
+    }
+    // Fallback: a standalone job-poster name link.
+    const poster = document.querySelector('.jobs-poster__name a[href*="/in/"], a.jobs-poster__name');
+    if (poster) return { card: poster.closest('section, div') || poster, profile: poster };
+    return null;
+  }
+  async function messageHiringTeam(match, c) {
+    const ht = hiringTeamCard();
+    if (!ht) return false;
+    const pkey = (ht.profile.getAttribute('href') || '').match(/\/in\/([^/?#]+)/i)?.[1]?.toLowerCase() || '';
+    if (!pkey || await alreadyMessaged(pkey)) return false;
+    const first = ((ht.profile.textContent || '').trim().split(/\s+/)[0] || 'there').replace(/[^a-zA-Z''-]/g, '') || 'there';
+    // Prefer a Message button inside the card; else fall back to opening the profile.
+    const msgBtn = [...ht.card.querySelectorAll('button, a')].find(b => /message/i.test((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')));
+    const text = c.template.replace(/\{first\}/gi, first).replace(/\{role\}/gi, match.role || 'the role').replace(/\{company\}/gi, match.company);
+    _lastSendAt = Date.now();
+    if (msgBtn) {
+      msgBtn.click();
+      let box = null;
+      for (let i = 0; i < 20; i++) { await sleep(300); box = document.querySelector('.msg-form__contenteditable[contenteditable="true"]'); if (box) break; }
+      if (!box) { log('Hiring-team Message clicked but composer did not open'); return false; }
+      await sleep(700);
+      setContentEditable(box, text);
+      await sleep(1000 + Math.random() * 800);
+      const send = findSendButton(box);
+      if (!send) { log('Hiring-team composer: send button not ready'); return false; }
+      send.click();
+      log('Follow-up sent to hiring-team contact for ' + match.company);
+      await markSent(pkey, match.company, match.role); await removeFromQueue(match.company);
+      _lastSendAt = Date.now() + Math.random() * RAND_GAP_MS;
+      return true;
+    }
+    return false;
+  }
+
   async function tick() {
     if (_busy) return; _busy = true;
     try {
       const c = await cfg();
       renderPanel(c);                     // keep the on-page panel current
       if (!c.enabled) return;
-      if (!/\/in\//i.test(location.pathname)) return;   // only act on a profile page
       if (Date.now() - _lastSendAt < MIN_GAP_MS) return; // global throttle
       if (await sentToday() >= c.cap) return;            // daily cap
-      const pkey = profileKey();
-      if (!pkey || await alreadyMessaged(pkey)) return;  // dedupe
-
       const q = await queue();
       if (!q.length) return;
+
+      // Path A (preferred): LinkedIn JOB page — message the named hiring-team recruiter.
+      if (/\/jobs\/(view|collections|search)/i.test(location.pathname)) {
+        const co = norm(jobPageCompany());
+        const jm = co && q.find(f => f.company && (co.includes(norm(f.company)) || norm(f.company).includes(co)));
+        if (jm) { if (await messageHiringTeam(jm, c)) { renderPanel(await cfg()); } }
+        return;
+      }
+
+      // Path B (fallback): a profile page you opened for someone at an applied-to company.
+      if (!/\/in\//i.test(location.pathname)) return;
+      const pkey = profileKey();
+      if (!pkey || await alreadyMessaged(pkey)) return;  // dedupe
       const ptext = profileCompanyText();
       const match = q.find(f => f.company && ptext.includes(norm(f.company)));
       if (!match) return;                 // this profile isn't at an applied-to company
-      // Optional guardrail: only auto-message obvious recruiter/HR/hiring people.
       if (!looksLikeRecruiter()) { log('Profile matches ' + match.company + ' but does not look like a recruiter — skipping auto-send'); return; }
 
       const text = c.template
