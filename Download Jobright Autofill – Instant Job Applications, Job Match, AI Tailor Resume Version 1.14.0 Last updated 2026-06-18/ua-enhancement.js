@@ -6739,9 +6739,15 @@
     // where we click "Apply" to reveal the form). Skipping was the #1 reason the
     // CSV queue "did nothing" on many sites.
     const runnerActive = qActive && isRunnerTab();
-    // Never bail on an ATS page when Fully Automated is ON — we must mount + drive there.
-    const fullAutoOnATS = autoApply && (detectATS() || isWorkday());
-    if (!runnerActive && !fullAutoOnATS && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
+    // Whether this page is genuinely a job application (known ATS host, or a page that
+    // actually READS like a job application — not just a "/apply" URL or a PDF upload).
+    const eligible = typeof window.__uaIsEligiblePage !== 'function' || window.__uaIsEligiblePage();
+    // Never bail when a queue is running here, or when Fully Automated is ON AND the page
+    // is a real job application. We deliberately require `eligible` here now — a bare
+    // detectATS() 'Career' match on a /apply URL is NOT enough — so Fully Automated can't
+    // mount+drive on non-job forms (loan/membership/contact pages) and hallucinate answers.
+    const fullAutoOnATS = autoApply && eligible && (detectATS() || isWorkday());
+    if (!runnerActive && !fullAutoOnATS && !eligible) return;
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
@@ -6761,7 +6767,10 @@
     // below already drives dispatchATSAutomation itself (with its own verify/retry
     // loop). Running both would fire the whole apply flow TWICE on the same page,
     // risking a double submit / race between the two runs.
-    if (autoApply && !runnerActive && (ats || isWorkday())) {
+    // Gate the auto-run on `eligible` too: on a real ATS host / genuine job-application
+    // page only. Without this, detectATS()'s broad generic "Career" pattern (any URL with
+    // /apply, /jobs, /careers) would let Fully Automated fill non-job forms.
+    if (autoApply && !runnerActive && eligible && (ats || isWorkday())) {
       LOG(`Fully Automated: starting full automation for ${ats || 'Workday'}`);
       await sleep(1500);
       await dispatchATSAutomation();
@@ -6931,25 +6940,47 @@
   // (file input present). Pure browsing paths stay inert.
   const MIXED_USE_HOSTS = /(^|\.)(linkedin\.com|indeed\.com|glassdoor\.com|monster\.com|ziprecruiter\.com|dice\.com|simplyhired\.com|wellfound\.com|angel\.co|builtin\.com|otta\.com|welcometothejungle\.com)$/i;
   let cached = null;
+  // A resume/CV upload input — but ONLY when it's specifically a resume/CV field, not any
+  // generic PDF/DOC upload (a tax form, an ID upload, a "supporting document" dropzone).
+  // A bare accept="pdf" input is NOT enough on its own — it must name resume/cv, or the
+  // page must otherwise read like a job application (see jobTextSignal below).
   function hasResumeFileInput() {
     try {
-      return !!document.querySelector('input[type=file][accept*="pdf" i], input[type=file][accept*="doc" i], input[type=file][name*="resume" i], input[type=file][name*="cv" i], input[type=file][id*="resume" i], input[type=file][id*="cv" i], input[type=file][aria-label*="resume" i], input[type=file][aria-label*="cv" i]');
+      return !!document.querySelector('input[type=file][name*="resume" i], input[type=file][name*="cv" i], input[type=file][id*="resume" i], input[type=file][id*="cv" i], input[type=file][aria-label*="resume" i], input[type=file][aria-label*="cv" i], input[type=file][data-automation-id*="resume" i]');
+    } catch (_) { return false; }
+  }
+  function hasGenericFileUpload() {
+    try { return !!document.querySelector('input[type=file][accept*="pdf" i], input[type=file][accept*="doc" i]'); } catch (_) { return false; }
+  }
+  // Does the page CONTENT actually read like a JOB application? This is what stops us
+  // treating a loan/membership/"apply" form, a contact form, or any generic PDF-upload
+  // page as a job application and hallucinating job answers into it. Requires real
+  // job-application phrasing, not just a "/apply" in the URL.
+  function jobTextSignal() {
+    try {
+      const t = ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 30000);
+      if (!t) return false;
+      return /(apply for (this|the) (job|position|role|opening|vacancy)|cover letter|work authoriz|authoriz(ed|ation) to work|require (visa )?sponsorship|visa sponsorship|years of (relevant |related )?experience|equal employment opportunity|\beeo\b|veteran status|disability status|voluntary self.?identif|desired salary|salary expectation|salary requirement|notice period|willing to relocate|how did you hear about (us|this)|position (applied|being applied) for|are you legally (authorized|eligible)|upload (your )?(resume|cv|c\.v\.)|attach (your )?(resume|cv)|employment history|work experience|job title|hiring manager|job requisition|req(uisition)? (id|number))/.test(t);
     } catch (_) { return false; }
   }
   window.__uaIsEligiblePage = function () {
     if (cached !== null) return cached;
     try {
       const h = (location.hostname || '').toLowerCase();
+      // Known end-to-end ATS hosts are definitely job sites — always eligible.
+      if (ATS_HOSTS.test(h)) { cached = true; return true; }
       if (MIXED_USE_HOSTS.test(h)) {
-        // LinkedIn/Indeed/etc. — only eligible inside an Easy-Apply-style modal
-        cached = hasResumeFileInput();
+        // LinkedIn/Indeed/etc. — only inside an actual apply flow (resume field + job text).
+        cached = (hasResumeFileInput() || hasGenericFileUpload()) && jobTextSignal();
         return cached;
       }
-      if (ATS_HOSTS.test(h)) { cached = true; return true; }
-      if (CAREER_PATH.test(location.pathname || '')) { cached = true; return true; }
-      if (hasResumeFileInput()) { cached = true; return true; }
-      cached = false;
-      return false;
+      // Everywhere else: a career-ish URL OR a resume upload is a HINT, but we require the
+      // page to actually READ like a job application before activating. This is the fix for
+      // the extension filling non-job forms (loan/membership "apply" pages, contact forms,
+      // generic document-upload pages) that merely had "/apply" in the URL or a PDF input.
+      const hint = CAREER_PATH.test(location.pathname || '') || hasResumeFileInput() || hasGenericFileUpload();
+      cached = (hint && jobTextSignal()) || (hasResumeFileInput() && CAREER_PATH.test(location.pathname || ''));
+      return cached;
     } catch (_) { cached = false; return false; }
   };
   // Recompute once the DOM has been parsed (document_start content scripts run
