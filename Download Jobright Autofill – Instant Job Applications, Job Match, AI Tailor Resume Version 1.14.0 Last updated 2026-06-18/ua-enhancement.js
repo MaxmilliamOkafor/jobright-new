@@ -4609,19 +4609,101 @@
     // On a CONFIRMED submission, queue a LinkedIn recruiter follow-up for this company/
     // role. The LinkedIn module (below) sends it when you land on a matching profile.
     if ((status || 'applied') === 'applied') {
-      try { await enqueueFollowUp(extractCompanyFromUrl(url), title || '', url); } catch (_) {}
+      try {
+        // Attach the insider contacts we captured from Jobright just before applying, so the
+        // LinkedIn module aims at the exact recruiter / hiring manager Jobright surfaced.
+        let contacts = [];
+        const pend = await st.get('ua_pending_insiders');
+        if (pend && Array.isArray(pend.contacts) && (Date.now() - (pend.ts || 0) < 30 * 60 * 1000)) {
+          contacts = pend.contacts;
+          await st.set('ua_pending_insiders', null); // consume once
+        }
+        await enqueueFollowUp(extractCompanyFromUrl(url), title || '', url, contacts);
+      } catch (_) {}
     }
   }
 
   // ---- LinkedIn recruiter follow-up queue (consumed by the LinkedIn module) ----
-  async function enqueueFollowUp(company, role, url) {
+  // A queue item can carry EXACT people to contact (captured from Jobright's "Insider
+  // Connection" panel — Jobright is good at surfacing the right person), each with their
+  // LinkedIn profile slug so the LinkedIn module messages that precise person, not a guess.
+  async function enqueueFollowUp(company, role, url, contacts) {
     if (!company || company === 'Unknown') return;
     const q = (await st.get('ua_followup_queue')) || [];
     const key = (company + '|' + (role || '')).toLowerCase();
-    if (q.some(f => (f.company + '|' + (f.role || '')).toLowerCase() === key)) return; // already queued
-    q.unshift({ company, role: role || '', url: url || '', ts: Date.now(), status: 'pending' });
+    const existing = q.find(f => (f.company + '|' + (f.role || '')).toLowerCase() === key);
+    if (existing) {
+      if (contacts && contacts.length) { // merge any newly-found insider contacts
+        existing.contacts = existing.contacts || [];
+        for (const c of contacts) if (c.profile && !existing.contacts.some(x => x.profile === c.profile)) existing.contacts.push(c);
+        await st.set('ua_followup_queue', q);
+      }
+      return;
+    }
+    q.unshift({ company, role: role || '', url: url || '', ts: Date.now(), status: 'pending', contacts: contacts || [] });
     await st.set('ua_followup_queue', q.slice(0, 200));
-    LOG(`Follow-up queued for ${company}${role ? ' — ' + role : ''}`);
+    LOG(`Follow-up queued for ${company}${role ? ' — ' + role : ''}${contacts && contacts.length ? ' (' + contacts.length + ' insider contacts)' : ''}`);
+  }
+
+  // Classify a person's title/headline: who has the most say over an interview?
+  //  3 = the actual hiring manager / decision maker for the role (VP/Director/Head/Lead/Manager
+  //      of the relevant function, or literally "hiring manager").
+  //  2 = a recruiter / talent-acquisition / people-team contact (owns the pipeline).
+  //  1 = anyone else at the company (weak signal — last resort).
+  // Higher wins, so the LinkedIn module messages the person who matters most first.
+  function scoreContactRole(title) {
+    const t = (title || '').toLowerCase();
+    if (/hiring manager|\bhead of\b|\bvp\b|vice president|\bdirector\b|\bchief\b|\bcto\b|\bceo\b|\blead\b|\bmanager\b|\bprincipal\b|founder/.test(t)) return 3;
+    if (/recruit|talent|sourcer|\bta\b|people|human resources|\bhr\b|staffing|acquisition/.test(t)) return 2;
+    return 1;
+  }
+
+  // Scrape Jobright's "Insider Connection" panel for the specific people it surfaced.
+  // Depends on the panel exposing linkedin.com/in/ profile links (the "in" button). If
+  // Jobright renders those as JS-only buttons without hrefs we simply capture nothing and
+  // fall back to company-based matching — never guesses a wrong person. Each captured
+  // contact carries its title + a role score so we can aim at the recruiter / hiring
+  // manager for THIS role (the people with a say on getting the interview) first.
+  function captureInsiderConnections() {
+    try {
+      if (!isJobright()) return [];
+      const links = (typeof window.__uaDeepQueryAll === 'function')
+        ? window.__uaDeepQueryAll('a[href*="linkedin.com/in/"]')
+        : [...document.querySelectorAll('a[href*="linkedin.com/in/"]')];
+      const seen = new Set(), out = [];
+      for (const a of links) {
+        const m = (a.getAttribute('href') || '').match(/linkedin\.com\/in\/([^/?#]+)/i);
+        if (!m) continue;
+        const slug = m[1].toLowerCase();
+        if (seen.has(slug)) continue; seen.add(slug);
+        // Name/title from the card around the link (best-effort).
+        const card = a.closest('li,[class*="card"],[class*="connection"],[class*="item"],div') || a;
+        const name = ((card.querySelector('[class*="name"],b,strong,h3,h4')?.textContent) || a.textContent || '').trim().slice(0, 60);
+        // Title/headline sits near the name in the card; grab the fuller card text minus
+        // the name so scoreContactRole can spot "Recruiter" / "Engineering Manager" etc.
+        let title = (card.querySelector('[class*="title"],[class*="headline"],[class*="position"],[class*="role"],[class*="subtitle"]')?.textContent || '').trim();
+        if (!title) { const ct = (card.textContent || '').replace(name, ' ').replace(/\s+/g, ' ').trim(); title = ct.slice(0, 120); }
+        const score = scoreContactRole(title);
+        out.push({ profile: slug, name, title: title.slice(0, 120), score, ts: Date.now() });
+      }
+      // Best contacts first: hiring managers, then recruiters, then everyone else.
+      out.sort((a, b) => b.score - a.score);
+      return out;
+    } catch (_) { return []; }
+  }
+
+  // Capture the insiders on the CURRENT Jobright job page and stash them (with the job's
+  // role) so recordApplication — which fires later on the ATS page — can attach them to the
+  // follow-up queue item. Recency-matched: an application submitted shortly after viewing a
+  // Jobright job belongs to the insiders we just saw.
+  async function stashInsidersFromJobright(role) {
+    try {
+      if (!isJobright()) return;
+      const contacts = captureInsiderConnections();
+      if (!contacts.length) return;
+      await st.set('ua_pending_insiders', { role: role || '', contacts, ts: Date.now() });
+      LOG(`Captured ${contacts.length} insider contact(s) from Jobright (top: ${contacts[0].name || contacts[0].profile})`);
+    } catch (_) {}
   }
 
   function extractCompanyFromUrl(url) {
@@ -6796,7 +6878,13 @@
     // the Create Account / Sign In step. When OFF we stay out of the way and let
     // Jobright's native flow handle it, so the toggle is the single source of truth.
     if (isWorkday() && (autoApply || runnerActive)) startWorkdayAccountWatch();
-    if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
+    if (isJobright()) {
+      await sleep(2000); resumeTailoringAutomation();
+      // Capture Jobright's Insider Connections (recruiter/hiring manager for this role) so a
+      // follow-up can be aimed at the exact person. Re-capture as the panel loads/expands.
+      const roleGuess = ((document.querySelector('h1, [class*="job-title"], [class*="jobTitle"]')?.textContent) || '').trim().slice(0, 80);
+      [1500, 4000, 8000].forEach(ms => setTimeout(() => stashInsidersFromJobright(roleGuess), ms));
+    }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
       const el = e.target;
@@ -10692,14 +10780,26 @@ a[href*="/checkout" i],
         return;
       }
 
-      // Path B (fallback): a profile page you opened for someone at an applied-to company.
+      // Path B: a profile page you opened for someone at an applied-to company.
       if (!/\/in\//i.test(location.pathname)) return;
       const pkey = profileKey();
       if (!pkey || await alreadyMessaged(pkey)) return;  // dedupe
-      const ptext = profileCompanyText();
-      const match = q.find(f => f.company && ptext.includes(norm(f.company)));
-      if (!match) return;                 // this profile isn't at an applied-to company
-      if (!looksLikeRecruiter()) { log('Profile matches ' + match.company + ' but does not look like a recruiter — skipping auto-send'); return; }
+
+      // B1 (best): this profile IS one of the exact insider contacts Jobright surfaced for a
+      // job we applied to (recruiter / hiring manager for the role). Send with no further
+      // gating — Jobright already vetted that this is the right person to reach.
+      let match = q.find(f => Array.isArray(f.contacts) && f.contacts.some(c => c.profile === pkey));
+      let exact = false;
+      if (match) { exact = true; }
+      else {
+        // B2 (fallback): guess by company text on the profile, and require a recruiter-ish
+        // headline so we don't cold-message a random employee.
+        const ptext = profileCompanyText();
+        match = q.find(f => f.company && ptext.includes(norm(f.company)));
+        if (!match) return;               // this profile isn't at an applied-to company
+        if (!looksLikeRecruiter()) { log('Profile matches ' + match.company + ' but does not look like a recruiter/hiring manager — skipping auto-send'); return; }
+      }
+      if (exact) log('Exact insider match for ' + match.company + ' — messaging the person Jobright surfaced');
 
       const text = c.template
         .replace(/\{first\}/gi, firstName())
@@ -10732,7 +10832,16 @@ a[href*="/checkout" i],
             '<div style="font-size:10px;color:#666;margin-bottom:6px">Sent today: <b>' + st + '/' + c.cap + '</b> · Pending: <b>' + q.length + '</b></div>' +
             (c.enabled ? '<div style="font-size:10px;color:#0a66c2;margin-bottom:6px">Open a recruiter/hiring-manager profile at a company you applied to — it will auto-send.</div>'
                        : '<div style="font-size:10px;color:#b42318;margin-bottom:6px">Off. Turning on auto-sends LinkedIn messages (against LinkedIn ToS — use at your own risk).</div>') +
-            q.slice(0, 5).map(f => '<div style="display:flex;justify-content:space-between;gap:6px;padding:4px 0;border-top:1px solid #eee"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (f.company) + (f.role ? ' · ' + f.role : '') + '</span><a href="https://www.linkedin.com/search/results/people/?keywords=' + encodeURIComponent(f.company + ' recruiter') + '" target="_self" style="color:#0a66c2;text-decoration:none;flex:0 0 auto">find →</a></div>').join('') +
+            q.slice(0, 5).map(f => {
+              // Prefer the exact insider Jobright surfaced (highest-scoring = recruiter /
+              // hiring manager for the role). Clicking opens THAT profile → auto-send fires.
+              const top = Array.isArray(f.contacts) && f.contacts.length ? f.contacts.slice().sort((a, b) => (b.score || 0) - (a.score || 0))[0] : null;
+              const href = top ? ('https://www.linkedin.com/in/' + encodeURIComponent(top.profile) + '/')
+                               : ('https://www.linkedin.com/search/results/people/?keywords=' + encodeURIComponent(f.company + ' recruiter'));
+              const label = top ? ((top.name ? top.name.split(/\s+/)[0] : 'contact') + ' →') : 'find →';
+              const line = (f.company) + (f.role ? ' · ' + f.role : '');
+              return '<div style="display:flex;justify-content:space-between;gap:6px;padding:4px 0;border-top:1px solid #eee"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (top && top.title ? String(top.title).replace(/"/g, '&quot;') : '') + '">' + line + '</span><a href="' + href + '" target="_self" style="color:#0a66c2;text-decoration:none;flex:0 0 auto">' + label + '</a></div>';
+            }).join('') +
             '<textarea id="ua-li-tpl" style="width:100%;box-sizing:border-box;margin-top:8px;min-height:54px;border:1px solid #d0d5dd;border-radius:8px;padding:6px;font:11px/1.4 inherit;resize:vertical" placeholder="Message template">' + (c.template).replace(/</g, '&lt;') + '</textarea>' +
             '<div style="font-size:9px;color:#888;margin-top:3px">Placeholders: {first} {role} {company}</div>' +
             '</div>';
