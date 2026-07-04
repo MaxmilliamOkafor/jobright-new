@@ -4606,6 +4606,22 @@
     // Keep last 500 applications
     if (_appHistory.length > 500) _appHistory = _appHistory.slice(0, 500);
     await saveAppHistory();
+    // On a CONFIRMED submission, queue a LinkedIn recruiter follow-up for this company/
+    // role. The LinkedIn module (below) sends it when you land on a matching profile.
+    if ((status || 'applied') === 'applied') {
+      try { await enqueueFollowUp(extractCompanyFromUrl(url), title || '', url); } catch (_) {}
+    }
+  }
+
+  // ---- LinkedIn recruiter follow-up queue (consumed by the LinkedIn module) ----
+  async function enqueueFollowUp(company, role, url) {
+    if (!company || company === 'Unknown') return;
+    const q = (await st.get('ua_followup_queue')) || [];
+    const key = (company + '|' + (role || '')).toLowerCase();
+    if (q.some(f => (f.company + '|' + (f.role || '')).toLowerCase() === key)) return; // already queued
+    q.unshift({ company, role: role || '', url: url || '', ts: Date.now(), status: 'pending' });
+    await st.set('ua_followup_queue', q.slice(0, 200));
+    LOG(`Follow-up queued for ${company}${role ? ' — ' + role : ''}`);
   }
 
   function extractCompanyFromUrl(url) {
@@ -10480,4 +10496,199 @@ a[href*="/checkout" i],
     }
   } catch (_) {}
   log('candidate-profile snapshot watcher active');
+})();
+
+// ============================================================================
+// === LINKEDIN RECRUITER FOLLOW-UP (auto-send after applying) ===
+// After a confirmed application, a follow-up for {company, role} is queued (see
+// enqueueFollowUp in the main module). This module runs on linkedin.com: when you
+// land on the profile of someone whose CURRENT company matches a pending follow-up,
+// and auto-send is enabled, it composes a short personalized note and sends it.
+//
+// IMPORTANT / HONEST NOTE: automating LinkedIn messaging is against LinkedIn's User
+// Agreement and can get an account restricted or banned — Premium raises message
+// LIMITS, not automation PERMISSION. To reduce that risk this is OFF by default and
+// heavily throttled: a per-day cap, a randomized delay between sends, and dedupe so
+// the same person is never messaged twice. You stay in control of WHO by choosing
+// which profiles to open (e.g. via Jobright's "Insider Connections").
+// ============================================================================
+(function () {
+  'use strict';
+  const TAG = '[UA-LinkedIn]';
+  const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
+  if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return;
+  if (window.top !== window.self) return;
+
+  const S = {
+    get: k => new Promise(r => { try { chrome.storage.local.get(k, d => r(d[k])); } catch (_) { r(undefined); } }),
+    set: (k, v) => new Promise(r => { try { chrome.storage.local.set({ [k]: v }, r); } catch (_) { r(); } }),
+  };
+  const DEFAULT_TEMPLATE =
+    "Hi {first}, I just submitted my application for the {role} role at {company} and wanted to reach out directly. I'm genuinely excited about the opportunity and would welcome the chance to connect. Thank you for your time!";
+  const DEFAULT_CAP = 12;          // max auto-sends per day
+  const MIN_GAP_MS = 45_000;       // minimum gap between two auto-sends
+  const RAND_GAP_MS = 40_000;      // + up to this much random jitter
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // ---------- config ----------
+  async function cfg() {
+    return {
+      enabled: (await S.get('ua_followup_enabled')) === true,
+      template: (await S.get('ua_followup_template')) || DEFAULT_TEMPLATE,
+      cap: (await S.get('ua_followup_daily_cap')) || DEFAULT_CAP,
+    };
+  }
+  async function sentLog() { return (await S.get('ua_followup_sent')) || []; }
+  async function sentToday() { const now = Date.now(); return (await sentLog()).filter(s => now - s.ts < 86_400_000).length; }
+  async function alreadyMessaged(profileKey) { return (await sentLog()).some(s => s.profile === profileKey); }
+  async function markSent(profileKey, company, role) {
+    const l = await sentLog(); l.unshift({ profile: profileKey, company, role, ts: Date.now() });
+    await S.set('ua_followup_sent', l.slice(0, 2000));
+  }
+  async function queue() { return (await S.get('ua_followup_queue')) || []; }
+  async function removeFromQueue(company) {
+    const q = await queue();
+    await S.set('ua_followup_queue', q.filter(f => norm(f.company) !== norm(company)));
+  }
+
+  // ---------- profile parsing ----------
+  function profileKey() { const m = location.pathname.match(/\/in\/([^/]+)/i); return m ? m[1].toLowerCase() : ''; }
+  function firstName() {
+    const h = document.querySelector('h1.text-heading-xlarge, .pv-text-details__left-panel h1, main h1');
+    const full = (h && h.textContent || '').trim();
+    return (full.split(/\s+/)[0] || 'there').replace(/[^a-zA-Z''-]/g, '') || 'there';
+  }
+  // The person's CURRENT company text (headline + top-card subtitle + first experience).
+  function profileCompanyText() {
+    const parts = [];
+    const head = document.querySelector('.text-body-medium.break-words, .pv-text-details__left-panel .text-body-medium');
+    if (head) parts.push(head.textContent || '');
+    // "Current" line in the top card (e.g. a company chip) + first experience entry.
+    document.querySelectorAll('[data-field="experience_company_logo"], .pv-text-details__right-panel, #experience ~ * li:first-child, .pvs-list__item--line-separated:first-child').forEach(e => parts.push(e.textContent || ''));
+    return norm(parts.join(' • ')).slice(0, 800);
+  }
+  function looksLikeRecruiter() {
+    const t = profileCompanyText() + ' ' + norm((document.querySelector('main h1')?.parentElement?.textContent) || '');
+    return /recruit|talent|sourcer|people|human resources|\bhr\b|hiring|staffing|acquisition/.test(t);
+  }
+
+  // ---------- message sending ----------
+  function setContentEditable(box, text) {
+    box.focus();
+    // Clear then insert via execCommand so LinkedIn's React/Draft editor fires its input handlers.
+    try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (_) {}
+    let ok = false;
+    try { ok = document.execCommand('insertText', false, text); } catch (_) {}
+    if (!ok) {
+      box.textContent = text;
+      box.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+    }
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  async function openMessageComposer() {
+    // Already open?
+    let box = document.querySelector('.msg-form__contenteditable[contenteditable="true"]');
+    if (box) return box;
+    // Click the profile "Message" button (Premium opens InMail for non-connections).
+    const btn = [...document.querySelectorAll('button, a')].find(b => {
+      const l = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+      return /^\s*message\b/i.test((b.textContent || '').trim()) || /message [A-Z]/.test(l);
+    });
+    if (!btn) return null;
+    btn.click();
+    for (let i = 0; i < 20; i++) { await sleep(300); box = document.querySelector('.msg-form__contenteditable[contenteditable="true"]'); if (box) return box; }
+    return null;
+  }
+  function findSendButton(box) {
+    const scope = box.closest('.msg-form, .msg-overlay-conversation-bubble, form') || document;
+    return scope.querySelector('.msg-form__send-button:not([disabled]), button[type="submit"].msg-form__send-button:not([disabled])')
+      || [...scope.querySelectorAll('button')].find(b => /^\s*send\s*$/i.test(b.textContent || '') && !b.disabled);
+  }
+  async function sendMessage(text) {
+    const box = await openMessageComposer();
+    if (!box) { log('No message composer found on this profile'); return false; }
+    await sleep(600 + Math.random() * 800);
+    setContentEditable(box, text);
+    await sleep(900 + Math.random() * 900); // let the Send button enable + look human
+    const send = findSendButton(box);
+    if (!send) { log('Send button not found / disabled'); return false; }
+    send.click();
+    log('Follow-up message sent');
+    return true;
+  }
+
+  // ---------- driver ----------
+  let _lastSendAt = 0;
+  let _busy = false;
+  async function tick() {
+    if (_busy) return; _busy = true;
+    try {
+      const c = await cfg();
+      renderPanel(c);                     // keep the on-page panel current
+      if (!c.enabled) return;
+      if (!/\/in\//i.test(location.pathname)) return;   // only act on a profile page
+      if (Date.now() - _lastSendAt < MIN_GAP_MS) return; // global throttle
+      if (await sentToday() >= c.cap) return;            // daily cap
+      const pkey = profileKey();
+      if (!pkey || await alreadyMessaged(pkey)) return;  // dedupe
+
+      const q = await queue();
+      if (!q.length) return;
+      const ptext = profileCompanyText();
+      const match = q.find(f => f.company && ptext.includes(norm(f.company)));
+      if (!match) return;                 // this profile isn't at an applied-to company
+      // Optional guardrail: only auto-message obvious recruiter/HR/hiring people.
+      if (!looksLikeRecruiter()) { log('Profile matches ' + match.company + ' but does not look like a recruiter — skipping auto-send'); return; }
+
+      const text = c.template
+        .replace(/\{first\}/gi, firstName())
+        .replace(/\{role\}/gi, match.role || 'the role')
+        .replace(/\{company\}/gi, match.company);
+      _lastSendAt = Date.now();
+      const ok = await sendMessage(text);
+      if (ok) { await markSent(pkey, match.company, match.role); await removeFromQueue(match.company); _lastSendAt = Date.now() + Math.random() * RAND_GAP_MS; renderPanel(await cfg()); }
+    } catch (e) { log('tick error:', e && e.message); }
+    finally { _busy = false; }
+  }
+
+  // ---------- on-page control panel ----------
+  function renderPanel(c) {
+    try {
+      queue().then(q => {
+        let el = document.getElementById('ua-li-followup');
+        if (!q.length && !c.enabled) { if (el) el.remove(); return; }
+        if (!el) {
+          el = document.createElement('div');
+          el.id = 'ua-li-followup';
+          el.style.cssText = 'position:fixed;right:14px;bottom:14px;width:260px;z-index:2147483000;background:#fff;border:1px solid #d0d5dd;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.18);font:12px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;color:#1d2226;overflow:hidden';
+          document.body.appendChild(el);
+        }
+        sentToday().then(st => {
+          el.innerHTML =
+            '<div style="padding:9px 11px;background:#0a66c2;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:space-between">📨 Recruiter Follow-up' +
+            '<label style="display:inline-flex;align-items:center;gap:5px;font-weight:600;font-size:11px;cursor:pointer"><input type="checkbox" id="ua-li-tog" ' + (c.enabled ? 'checked' : '') + '> Auto-send</label></div>' +
+            '<div style="padding:9px 11px">' +
+            '<div style="font-size:10px;color:#666;margin-bottom:6px">Sent today: <b>' + st + '/' + c.cap + '</b> · Pending: <b>' + q.length + '</b></div>' +
+            (c.enabled ? '<div style="font-size:10px;color:#0a66c2;margin-bottom:6px">Open a recruiter/hiring-manager profile at a company you applied to — it will auto-send.</div>'
+                       : '<div style="font-size:10px;color:#b42318;margin-bottom:6px">Off. Turning on auto-sends LinkedIn messages (against LinkedIn ToS — use at your own risk).</div>') +
+            q.slice(0, 5).map(f => '<div style="display:flex;justify-content:space-between;gap:6px;padding:4px 0;border-top:1px solid #eee"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (f.company) + (f.role ? ' · ' + f.role : '') + '</span><a href="https://www.linkedin.com/search/results/people/?keywords=' + encodeURIComponent(f.company + ' recruiter') + '" target="_self" style="color:#0a66c2;text-decoration:none;flex:0 0 auto">find →</a></div>').join('') +
+            '<textarea id="ua-li-tpl" style="width:100%;box-sizing:border-box;margin-top:8px;min-height:54px;border:1px solid #d0d5dd;border-radius:8px;padding:6px;font:11px/1.4 inherit;resize:vertical" placeholder="Message template">' + (c.template).replace(/</g, '&lt;') + '</textarea>' +
+            '<div style="font-size:9px;color:#888;margin-top:3px">Placeholders: {first} {role} {company}</div>' +
+            '</div>';
+          const tog = el.querySelector('#ua-li-tog');
+          if (tog) tog.onchange = () => S.set('ua_followup_enabled', tog.checked).then(() => cfg().then(renderPanel));
+          const tpl = el.querySelector('#ua-li-tpl');
+          if (tpl) tpl.onchange = () => S.set('ua_followup_template', tpl.value);
+        });
+      });
+    } catch (_) {}
+  }
+
+  // Kick off: render the panel and poll for a matching profile.
+  function start() { cfg().then(renderPanel); setInterval(tick, 3500); setTimeout(tick, 1500); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+  log('LinkedIn recruiter follow-up module active');
 })();
