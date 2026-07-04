@@ -619,6 +619,17 @@
       return 'No'; // "have you been convicted/have a criminal record" style question
     }
     if (/drug.?test|screening/.test(l)) return 'Yes';
+    // Conditional "disclosure" knockout questions that should default to NO (they're the
+    // ones left unanswered on Workday questionnaires — non-compete, prior applicant/
+    // employee, prior engagement/client relationship, relative-at-company, conflicts).
+    // These must be checked BEFORE the generic "agree/consent → Yes" rule below, or a
+    // question like "...that would preclude your employment? If yes, please provide..."
+    // would wrongly return Yes. Note the earlier /agree/ rule is for consent CHECKBOXES.
+    if (/non.?compet|restrictive.?covenant|non.?solicit|would (preclude|restrict|prevent).*(employ|work)/.test(l)) return 'No';
+    if (/(ever|previously).*(applied|interview|offer|employ).*(with|at|for|by)|former.*(applicant|employee)|worked.*(here|for us|for this company).*before/.test(l)) return 'No';
+    if (/engagement team|worked.*(as|with).*(client|engagement)|independent.?contractor|third.?party.?labor/.test(l)) return 'No';
+    if (/(related|relative|family).*(partner|principal|employee|associate|work)|conflict.*interest/.test(l)) return 'No';
+    if (/terminated|dismissed|discharged|suspended.*(employ|job)|debarred|pending.*charge/.test(l)) return 'No';
     if (/\bage\b|18.*years|over.*18|at.*least.*18/.test(l)) return 'Yes';
     if (/agree|acknowledge|certif|attest|confirm|consent/.test(l)) return 'Yes';
     if (/please.?specify|other.?please/.test(l)) return p.city || p.state || '';
@@ -1272,7 +1283,7 @@
         if (!opt && /gender|disability|veteran|race|ethnic|sex\b/i.test(lbl || ''))
           opt = opts.find(o => /prefer not|decline|not to/i.test(o.text));
         if (!opt) opt = opts[0];
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); fixed++; }
+        if (opt) { setSelectValue(el, opt.value); fixed++; }
         continue;
       }
       if (isLocationField(el)) { continue; } // already handled by resolveLocationFields
@@ -1336,6 +1347,25 @@
     return true;
   }
 
+  // Set a <select>'s value so REACT registers it. Assigning `sel.value = ...` directly
+  // is bypassed by React's controlled-input value tracker (exactly like the text-input
+  // bug we fixed earlier) — so on the next render React reverts the select and the field
+  // stays "required / must have a value" even though the option visibly shows selected.
+  // Calling the PROTOTYPE value setter + dispatching input & change is what makes it stick.
+  function setSelectValue(sel, value) {
+    if (!sel) return false;
+    try {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      if (setter) setter.call(sel, value); else sel.value = value;
+    } catch (_) { try { sel.value = value; } catch (__) {} }
+    // Some frameworks track by selectedIndex — keep it consistent with the value we set.
+    try { if (sel.value !== value) { for (let i = 0; i < sel.options.length; i++) { if (sel.options[i].value === value) { sel.selectedIndex = i; break; } } } } catch (_) {}
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    sel.dispatchEvent(new Event('blur', { bubbles: true }));
+    return true;
+  }
+
   function realClick(el) {
     if (!el) return;
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
@@ -1388,7 +1418,13 @@
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) { const d = document.getElementById(labelledBy); if (d?.textContent?.trim()) return d.textContent.trim(); }
     if (el.id) { const lbl = $(`label[for="${CSS.escape(el.id)}"]`); if (lbl) return lbl.textContent.trim(); }
-    if (el.placeholder) return el.placeholder;
+    // A GENERIC placeholder ("Enter your answer", "Type here", "Select…") tells us nothing
+    // about the field and was previously returned here — shadowing the real question label
+    // from the fieldset/container below, so guessValue couldn't match and the field got the
+    // wrong value or none. Only use a placeholder if it's specific enough to be a real hint,
+    // and only AFTER trying the structural labels (fieldset legend / container label).
+    const GENERIC_PLACEHOLDER = /^\s*(enter|type|select|choose|pick|search|please|your answer|answer here|e\.?g\.?|example|start typing|--|\.\.\.|…)\b|^\s*(select|choose)\s*(an?\s+)?(option|one|value)?\s*\.*\s*$/i;
+    const specificPlaceholder = (el.placeholder && !GENERIC_PLACEHOLDER.test(el.placeholder)) ? el.placeholder : '';
     const autoId = el.getAttribute('data-automation-id') || el.getAttribute('data-testid') || el.getAttribute('data-qa');
     if (autoId) { const readable = splitCamelCase(autoId); if (readable.length > 2 && !/^(input|field|text|form|container)$/i.test(readable)) return readable; }
     const fieldset = el.closest('fieldset');
@@ -1398,11 +1434,28 @@
       const lbl = container.querySelector('label,[class*="label"],[class*="Label"],legend,[class*="title"],[class*="prompt"],[class*="question-text"]');
       if (lbl && lbl !== el && !lbl.contains(el)) return lbl.textContent.trim();
     }
+    // Fall back to a specific (non-generic) placeholder before the last-ditch sibling/name guesses.
+    if (specificPlaceholder) return specificPlaceholder;
     const prev = el.previousElementSibling;
     if (prev && (prev.tagName === 'LABEL' || prev.tagName === 'SPAN' || prev.tagName === 'DIV') && prev.textContent?.trim().length < 100) return prev.textContent.trim();
     const parentText = el.parentElement?.childNodes?.[0];
     if (parentText?.nodeType === 3 && parentText.textContent?.trim().length > 1 && parentText.textContent?.trim().length < 60) return parentText.textContent.trim();
     return splitCamelCase(el.name || el.id) || '';
+  }
+
+  // A checkbox we should NOT auto-tick: marketing/newsletter/promotional opt-ins.
+  // Our account-creation flow ticks "every checkbox" to satisfy the required
+  // "agree to terms / privacy notice" consent — but that could also silently opt the
+  // user into job-alert / marketing emails. Skip anything that reads like marketing,
+  // UNLESS it's clearly a REQUIRED legal consent (terms/privacy/agree).
+  function isMarketingCheckbox(el) {
+    try {
+      const t = ((getLabel(el) || '') + ' ' + (el.name || '') + ' ' + (el.id || '')).toLowerCase();
+      if (!/market|newsletter|promotion|promotional|job.?alert|subscribe|keep me (updated|informed)|notify me|email me about|opt.?in|receive.*(email|update|offer)|similar (jobs|roles|opportunities)/.test(t)) return false;
+      // Don't treat a genuine legal consent as marketing even if it mentions "email".
+      if (/\b(terms|privacy|consent to the|agree to the|conditions|policy|acknowledge)\b/.test(t) && (el.required || el.getAttribute('aria-required') === 'true')) return false;
+      return true;
+    } catch (_) { return false; }
   }
 
   function isFieldRequired(el) {
@@ -1531,14 +1584,14 @@
       // it simply doesn't match the site's own wording), prefer a genuine "decline to
       // answer" style option over guessing a SPECIFIC demographic value.
       if (!opt && isEEO) opt = opts.find(o => /prefer not|decline|not to|do not|don.t wish/i.test(o.text));
-      if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++; }
+      if (opt) { setSelectValue(sel, opt.value); filled++; }
       else if (isFieldRequired(sel) && opts.length) {
         // Blindly picking option[0] when we have NO confident match used to run
         // unconditionally — including on OPTIONAL dropdowns and EEO fields, where it
         // could select a wrong SPECIFIC value (e.g. a random gender/race) instead of
         // leaving an optional field alone. Now this last resort only fires when the
         // field is actually REQUIRED (so the form would otherwise be unsubmittable).
-        sel.value = opts[0].value; sel.dispatchEvent(new Event('change', { bubbles: true })); filled++;
+        setSelectValue(sel, opts[0].value); filled++;
       }
     }
 
@@ -1621,7 +1674,7 @@
       const val = guessFieldValue(lbl, p, sel);
       if (!val) continue;
       const opt = $$('option', sel).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-      if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); refilled++; }
+      if (opt) { setSelectValue(sel, opt.value); refilled++; }
     }
     if (refilled > 0) LOG(`Verification pass: re-filled ${refilled} fields that were cleared`);
 
@@ -1978,6 +2031,7 @@
   async function multiPageLoop() {
     const MAX_PAGES = 18;
     let prevPageHash = getPageHash();
+    let samePageRetries = 0;
     for (let page = 1; page <= MAX_PAGES; page++) {
       if (autoStopped()) { LOG('Fully Automated turned off — stopping multi-page loop'); break; }
       if (checkSuccess()) { LOG('Success detected — stopping multi-page loop'); break; }
@@ -1986,15 +2040,29 @@
       // Wait for page content to change
       await sleep(2000);
 
-      // Detect if page actually changed (URL hash, DOM content, or form fields)
+      // Detect whether the page actually advanced. getPageHash is URL + visible-field
+      // count + labels, which stays IDENTICAL when a Workday-style page rejects "Save
+      // and Continue" and just shows inline validation errors. Previously that made the
+      // loop give up after a single failed attempt. Now: if the page didn't advance but
+      // there's still something FIXABLE (a validation error or a missing required
+      // field), we re-fill and retry the same page (bounded) instead of bailing —
+      // clicking Continue re-validates, and the fill pass below re-answers anything we
+      // now know how to (e.g. the disclosure "No" defaults + the React select setter).
       const newHash = getPageHash();
       if (page > 1 && newHash === prevPageHash) {
-        LOG('Page did not change — waiting longer');
-        await sleep(3000);
-        if (getPageHash() === prevPageHash) {
-          LOG('Still no change — stopping multi-page loop');
-          break;
+        await sleep(2000);
+        const stillSame = getPageHash() === prevPageHash;
+        const fixable = pageHasValidationError() || getMissingRequired().length > 0;
+        if (stillSame) {
+          samePageRetries++;
+          if (!fixable || samePageRetries > 4) {
+            LOG(`Multi-page: page not advancing (${fixable ? 'unresolved after ' + samePageRetries + ' retries' : 'nothing left to fix'}) — stopping`);
+            break;
+          }
+          LOG(`Page did not advance — re-filling & retrying same page (attempt ${samePageRetries})`);
         }
+      } else {
+        samePageRetries = 0;
       }
       prevPageHash = getPageHash();
 
@@ -2110,8 +2178,7 @@
         /ireland|\+353|353|IE\b/i.test(o.text) || o.value === 'IE' || o.value === '+353' || o.value === '353'
       );
       if (ieOpt) {
-        sel.value = ieOpt.value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        setSelectValue(sel, ieOpt.value);
         LOG('Phone country code set to Ireland via select');
       }
     }
@@ -2149,7 +2216,7 @@
     // Handle <select> elements directly
     if (btn.tagName === 'SELECT') {
       const opt = $$('option', btn).find(o => o.text.toLowerCase().includes(value.toLowerCase()));
-      if (opt) { btn.value = opt.value; btn.dispatchEvent(new Event('change', { bubbles: true })); return true; }
+      if (opt) { setSelectValue(btn, opt.value); return true; }
       return false;
     }
     realClick(btn);
@@ -2450,7 +2517,7 @@
 
     // Graduated status
     const gradSelect = xpath("//select[contains(@id,'CandProfileFields.IsGraduated')]") || $('select[data-automation-id="isGraduated"]');
-    if (gradSelect) { const opt = $$('option', gradSelect).find(o => /yes|complete|graduated/i.test(o.text)); if (opt) { gradSelect.value = opt.value; gradSelect.dispatchEvent(new Event('change', { bubbles: true })); } }
+    if (gradSelect) { const opt = $$('option', gradSelect).find(o => /yes|complete|graduated/i.test(o.text)); if (opt) { setSelectValue(gradSelect, opt.value); } }
 
     LOG('Workday: education fields filled (enhanced)');
   }
@@ -2797,7 +2864,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3004,7 +3071,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else {
         inp.focus({ preventScroll: true }); nativeSet(inp, val);
       }
@@ -3029,7 +3096,7 @@
     for (const sp of sponsorInputs) {
       if (sp.tagName === 'SELECT') {
         const opt = $$('option', sp).find(o => /no/i.test(o.text));
-        if (opt) { sp.value = opt.value; sp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(sp, opt.value); }
       } else {
         sp.focus({ preventScroll: true }); nativeSet(sp, DEFAULTS.sponsorship);
       }
@@ -3203,12 +3270,12 @@
     const countrySelect = $('select[id*="Country"],select[name*="country"]');
     if (countrySelect && !hasFieldValue(countrySelect)) {
       const opt = $$('option', countrySelect).find(o => new RegExp(p.country || DEFAULTS.country, 'i').test(o.text));
-      if (opt) { countrySelect.value = opt.value; countrySelect.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (opt) { setSelectValue(countrySelect, opt.value); }
     }
     const stateSelect = $('select[id*="State"],select[id*="Province"],select[name*="state"]');
     if (stateSelect && !hasFieldValue(stateSelect) && p.state) {
       const opt = $$('option', stateSelect).find(o => o.text.toLowerCase().includes(p.state.toLowerCase()));
-      if (opt) { stateSelect.value = opt.value; stateSelect.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (opt) { setSelectValue(stateSelect, opt.value); }
     }
 
     // Phase 3: Taleo multi-page navigation
@@ -3331,7 +3398,7 @@
         if (!val) continue;
         if (field.tagName === 'SELECT') {
           const opt = $$('option', field).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-          if (opt) { field.value = opt.value; field.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (opt) { setSelectValue(field, opt.value); }
         } else { field.focus({ preventScroll: true }); nativeSet(field, val); }
         await sleep(80);
       }
@@ -3424,7 +3491,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3501,7 +3568,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3551,7 +3618,7 @@
         if (!el || hasFieldValue(el)) continue;
         if (el.tagName === 'SELECT') {
           const opt = $$('option', el).find(o => o.text.toLowerCase().includes(val.toLowerCase()) || /prefer not|decline/i.test(o.text));
-          if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (opt) { setSelectValue(el, opt.value); }
         } else { el.focus({ preventScroll: true }); nativeSet(el, val); }
         await sleep(80);
         break;
@@ -3584,7 +3651,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3618,7 +3685,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3649,7 +3716,7 @@
       if (!val) continue;
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (opt) { setSelectValue(inp, opt.value); }
       } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
       await sleep(80);
     }
@@ -3725,7 +3792,7 @@
         if (!val) continue;
         if (field.tagName === 'SELECT') {
           const opt = $$('option', field).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-          if (opt) { field.value = opt.value; field.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (opt) { setSelectValue(field, opt.value); }
         } else {
           field.focus({ preventScroll: true }); nativeSet(field, val);
         }
@@ -3834,7 +3901,27 @@
       const container = errEl.closest('.form-group,.field,.question,[class*="Field"],[class*="Question"],li,.form-item,.ant-form-item,.MuiFormControl-root,fieldset,div');
       if (!container) continue;
       const inp = container.querySelector('input:not([type=hidden]):not([type=file]),textarea,select');
-      if (!inp || hasFieldValue(inp)) continue;
+      if (!inp) continue;
+
+      // RADIO GROUP in the error container — previously this fell through to nativeSet()
+      // on a radio (a no-op), so radio-based questions with a validation error (common on
+      // Workday questionnaires) never got fixed. Route them through the knockout radio
+      // answerer (Yes/No/EEO/experience-range aware).
+      if (inp.type === 'radio') {
+        const radios = [...container.querySelectorAll('input[type=radio]')].filter(isVisible);
+        if (radios.length && !radios.some(r => r.checked)) {
+          if (answerKnockoutRadioGroup(radios, container, p)) fixed++;
+        }
+        await sleep(60);
+        continue;
+      }
+      // Required consent CHECKBOX with an error — tick it (unless it's a marketing opt-in).
+      if (inp.type === 'checkbox') {
+        if (!inp.checked && !isMarketingCheckbox(inp)) { realClick(inp); fixed++; }
+        await sleep(60);
+        continue;
+      }
+      if (hasFieldValue(inp)) continue;
 
       const lbl = getLabel(inp);
       const val = guessFieldValue(lbl, p, inp);
@@ -3842,7 +3929,7 @@
 
       if (inp.tagName === 'SELECT') {
         const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { inp.value = opt.value; inp.dispatchEvent(new Event('change', { bubbles: true })); fixed++; }
+        if (opt) { setSelectValue(inp, opt.value); fixed++; }
       } else {
         inp.focus({ preventScroll: true }); nativeSet(inp, val); fixed++;
       }
@@ -4103,7 +4190,7 @@
         .find(i => /e-?mail/i.test((getLabel(i) || '') + (i.name || '') + (i.id || '') + (i.getAttribute('data-automation-id') || '')));
     if (emailField && emailField.value !== email) reactTypeValue(emailField, email);
     for (const f of pwFields) if (f.value !== pw) reactTypeValue(f, pw);
-    if (onCreate) $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+    if (onCreate) $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked && !isMarketingCheckbox(c)) realClick(c); });
     if (!submit) return 'working';
 
     const pwOK = pwFields.every(f => f.value === pw) && pw.length >= 8;
@@ -4519,6 +4606,104 @@
     // Keep last 500 applications
     if (_appHistory.length > 500) _appHistory = _appHistory.slice(0, 500);
     await saveAppHistory();
+    // On a CONFIRMED submission, queue a LinkedIn recruiter follow-up for this company/
+    // role. The LinkedIn module (below) sends it when you land on a matching profile.
+    if ((status || 'applied') === 'applied') {
+      try {
+        // Attach the insider contacts we captured from Jobright just before applying, so the
+        // LinkedIn module aims at the exact recruiter / hiring manager Jobright surfaced.
+        let contacts = [];
+        const pend = await st.get('ua_pending_insiders');
+        if (pend && Array.isArray(pend.contacts) && (Date.now() - (pend.ts || 0) < 30 * 60 * 1000)) {
+          contacts = pend.contacts;
+          await st.set('ua_pending_insiders', null); // consume once
+        }
+        await enqueueFollowUp(extractCompanyFromUrl(url), title || '', url, contacts);
+      } catch (_) {}
+    }
+  }
+
+  // ---- LinkedIn recruiter follow-up queue (consumed by the LinkedIn module) ----
+  // A queue item can carry EXACT people to contact (captured from Jobright's "Insider
+  // Connection" panel — Jobright is good at surfacing the right person), each with their
+  // LinkedIn profile slug so the LinkedIn module messages that precise person, not a guess.
+  async function enqueueFollowUp(company, role, url, contacts) {
+    if (!company || company === 'Unknown') return;
+    const q = (await st.get('ua_followup_queue')) || [];
+    const key = (company + '|' + (role || '')).toLowerCase();
+    const existing = q.find(f => (f.company + '|' + (f.role || '')).toLowerCase() === key);
+    if (existing) {
+      if (contacts && contacts.length) { // merge any newly-found insider contacts
+        existing.contacts = existing.contacts || [];
+        for (const c of contacts) if (c.profile && !existing.contacts.some(x => x.profile === c.profile)) existing.contacts.push(c);
+        await st.set('ua_followup_queue', q);
+      }
+      return;
+    }
+    q.unshift({ company, role: role || '', url: url || '', ts: Date.now(), status: 'pending', contacts: contacts || [] });
+    await st.set('ua_followup_queue', q.slice(0, 200));
+    LOG(`Follow-up queued for ${company}${role ? ' — ' + role : ''}${contacts && contacts.length ? ' (' + contacts.length + ' insider contacts)' : ''}`);
+  }
+
+  // Classify a person's title/headline: who has the most say over an interview?
+  //  3 = the actual hiring manager / decision maker for the role (VP/Director/Head/Lead/Manager
+  //      of the relevant function, or literally "hiring manager").
+  //  2 = a recruiter / talent-acquisition / people-team contact (owns the pipeline).
+  //  1 = anyone else at the company (weak signal — last resort).
+  // Higher wins, so the LinkedIn module messages the person who matters most first.
+  function scoreContactRole(title) {
+    const t = (title || '').toLowerCase();
+    if (/hiring manager|\bhead of\b|\bvp\b|vice president|\bdirector\b|\bchief\b|\bcto\b|\bceo\b|\blead\b|\bmanager\b|\bprincipal\b|founder/.test(t)) return 3;
+    if (/recruit|talent|sourcer|\bta\b|people|human resources|\bhr\b|staffing|acquisition/.test(t)) return 2;
+    return 1;
+  }
+
+  // Scrape Jobright's "Insider Connection" panel for the specific people it surfaced.
+  // Depends on the panel exposing linkedin.com/in/ profile links (the "in" button). If
+  // Jobright renders those as JS-only buttons without hrefs we simply capture nothing and
+  // fall back to company-based matching — never guesses a wrong person. Each captured
+  // contact carries its title + a role score so we can aim at the recruiter / hiring
+  // manager for THIS role (the people with a say on getting the interview) first.
+  function captureInsiderConnections() {
+    try {
+      if (!isJobright()) return [];
+      const links = (typeof window.__uaDeepQueryAll === 'function')
+        ? window.__uaDeepQueryAll('a[href*="linkedin.com/in/"]')
+        : [...document.querySelectorAll('a[href*="linkedin.com/in/"]')];
+      const seen = new Set(), out = [];
+      for (const a of links) {
+        const m = (a.getAttribute('href') || '').match(/linkedin\.com\/in\/([^/?#]+)/i);
+        if (!m) continue;
+        const slug = m[1].toLowerCase();
+        if (seen.has(slug)) continue; seen.add(slug);
+        // Name/title from the card around the link (best-effort).
+        const card = a.closest('li,[class*="card"],[class*="connection"],[class*="item"],div') || a;
+        const name = ((card.querySelector('[class*="name"],b,strong,h3,h4')?.textContent) || a.textContent || '').trim().slice(0, 60);
+        // Title/headline sits near the name in the card; grab the fuller card text minus
+        // the name so scoreContactRole can spot "Recruiter" / "Engineering Manager" etc.
+        let title = (card.querySelector('[class*="title"],[class*="headline"],[class*="position"],[class*="role"],[class*="subtitle"]')?.textContent || '').trim();
+        if (!title) { const ct = (card.textContent || '').replace(name, ' ').replace(/\s+/g, ' ').trim(); title = ct.slice(0, 120); }
+        const score = scoreContactRole(title);
+        out.push({ profile: slug, name, title: title.slice(0, 120), score, ts: Date.now() });
+      }
+      // Best contacts first: hiring managers, then recruiters, then everyone else.
+      out.sort((a, b) => b.score - a.score);
+      return out;
+    } catch (_) { return []; }
+  }
+
+  // Capture the insiders on the CURRENT Jobright job page and stash them (with the job's
+  // role) so recordApplication — which fires later on the ATS page — can attach them to the
+  // follow-up queue item. Recency-matched: an application submitted shortly after viewing a
+  // Jobright job belongs to the insiders we just saw.
+  async function stashInsidersFromJobright(role) {
+    try {
+      if (!isJobright()) return;
+      const contacts = captureInsiderConnections();
+      if (!contacts.length) return;
+      await st.set('ua_pending_insiders', { role: role || '', contacts, ts: Date.now() });
+      LOG(`Captured ${contacts.length} insider contact(s) from Jobright (top: ${contacts[0].name || contacts[0].profile})`);
+    } catch (_) {}
   }
 
   function extractCompanyFromUrl(url) {
@@ -6559,7 +6744,7 @@
         || /create (an )?account|register|sign ?up/i.test((document.body.innerText || '').toLowerCase().slice(0, 4000));
       // Tick EVERY unchecked visible checkbox on an auth page — these are the consent /
       // "Agree to Privacy Notice" boxes that keep the Create Account button disabled.
-      const tickConsents = () => $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked) realClick(c); });
+      const tickConsents = () => $$('input[type=checkbox]').filter(isVisible).forEach(c => { if (!c.checked && !isMarketingCheckbox(c)) realClick(c); });
       tickConsents();
       await sleep(400);
       // Wait for the submit button to actually ENABLE (Workday disables "Create
@@ -6652,9 +6837,15 @@
     // where we click "Apply" to reveal the form). Skipping was the #1 reason the
     // CSV queue "did nothing" on many sites.
     const runnerActive = qActive && isRunnerTab();
-    // Never bail on an ATS page when Fully Automated is ON — we must mount + drive there.
-    const fullAutoOnATS = autoApply && (detectATS() || isWorkday());
-    if (!runnerActive && !fullAutoOnATS && typeof window.__uaIsEligiblePage === 'function' && !window.__uaIsEligiblePage()) return;
+    // Whether this page is genuinely a job application (known ATS host, or a page that
+    // actually READS like a job application — not just a "/apply" URL or a PDF upload).
+    const eligible = typeof window.__uaIsEligiblePage !== 'function' || window.__uaIsEligiblePage();
+    // Never bail when a queue is running here, or when Fully Automated is ON AND the page
+    // is a real job application. We deliberately require `eligible` here now — a bare
+    // detectATS() 'Career' match on a /apply URL is NOT enough — so Fully Automated can't
+    // mount+drive on non-job forms (loan/membership/contact pages) and hallucinate answers.
+    const fullAutoOnATS = autoApply && eligible && (detectATS() || isWorkday());
+    if (!runnerActive && !fullAutoOnATS && !eligible) return;
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
@@ -6674,7 +6865,10 @@
     // below already drives dispatchATSAutomation itself (with its own verify/retry
     // loop). Running both would fire the whole apply flow TWICE on the same page,
     // risking a double submit / race between the two runs.
-    if (autoApply && !runnerActive && (ats || isWorkday())) {
+    // Gate the auto-run on `eligible` too: on a real ATS host / genuine job-application
+    // page only. Without this, detectATS()'s broad generic "Career" pattern (any URL with
+    // /apply, /jobs, /careers) would let Fully Automated fill non-job forms.
+    if (autoApply && !runnerActive && eligible && (ats || isWorkday())) {
       LOG(`Fully Automated: starting full automation for ${ats || 'Workday'}`);
       await sleep(1500);
       await dispatchATSAutomation();
@@ -6684,7 +6878,13 @@
     // the Create Account / Sign In step. When OFF we stay out of the way and let
     // Jobright's native flow handle it, so the toggle is the single source of truth.
     if (isWorkday() && (autoApply || runnerActive)) startWorkdayAccountWatch();
-    if (isJobright()) { await sleep(2000); resumeTailoringAutomation(); }
+    if (isJobright()) {
+      await sleep(2000); resumeTailoringAutomation();
+      // Capture Jobright's Insider Connections (recruiter/hiring manager for this role) so a
+      // follow-up can be aimed at the exact person. Re-capture as the panel loads/expands.
+      const roleGuess = ((document.querySelector('h1, [class*="job-title"], [class*="jobTitle"]')?.textContent) || '').trim().slice(0, 80);
+      [1500, 4000, 8000].forEach(ms => setTimeout(() => stashInsidersFromJobright(roleGuess), ms));
+    }
     // Auto-learn: capture user-filled fields for future autofills
     document.addEventListener('focusout', (e) => {
       const el = e.target;
@@ -6844,25 +7044,47 @@
   // (file input present). Pure browsing paths stay inert.
   const MIXED_USE_HOSTS = /(^|\.)(linkedin\.com|indeed\.com|glassdoor\.com|monster\.com|ziprecruiter\.com|dice\.com|simplyhired\.com|wellfound\.com|angel\.co|builtin\.com|otta\.com|welcometothejungle\.com)$/i;
   let cached = null;
+  // A resume/CV upload input — but ONLY when it's specifically a resume/CV field, not any
+  // generic PDF/DOC upload (a tax form, an ID upload, a "supporting document" dropzone).
+  // A bare accept="pdf" input is NOT enough on its own — it must name resume/cv, or the
+  // page must otherwise read like a job application (see jobTextSignal below).
   function hasResumeFileInput() {
     try {
-      return !!document.querySelector('input[type=file][accept*="pdf" i], input[type=file][accept*="doc" i], input[type=file][name*="resume" i], input[type=file][name*="cv" i], input[type=file][id*="resume" i], input[type=file][id*="cv" i], input[type=file][aria-label*="resume" i], input[type=file][aria-label*="cv" i]');
+      return !!document.querySelector('input[type=file][name*="resume" i], input[type=file][name*="cv" i], input[type=file][id*="resume" i], input[type=file][id*="cv" i], input[type=file][aria-label*="resume" i], input[type=file][aria-label*="cv" i], input[type=file][data-automation-id*="resume" i]');
+    } catch (_) { return false; }
+  }
+  function hasGenericFileUpload() {
+    try { return !!document.querySelector('input[type=file][accept*="pdf" i], input[type=file][accept*="doc" i]'); } catch (_) { return false; }
+  }
+  // Does the page CONTENT actually read like a JOB application? This is what stops us
+  // treating a loan/membership/"apply" form, a contact form, or any generic PDF-upload
+  // page as a job application and hallucinating job answers into it. Requires real
+  // job-application phrasing, not just a "/apply" in the URL.
+  function jobTextSignal() {
+    try {
+      const t = ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 30000);
+      if (!t) return false;
+      return /(apply for (this|the) (job|position|role|opening|vacancy)|cover letter|work authoriz|authoriz(ed|ation) to work|require (visa )?sponsorship|visa sponsorship|years of (relevant |related )?experience|equal employment opportunity|\beeo\b|veteran status|disability status|voluntary self.?identif|desired salary|salary expectation|salary requirement|notice period|willing to relocate|how did you hear about (us|this)|position (applied|being applied) for|are you legally (authorized|eligible)|upload (your )?(resume|cv|c\.v\.)|attach (your )?(resume|cv)|employment history|work experience|job title|hiring manager|job requisition|req(uisition)? (id|number))/.test(t);
     } catch (_) { return false; }
   }
   window.__uaIsEligiblePage = function () {
     if (cached !== null) return cached;
     try {
       const h = (location.hostname || '').toLowerCase();
+      // Known end-to-end ATS hosts are definitely job sites — always eligible.
+      if (ATS_HOSTS.test(h)) { cached = true; return true; }
       if (MIXED_USE_HOSTS.test(h)) {
-        // LinkedIn/Indeed/etc. — only eligible inside an Easy-Apply-style modal
-        cached = hasResumeFileInput();
+        // LinkedIn/Indeed/etc. — only inside an actual apply flow (resume field + job text).
+        cached = (hasResumeFileInput() || hasGenericFileUpload()) && jobTextSignal();
         return cached;
       }
-      if (ATS_HOSTS.test(h)) { cached = true; return true; }
-      if (CAREER_PATH.test(location.pathname || '')) { cached = true; return true; }
-      if (hasResumeFileInput()) { cached = true; return true; }
-      cached = false;
-      return false;
+      // Everywhere else: a career-ish URL OR a resume upload is a HINT, but we require the
+      // page to actually READ like a job application before activating. This is the fix for
+      // the extension filling non-job forms (loan/membership "apply" pages, contact forms,
+      // generic document-upload pages) that merely had "/apply" in the URL or a PDF input.
+      const hint = CAREER_PATH.test(location.pathname || '') || hasResumeFileInput() || hasGenericFileUpload();
+      cached = (hint && jobTextSignal()) || (hasResumeFileInput() && CAREER_PATH.test(location.pathname || ''));
+      return cached;
     } catch (_) { cached = false; return false; }
   };
   // Recompute once the DOM has been parsed (document_start content scripts run
@@ -10362,4 +10584,279 @@ a[href*="/checkout" i],
     }
   } catch (_) {}
   log('candidate-profile snapshot watcher active');
+})();
+
+// ============================================================================
+// === LINKEDIN RECRUITER FOLLOW-UP (auto-send after applying) ===
+// After a confirmed application, a follow-up for {company, role} is queued (see
+// enqueueFollowUp in the main module). This module runs on linkedin.com: when you
+// land on the profile of someone whose CURRENT company matches a pending follow-up,
+// and auto-send is enabled, it composes a short personalized note and sends it.
+//
+// IMPORTANT / HONEST NOTE: automating LinkedIn messaging is against LinkedIn's User
+// Agreement and can get an account restricted or banned — Premium raises message
+// LIMITS, not automation PERMISSION. To reduce that risk this is OFF by default and
+// heavily throttled: a per-day cap, a randomized delay between sends, and dedupe so
+// the same person is never messaged twice. You stay in control of WHO by choosing
+// which profiles to open (e.g. via Jobright's "Insider Connections").
+// ============================================================================
+(function () {
+  'use strict';
+  const TAG = '[UA-LinkedIn]';
+  const log = (...a) => { try { console.log(TAG, ...a); } catch (_) {} };
+  if (!/(^|\.)linkedin\.com$/i.test(location.hostname)) return;
+  if (window.top !== window.self) return;
+
+  const S = {
+    get: k => new Promise(r => { try { chrome.storage.local.get(k, d => r(d[k])); } catch (_) { r(undefined); } }),
+    set: (k, v) => new Promise(r => { try { chrome.storage.local.set({ [k]: v }, r); } catch (_) { r(); } }),
+  };
+  const DEFAULT_TEMPLATE =
+    "Hi {first}, I just submitted my application for the {role} role at {company} and wanted to reach out directly. I'm genuinely excited about the opportunity and would welcome the chance to connect. Thank you for your time!";
+  const DEFAULT_CAP = 12;          // max auto-sends per day
+  const MIN_GAP_MS = 45_000;       // minimum gap between two auto-sends
+  const RAND_GAP_MS = 40_000;      // + up to this much random jitter
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // ---------- config ----------
+  async function cfg() {
+    return {
+      enabled: (await S.get('ua_followup_enabled')) === true,
+      template: (await S.get('ua_followup_template')) || DEFAULT_TEMPLATE,
+      cap: (await S.get('ua_followup_daily_cap')) || DEFAULT_CAP,
+    };
+  }
+  async function sentLog() { return (await S.get('ua_followup_sent')) || []; }
+  async function sentToday() { const now = Date.now(); return (await sentLog()).filter(s => now - s.ts < 86_400_000).length; }
+  async function alreadyMessaged(profileKey) { return (await sentLog()).some(s => s.profile === profileKey); }
+  async function markSent(profileKey, company, role) {
+    const l = await sentLog(); l.unshift({ profile: profileKey, company, role, ts: Date.now() });
+    await S.set('ua_followup_sent', l.slice(0, 2000));
+  }
+  async function queue() { return (await S.get('ua_followup_queue')) || []; }
+  async function removeFromQueue(company) {
+    const q = await queue();
+    await S.set('ua_followup_queue', q.filter(f => norm(f.company) !== norm(company)));
+  }
+
+  // ---------- profile parsing ----------
+  function profileKey() { const m = location.pathname.match(/\/in\/([^/]+)/i); return m ? m[1].toLowerCase() : ''; }
+  function firstName() {
+    const h = document.querySelector('h1.text-heading-xlarge, .pv-text-details__left-panel h1, main h1');
+    const full = (h && h.textContent || '').trim();
+    return (full.split(/\s+/)[0] || 'there').replace(/[^a-zA-Z''-]/g, '') || 'there';
+  }
+  // The person's CURRENT company text (headline + top-card subtitle + first experience).
+  function profileCompanyText() {
+    const parts = [];
+    const head = document.querySelector('.text-body-medium.break-words, .pv-text-details__left-panel .text-body-medium');
+    if (head) parts.push(head.textContent || '');
+    // "Current" line in the top card (e.g. a company chip) + first experience entry.
+    document.querySelectorAll('[data-field="experience_company_logo"], .pv-text-details__right-panel, #experience ~ * li:first-child, .pvs-list__item--line-separated:first-child').forEach(e => parts.push(e.textContent || ''));
+    return norm(parts.join(' • ')).slice(0, 800);
+  }
+  function looksLikeRecruiter() {
+    const t = profileCompanyText() + ' ' + norm((document.querySelector('main h1')?.parentElement?.textContent) || '');
+    return /recruit|talent|sourcer|people|human resources|\bhr\b|hiring|staffing|acquisition/.test(t);
+  }
+
+  // ---------- message sending ----------
+  function setContentEditable(box, text) {
+    box.focus();
+    // Clear then insert via execCommand so LinkedIn's React/Draft editor fires its input handlers.
+    try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (_) {}
+    let ok = false;
+    try { ok = document.execCommand('insertText', false, text); } catch (_) {}
+    if (!ok) {
+      box.textContent = text;
+      box.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+    }
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  async function openMessageComposer() {
+    // Already open?
+    let box = document.querySelector('.msg-form__contenteditable[contenteditable="true"]');
+    if (box) return box;
+    // Click the profile "Message" button (Premium opens InMail for non-connections).
+    const btn = [...document.querySelectorAll('button, a')].find(b => {
+      const l = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+      return /^\s*message\b/i.test((b.textContent || '').trim()) || /message [A-Z]/.test(l);
+    });
+    if (!btn) return null;
+    btn.click();
+    for (let i = 0; i < 20; i++) { await sleep(300); box = document.querySelector('.msg-form__contenteditable[contenteditable="true"]'); if (box) return box; }
+    return null;
+  }
+  function findSendButton(box) {
+    const scope = box.closest('.msg-form, .msg-overlay-conversation-bubble, form') || document;
+    return scope.querySelector('.msg-form__send-button:not([disabled]), button[type="submit"].msg-form__send-button:not([disabled])')
+      || [...scope.querySelectorAll('button')].find(b => /^\s*send\s*$/i.test(b.textContent || '') && !b.disabled);
+  }
+  async function sendMessage(text) {
+    const box = await openMessageComposer();
+    if (!box) { log('No message composer found on this profile'); return false; }
+    await sleep(600 + Math.random() * 800);
+    setContentEditable(box, text);
+    await sleep(900 + Math.random() * 900); // let the Send button enable + look human
+    const send = findSendButton(box);
+    if (!send) { log('Send button not found / disabled'); return false; }
+    send.click();
+    log('Follow-up message sent');
+    return true;
+  }
+
+  // ---------- driver ----------
+  let _lastSendAt = 0;
+  let _busy = false;
+  // LazyApply-style: on a LinkedIn JOB page, LinkedIn's "Meet the hiring team" card
+  // explicitly names the recruiter/job-poster and gives a direct Message button. That's
+  // a far more reliable target than guessing from an arbitrary profile — so prefer it.
+  function jobPageCompany() {
+    const el = document.querySelector('.job-details-jobs-unified-top-card__company-name, .jobs-unified-top-card__company-name, [class*="company-name"] a, .topcard__org-name-link');
+    return el ? (el.textContent || '').trim() : '';
+  }
+  function hiringTeamCard() {
+    // The card lives in the right rail / details; find a container that mentions the
+    // hiring team and contains a profile link + a Message affordance.
+    const cards = [...document.querySelectorAll('.hirer-card__container, [class*="hirer-card"], .job-details-people-who-can-help__section, section')];
+    for (const card of cards) {
+      const t = (card.textContent || '').toLowerCase();
+      if (!/hiring team|job poster|meet the|who can help|recruiter/.test(t)) continue;
+      const profile = card.querySelector('a[href*="/in/"]');
+      if (profile) return { card, profile };
+    }
+    // Fallback: a standalone job-poster name link.
+    const poster = document.querySelector('.jobs-poster__name a[href*="/in/"], a.jobs-poster__name');
+    if (poster) return { card: poster.closest('section, div') || poster, profile: poster };
+    return null;
+  }
+  async function messageHiringTeam(match, c) {
+    const ht = hiringTeamCard();
+    if (!ht) return false;
+    const pkey = (ht.profile.getAttribute('href') || '').match(/\/in\/([^/?#]+)/i)?.[1]?.toLowerCase() || '';
+    if (!pkey || await alreadyMessaged(pkey)) return false;
+    const first = ((ht.profile.textContent || '').trim().split(/\s+/)[0] || 'there').replace(/[^a-zA-Z''-]/g, '') || 'there';
+    // Prefer a Message button inside the card; else fall back to opening the profile.
+    const msgBtn = [...ht.card.querySelectorAll('button, a')].find(b => /message/i.test((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')));
+    const text = c.template.replace(/\{first\}/gi, first).replace(/\{role\}/gi, match.role || 'the role').replace(/\{company\}/gi, match.company);
+    _lastSendAt = Date.now();
+    if (msgBtn) {
+      msgBtn.click();
+      let box = null;
+      for (let i = 0; i < 20; i++) { await sleep(300); box = document.querySelector('.msg-form__contenteditable[contenteditable="true"]'); if (box) break; }
+      if (!box) { log('Hiring-team Message clicked but composer did not open'); return false; }
+      await sleep(700);
+      setContentEditable(box, text);
+      await sleep(1000 + Math.random() * 800);
+      const send = findSendButton(box);
+      if (!send) { log('Hiring-team composer: send button not ready'); return false; }
+      send.click();
+      log('Follow-up sent to hiring-team contact for ' + match.company);
+      await markSent(pkey, match.company, match.role); await removeFromQueue(match.company);
+      _lastSendAt = Date.now() + Math.random() * RAND_GAP_MS;
+      return true;
+    }
+    return false;
+  }
+
+  async function tick() {
+    if (_busy) return; _busy = true;
+    try {
+      const c = await cfg();
+      renderPanel(c);                     // keep the on-page panel current
+      if (!c.enabled) return;
+      if (Date.now() - _lastSendAt < MIN_GAP_MS) return; // global throttle
+      if (await sentToday() >= c.cap) return;            // daily cap
+      const q = await queue();
+      if (!q.length) return;
+
+      // Path A (preferred): LinkedIn JOB page — message the named hiring-team recruiter.
+      if (/\/jobs\/(view|collections|search)/i.test(location.pathname)) {
+        const co = norm(jobPageCompany());
+        const jm = co && q.find(f => f.company && (co.includes(norm(f.company)) || norm(f.company).includes(co)));
+        if (jm) { if (await messageHiringTeam(jm, c)) { renderPanel(await cfg()); } }
+        return;
+      }
+
+      // Path B: a profile page you opened for someone at an applied-to company.
+      if (!/\/in\//i.test(location.pathname)) return;
+      const pkey = profileKey();
+      if (!pkey || await alreadyMessaged(pkey)) return;  // dedupe
+
+      // B1 (best): this profile IS one of the exact insider contacts Jobright surfaced for a
+      // job we applied to (recruiter / hiring manager for the role). Send with no further
+      // gating — Jobright already vetted that this is the right person to reach.
+      let match = q.find(f => Array.isArray(f.contacts) && f.contacts.some(c => c.profile === pkey));
+      let exact = false;
+      if (match) { exact = true; }
+      else {
+        // B2 (fallback): guess by company text on the profile, and require a recruiter-ish
+        // headline so we don't cold-message a random employee.
+        const ptext = profileCompanyText();
+        match = q.find(f => f.company && ptext.includes(norm(f.company)));
+        if (!match) return;               // this profile isn't at an applied-to company
+        if (!looksLikeRecruiter()) { log('Profile matches ' + match.company + ' but does not look like a recruiter/hiring manager — skipping auto-send'); return; }
+      }
+      if (exact) log('Exact insider match for ' + match.company + ' — messaging the person Jobright surfaced');
+
+      const text = c.template
+        .replace(/\{first\}/gi, firstName())
+        .replace(/\{role\}/gi, match.role || 'the role')
+        .replace(/\{company\}/gi, match.company);
+      _lastSendAt = Date.now();
+      const ok = await sendMessage(text);
+      if (ok) { await markSent(pkey, match.company, match.role); await removeFromQueue(match.company); _lastSendAt = Date.now() + Math.random() * RAND_GAP_MS; renderPanel(await cfg()); }
+    } catch (e) { log('tick error:', e && e.message); }
+    finally { _busy = false; }
+  }
+
+  // ---------- on-page control panel ----------
+  function renderPanel(c) {
+    try {
+      queue().then(q => {
+        let el = document.getElementById('ua-li-followup');
+        if (!q.length && !c.enabled) { if (el) el.remove(); return; }
+        if (!el) {
+          el = document.createElement('div');
+          el.id = 'ua-li-followup';
+          el.style.cssText = 'position:fixed;right:14px;bottom:14px;width:260px;z-index:2147483000;background:#fff;border:1px solid #d0d5dd;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.18);font:12px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;color:#1d2226;overflow:hidden';
+          document.body.appendChild(el);
+        }
+        sentToday().then(st => {
+          el.innerHTML =
+            '<div style="padding:9px 11px;background:#0a66c2;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:space-between">📨 Recruiter Follow-up' +
+            '<label style="display:inline-flex;align-items:center;gap:5px;font-weight:600;font-size:11px;cursor:pointer"><input type="checkbox" id="ua-li-tog" ' + (c.enabled ? 'checked' : '') + '> Auto-send</label></div>' +
+            '<div style="padding:9px 11px">' +
+            '<div style="font-size:10px;color:#666;margin-bottom:6px">Sent today: <b>' + st + '/' + c.cap + '</b> · Pending: <b>' + q.length + '</b></div>' +
+            (c.enabled ? '<div style="font-size:10px;color:#0a66c2;margin-bottom:6px">Open a recruiter/hiring-manager profile at a company you applied to — it will auto-send.</div>'
+                       : '<div style="font-size:10px;color:#b42318;margin-bottom:6px">Off. Turning on auto-sends LinkedIn messages (against LinkedIn ToS — use at your own risk).</div>') +
+            q.slice(0, 5).map(f => {
+              // Prefer the exact insider Jobright surfaced (highest-scoring = recruiter /
+              // hiring manager for the role). Clicking opens THAT profile → auto-send fires.
+              const top = Array.isArray(f.contacts) && f.contacts.length ? f.contacts.slice().sort((a, b) => (b.score || 0) - (a.score || 0))[0] : null;
+              const href = top ? ('https://www.linkedin.com/in/' + encodeURIComponent(top.profile) + '/')
+                               : ('https://www.linkedin.com/search/results/people/?keywords=' + encodeURIComponent(f.company + ' recruiter'));
+              const label = top ? ((top.name ? top.name.split(/\s+/)[0] : 'contact') + ' →') : 'find →';
+              const line = (f.company) + (f.role ? ' · ' + f.role : '');
+              return '<div style="display:flex;justify-content:space-between;gap:6px;padding:4px 0;border-top:1px solid #eee"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (top && top.title ? String(top.title).replace(/"/g, '&quot;') : '') + '">' + line + '</span><a href="' + href + '" target="_self" style="color:#0a66c2;text-decoration:none;flex:0 0 auto">' + label + '</a></div>';
+            }).join('') +
+            '<textarea id="ua-li-tpl" style="width:100%;box-sizing:border-box;margin-top:8px;min-height:54px;border:1px solid #d0d5dd;border-radius:8px;padding:6px;font:11px/1.4 inherit;resize:vertical" placeholder="Message template">' + (c.template).replace(/</g, '&lt;') + '</textarea>' +
+            '<div style="font-size:9px;color:#888;margin-top:3px">Placeholders: {first} {role} {company}</div>' +
+            '</div>';
+          const tog = el.querySelector('#ua-li-tog');
+          if (tog) tog.onchange = () => S.set('ua_followup_enabled', tog.checked).then(() => cfg().then(renderPanel));
+          const tpl = el.querySelector('#ua-li-tpl');
+          if (tpl) tpl.onchange = () => S.set('ua_followup_template', tpl.value);
+        });
+      });
+    } catch (_) {}
+  }
+
+  // Kick off: render the panel and poll for a matching profile.
+  function start() { cfg().then(renderPanel); setInterval(tick, 3500); setTimeout(tick, 1500); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+  log('LinkedIn recruiter follow-up module active');
 })();
