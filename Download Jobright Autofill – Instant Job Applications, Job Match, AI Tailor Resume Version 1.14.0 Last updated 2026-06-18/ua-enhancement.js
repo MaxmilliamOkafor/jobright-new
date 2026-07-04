@@ -757,6 +757,8 @@
     answer = (answer || '').trim();
     if (!question || question.length < 3 || !answer || answer.length > 300) return;
     if (/ssn|social.?security|password|credit.?card|cvv|routing|iban|passport.?number/i.test(question)) return;
+    // Already known with the same answer (change + focusout both fire for one edit) — skip.
+    if (_answerBank[normalizeKey(question)] === answer) return;
     learnAnswer(question, answer);
     const keywords = question.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2).slice(0, 12);
     if (keywords.length >= 2) addSavedResponse(keywords, answer);
@@ -906,10 +908,14 @@
     // corrections — a previously-given human answer always beats the heuristics below.
     const savedAnswer = findSavedResponseMatch(questionText) || getLearnedAnswer(questionText);
     if (savedAnswer) {
-      const match = radios.find(r => {
+      const sNorm = savedAnswer.toLowerCase().trim();
+      const optText = r => {
         const lbl = $(`label[for="${CSS.escape(r.id)}"]`, parent);
-        return (lbl?.textContent || r.value || '').toLowerCase().trim().includes(savedAnswer.toLowerCase());
-      });
+        return (lbl?.textContent || r.value || '').toLowerCase().trim();
+      };
+      // Exact option match first — a saved "No" must not hit "NOt applicable" by substring.
+      const match = radios.find(r => optText(r) === sNorm)
+        || (sNorm.length > 3 ? radios.find(r => optText(r).includes(sNorm)) : null);
       if (match) { realClick(match); return true; }
     }
 
@@ -1313,7 +1319,11 @@
       const learned = findSavedResponseMatch(q) || getLearnedAnswer(q);
       if (learned) {
         const lnorm = learned.toLowerCase().trim();
-        const lm = radios.find(r => { const cl = choiceLabel(r); return cl && (cl === lnorm || cl.includes(lnorm) || (lnorm.includes(cl) && cl.length > 1)); });
+        // Exact label match FIRST — a learned "No" must hit the "No" option, not
+        // "NOt applicable" / "I do NOt wish to answer" via a substring match.
+        const lm = radios.find(r => choiceLabel(r) === lnorm)
+          || radios.find(r => { const cl = choiceLabel(r); return cl && (cl.startsWith(lnorm + ' ') || (lnorm.startsWith(cl) && cl.length > 1)); })
+          || (lnorm.length > 3 ? radios.find(r => (choiceLabel(r) || '').includes(lnorm)) : null);
         if (lm) { _choiceAnsweredAt.set(nq, Date.now()); realClick(lm); n++; await sleep(120); continue; }
       }
       const want = chooseChoiceAnswer(q);
