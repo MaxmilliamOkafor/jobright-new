@@ -1793,7 +1793,7 @@
   // (Robustness techniques adapted from the OptimHire auto-applier for 100% reliability.)
   const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful|you['’]ve\s+applied|you['’]re\s+all\s+set|application\s+is\s+under\s+review/i;
   const SUCCESS_URL_RE = /(thanks|thank.?you|success|confirm|complete|received|submitted|done|applied)/i;
-  const FAILURE_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+(closed|no\s+longer)|posting\s+is\s+closed|application\s+window\s+has\s+closed|page\s+not\s+found|404\s+error)/i;
+  const FAILURE_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+(closed|no\s+longer)|posting\s+is\s+closed|application\s+window\s+has\s+closed|page\s+not\s+found|404\s+error|job\s+posting\s+has\s+expired|posting\s+is\s+no\s+longer\s+available|no\s+longer\s+accepting\s+applications|position\s+has\s+been\s+filled|job\s+has\s+been\s+filled|vacancy\s+(is\s+)?closed)/i;
   let _lastSubmitAt = 0;            // set when our flow clicks a submit/apply button
   const SUBMIT_GRACE_MS = 8000;    // after a submit with no validation error, treat as success
   // A persistent inline validation error means a required field couldn't be satisfied.
@@ -1808,6 +1808,65 @@
   }
   function pageHasFailure() {
     try { return FAILURE_TEXT_RE.test((document.body && document.body.innerText || '').slice(0, 4000)); } catch (_) { return false; }
+  }
+
+  // ===== CAPTCHA GATE (ported from OptimHire 2.6.4) =====
+  // A VISIBLE captcha means no amount of filling/retrying will progress — the only move
+  // is a human solving it. Detect it, pause, tell the user, auto-resume once solved.
+  // Size/visibility filtering keeps the invisible reCAPTCHA v3 badge (which needs no
+  // action) from pausing anything.
+  function detectCaptcha() {
+    try {
+      const PROVIDERS = [
+        ['iframe[src*="recaptcha"],iframe[title*="reCAPTCHA"]', 'reCAPTCHA'],
+        ['iframe[src*="hcaptcha"],iframe[title*="hCaptcha"]', 'hCaptcha'],
+        ['iframe[src*="turnstile"],iframe[src*="challenges.cloudflare.com"]', 'Cloudflare Turnstile'],
+        ['.g-recaptcha[data-sitekey]', 'reCAPTCHA'],
+        ['.h-captcha[data-sitekey]', 'hCaptcha'],
+        ['.cf-turnstile', 'Cloudflare Turnstile'],
+      ];
+      for (const [sel, provider] of PROVIDERS) {
+        for (const el of document.querySelectorAll(sel)) {
+          const r = el.getBoundingClientRect();
+          if (r.width < 60 || r.height < 50) continue; // v3 badge / hidden token frames
+          const cs = getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+          return { provider, el };
+        }
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+  function showCaptchaBanner(provider) {
+    try {
+      let b = document.getElementById('ua-captcha-banner');
+      if (!b) {
+        b = document.createElement('div');
+        b.id = 'ua-captcha-banner';
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#b45309;color:#fff;padding:10px 16px;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.35)';
+        (document.body || document.documentElement).appendChild(b);
+      }
+      b.textContent = `🧩 ${provider || 'Captcha'} detected — please solve it. Automation is paused and resumes automatically once solved.`;
+    } catch (_) {}
+  }
+  function hideCaptchaBanner() { try { document.getElementById('ua-captcha-banner')?.remove(); } catch (_) {} }
+  // Wait (bounded) for the visible captcha to be solved/dismissed. Returns true if clear.
+  async function waitForCaptchaClear(maxMs = 180000) {
+    const start = Date.now();
+    let announced = false;
+    while (Date.now() - start < maxMs) {
+      const c = detectCaptcha();
+      if (!c) { if (announced) { hideCaptchaBanner(); LOG('Captcha cleared — resuming automation'); } return true; }
+      if (!announced) {
+        announced = true;
+        showCaptchaBanner(c.provider);
+        LOG(`CAPTCHA (${c.provider}) detected — automation paused, waiting for manual solve`);
+        try { c.el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+      }
+      await sleep(2000);
+    }
+    hideCaptchaBanner();
+    return !detectCaptcha();
   }
   // Resolve once the DOM has been quiet for ~300ms (or after `timeout`) — so we act on a
   // settled page instead of mid-render. Cuts races on multi-step / React forms.
@@ -2121,6 +2180,9 @@
     for (let page = 1; page <= MAX_PAGES; page++) {
       if (autoStopped()) { LOG('Fully Automated turned off — stopping multi-page loop'); break; }
       if (checkSuccess()) { LOG('Success detected — stopping multi-page loop'); break; }
+      // A visible captcha blocks every next step — pause for the user instead of
+      // burning the page budget on retries that can't succeed.
+      if (detectCaptcha()) await waitForCaptchaClear();
       LOG(`Multi-page: processing page ${page}`);
 
       // Wait for page content to change
@@ -4398,11 +4460,19 @@
         if (onCurrentJobPage(c)) {
           // LazyApply: start timeout timer — auto-skip if job stalls
           clearTimeout(_qTimeoutId);
-          _qTimeoutId = setTimeout(async () => {
+          const onJobTimeout = async () => {
             // Guard: if the main flow already finalized this job (done/failed/skipped)
             // in the meantime, do nothing — otherwise the timeout would also call
             // goNext(), double-advancing and silently SKIPPING the next queued job.
             if (c.status !== 'applying') return;
+            // A visible captcha is a HUMAN wait, not a stuck page — extend instead of
+            // skipping so the job isn't thrown away while the user solves it.
+            if (detectCaptcha()) {
+              LOG('Queue: captcha visible at timeout — extending 60s for manual solve');
+              showCaptchaBanner(detectCaptcha()?.provider);
+              _qTimeoutId = setTimeout(onJobTimeout, 60000);
+              return;
+            }
             LOG(`Queue: job timed out after ${qTimeout / 1000}s — auto-skipping`);
             c.status = 'timeout';
             c.error = `Timed out after ${qTimeout / 1000}s`;
@@ -4411,7 +4481,8 @@
             await saveQ(); await saveStats();
             renderQ(); updateCtrl();
             goNext();
-          }, qTimeout);
+          };
+          _qTimeoutId = setTimeout(onJobTimeout, qTimeout);
 
           // LazyApply-style: never re-apply to a job already applied to before.
           if (qSkipApplied && alreadyApplied(c.url)) {
@@ -4430,6 +4501,9 @@
           // page, skip it quickly instead of burning minutes on retries.
           await openApplicationForm();
           await handleAccountAuth();
+          // Captcha gate: pause here (not skip) until the user solves it — sign-in and
+          // apply pages are the most common places one appears.
+          if (detectCaptcha()) await waitForCaptchaClear();
           if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess()) {
             await sleep(2500); // one short grace period for slow SPAs
             await openApplicationForm();
@@ -4467,6 +4541,8 @@
             // Verify submission (poll for a confirmation signal).
             for (let check = 0; check < 6; check++) {
               await sleep(2000);
+              // A captcha popping up post-submit blocks confirmation — wait it out.
+              if (detectCaptcha()) { await waitForCaptchaClear(); continue; }
               if (confirmSubmitted()) { success = true; break; }
               if (pageHasFailure()) { LOG('Failure signal during verify — stopping'); break; }
             }
