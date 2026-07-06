@@ -31,8 +31,12 @@
     "tabs",
     "cookies",
     "activeTab",
-    "scripting"
+    "scripting",
+    "sidePanel"
   ],
+  "side_panel": {
+    "default_path": "ua-queue.html"
+  },
   "content_scripts": [
     {
       "matches": [
@@ -128,7 +132,9 @@
         "constants.90d51f50.js",
         "filler.17f3ba95.js",
         "ua-enhancement.js",
-        "scroll-to-anchor.45fefb1b.js"
+        "scroll-to-anchor.45fefb1b.js",
+        "ua-queue.html",
+        "ua-queue.js"
       ]
     }
   ]
