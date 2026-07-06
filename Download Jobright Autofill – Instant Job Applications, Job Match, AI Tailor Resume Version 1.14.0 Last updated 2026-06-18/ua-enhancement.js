@@ -9845,7 +9845,9 @@ a[href*="/checkout" i],
     } catch (_) {}
   }
   attachShadowObservers();
-  setInterval(attachShadowObservers, 1500);
+  // This walks the ENTIRE DOM + shadow tree every tick to wire observers for Jobright's
+  // own sidebar modal — pointless (and costly on big forms) off jobright.ai.
+  if (/jobright\.ai/i.test(location.hostname)) setInterval(attachShadowObservers, 1500);
 })();
 
 // ===================== WORK AUTHORIZATION PICKER + AUTO-ANSWER =====================
@@ -10263,6 +10265,12 @@ a[href*="/checkout" i],
   } catch (_) {}
 
   // ---- 2. Tear down the popup if it already opened ----
+  // This whole machine hunts Jobright's OWN "out of credits" modal, which lives in
+  // Jobright's sidebar. It has no business sweeping a third-party ATS form — and its
+  // querySelectorAll('div,span,p') sweep over the document + every iframe + every shadow
+  // root, every 800ms, was the main cause of "Page Unresponsive" on heavy forms like
+  // Workable. Restrict the expensive sweeps to jobright.ai.
+  const KP_IS_JR = /jobright\.ai/i.test(location.hostname);
   const POPUP_TEXT = [
     /remaining\s+autofill\s+credits/i,
     /credits?\s+will\s+be\s+refilled/i,
@@ -10289,7 +10297,8 @@ a[href*="/checkout" i],
       }
       // Also kill any element whose own innermost text matches the popup
       // copy, in case Jobright moves the modal under a new wrapper class.
-      const all = scope.querySelectorAll ? scope.querySelectorAll('div,span,p') : [];
+      // EXPENSIVE full-tree text sweep — jobright.ai only (see note above).
+      const all = (KP_IS_JR && scope.querySelectorAll) ? scope.querySelectorAll('div,span,p') : [];
       for (const el of all) {
         if (el.children && el.children.length > 0) continue;
         const t = (el.textContent || '').trim();
@@ -10313,6 +10322,10 @@ a[href*="/checkout" i],
   }
   function killAll() {
     try { killPopup(document); } catch (_) {}
+    // The Jobright credit popup only appears inside Jobright's own sidebar, so the
+    // iframe + full shadow-tree sweeps (very expensive on big ATS forms) are pointless
+    // off jobright.ai. Skip them there — this is the core "Page Unresponsive" fix.
+    if (!KP_IS_JR) return;
     // Iframes (the autofill flow runs in iframes for some ATS sites)
     try {
       for (const f of document.querySelectorAll('iframe')) {
