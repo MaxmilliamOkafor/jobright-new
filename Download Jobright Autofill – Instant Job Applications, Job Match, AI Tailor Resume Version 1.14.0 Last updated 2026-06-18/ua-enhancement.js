@@ -6839,11 +6839,18 @@
   // ===================== OBSERVER =====================
   let _sbInjectThrottle = 0;
   function observe() {
+    // Debounced: coalesce mutation bursts so hideCredits/injectSidebarUI run at most
+    // once per ~300ms instead of on every single DOM change (a fast autofill on a big
+    // form generates thousands of mutations — running these per-mutation froze the tab).
+    let _obsT = null;
     const o = new MutationObserver(() => {
-      hideCredits();
-      // Re-attach the in-sidebar bulk-apply UI when Jobright (re)renders its panel.
-      const now = Date.now();
-      if (now - _sbInjectThrottle > 400) { _sbInjectThrottle = now; injectSidebarUI(); }
+      if (_obsT) return;
+      _obsT = setTimeout(() => {
+        _obsT = null;
+        hideCredits();
+        const now = Date.now();
+        if (now - _sbInjectThrottle > 400) { _sbInjectThrottle = now; injectSidebarUI(); }
+      }, 300);
     });
     o.observe(document.body || document.documentElement, { childList: true, subtree: true });
     // Safety net: periodic re-inject in case the sidebar mounts without mutations
@@ -9801,8 +9808,12 @@ a[href*="/checkout" i],
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tick, { once: true });
   else tick();
   try {
-    // Document-level observer (catches modals rendered into the page DOM)
-    const mo = new MutationObserver(() => tick());
+    // Document-level observer (catches modals rendered into the page DOM).
+    // Debounced: a burst of mutations (e.g. our own fast autofill) coalesces into a
+    // single handler run instead of firing per-mutation — which was pegging the main
+    // thread to "Page Unresponsive" on heavy forms.
+    let _moT = null;
+    const mo = new MutationObserver(() => { if (_moT) return; _moT = setTimeout(() => { _moT = null; tick(); }, 350); });
     mo.observe(document.documentElement, { childList: true, subtree: true });
   } catch (_) {}
   // Polling fallback — the modal often lives inside the Plasmo sidebar
@@ -10169,7 +10180,10 @@ a[href*="/checkout" i],
     processAll();
   }
   try {
-    const mo = new MutationObserver(() => { processAll(); });
+    // Debounced so a mutation storm (our autofill / SPA re-render) can't call
+    // processAll per-mutation and freeze the page.
+    let _paT = null;
+    const mo = new MutationObserver(() => { if (_paT) return; _paT = setTimeout(() => { _paT = null; processAll(); }, 350); });
     mo.observe(document.documentElement, { childList: true, subtree: true });
   } catch (_) {}
   // Polling fallback for SPAs and shadow-root forms.
@@ -10325,10 +10339,13 @@ a[href*="/checkout" i],
     killAll();
   }
   try {
-    const mo = new MutationObserver(() => killAll());
+    // killAll REMOVES nodes, so an undebounced observer fed its own removals back to
+    // itself — a self-sustaining mutation storm that froze the page. Debounce it.
+    let _kaT = null;
+    const mo = new MutationObserver(() => { if (_kaT) return; _kaT = setTimeout(() => { _kaT = null; killAll(); }, 350); });
     mo.observe(document.documentElement, { childList: true, subtree: true });
   } catch (_) {}
-  setInterval(killAll, 600);
+  setInterval(killAll, 800);
 
   // ---- 3. Soften Jobright autofill API 402 responses to 200 (best-effort) ----
   // The actual AI generation is server-gated, so this won't make the AI
@@ -10801,7 +10818,8 @@ a[href*="/checkout" i],
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tick, { once: true });
   else tick();
   try {
-    const mo = new MutationObserver(() => tick());
+    let _aiT = null;
+    const mo = new MutationObserver(() => { if (_aiT) return; _aiT = setTimeout(() => { _aiT = null; tick(); }, 400); });
     mo.observe(document.documentElement, { childList: true, subtree: true });
   } catch (_) {}
   setInterval(tick, 1500);
