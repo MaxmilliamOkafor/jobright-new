@@ -3566,6 +3566,12 @@
   }
 
   // ===================== WORKABLE AUTOMATION =====================
+  // Modeled on OptimHire 2.2.8's workableAutofill(): a bounded, single-pass fill of the
+  // known fields, THEN answer every custom question (the sponsorship/authorization
+  // dropdowns, yes/no knockouts, and free-text prompts that were being skipped — which is
+  // why the checklist stayed empty), THEN commit required fields and click "Submit
+  // application". No re-scanning loops of our own — the outer multiPageLoop handles any
+  // second page.
   async function workableAutomation() {
     LOG('Workable automation starting...');
     const p = await getProfile();
@@ -3573,30 +3579,108 @@
 
     const form = await waitFor('.application-form,form[data-ui="application-form"],form', 10000);
     if (!form) { LOG('No Workable form found'); await directAutofillFlow(); return; }
-    await sleep(1500);
+    await sleep(1200);
 
-    // Workable uses data-ui attributes
+    // 1) Known fields (data-ui + name + aria-label fallbacks). Fill each once.
     const wkFields = {
-      'input[data-ui="firstname"],input[name="firstname"]': p.first_name || p.firstName || '',
-      'input[data-ui="lastname"],input[name="lastname"]': p.last_name || p.lastName || '',
-      'input[data-ui="email"],input[name="email"]': p.email || '',
-      'input[data-ui="phone"],input[name="phone"]': p.phone || '',
-      'input[data-ui="address"],input[name="address"]': p.address || '',
-      'input[data-ui="city"],input[name="city"]': p.city || '',
-      'textarea[data-ui="cover_letter"],textarea[name="cover_letter"]': p.cover_letter || DEFAULTS.cover,
+      'input[data-ui="firstname"],input[name="firstname"],input[aria-label*="First name" i]': p.first_name || p.firstName || '',
+      'input[data-ui="lastname"],input[name="lastname"],input[aria-label*="Last name" i]': p.last_name || p.lastName || '',
+      'input[data-ui="email"],input[name="email"],input[type="email"]': p.email || '',
+      'input[data-ui="phone"],input[name="phone"],input[type="tel"]': p.phone || '',
+      'input[data-ui="address"],input[name="address"],input[aria-label*="Address" i]': p.address || p.city || '',
+      'input[data-ui="city"],input[name="city"],input[aria-label*="City" i]': p.city || '',
+      'input[name="region"],input[aria-label*="State" i],input[aria-label*="Estado" i]': p.state || p.region || '',
+      'textarea[data-ui="cover_letter"],textarea[name="cover_letter"],textarea[aria-label*="cover" i]': p.cover_letter || DEFAULTS.cover,
     };
     for (const [sels, val] of Object.entries(wkFields)) {
       if (!val) continue;
       for (const sel of sels.split(',')) {
         const el = $(sel.trim());
-        if (el && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(80); break; }
+        if (el && isVisible(el) && !el.value?.trim()) { el.focus({ preventScroll: true }); nativeSet(el, val); await sleep(70); break; }
       }
     }
-
     await fixPhoneCountryCode();
-    await tailorFirstFlow();
+
+    // 2) Answer the custom questions Workable renders as native selects, react-select
+    //    dropdowns, radio/button groups, and free-text prompts. This is the part that was
+    //    missing — the semantic matchers map decisions onto the real option wording.
+    await resolveLocationFields();
+    await answerChoiceGroups();            // radios (sponsorship/authorization etc.)
+    await answerButtonStyleQuestions(p);   // button / role=option groups + opened dropdowns
+    await answerNativeSelects(p);          // native <select> knockouts (decision-aware)
+    await answerWorkableDropdowns(p);      // Workable react-select comboboxes
+    await fillOpenTextPrompts(p);          // "Please elaborate on your experience…" textareas
+    await sleep(300);
+
+    // 3) Guarantee anything still required (School default, remaining selects/checkboxes),
+    //    then submit. The outer multiPageLoop picks up any confirmation/second step.
+    await guaranteeRequiredFields();
+    await handleValidationErrors();
+    await sleep(400);
+    const r = await autoSubmitOrNext();
+    LOG('Workable automation complete (' + (r || 'no-submit') + ')');
     learnFromFilledFields();
-    LOG('Workable automation complete');
+  }
+
+  // Fill Workable's native <select> knockouts using the decision-aware picker.
+  async function answerNativeSelects(p) {
+    for (const sel of $$('select').filter(el => isVisible(el) && !hasFieldValue(el))) {
+      const lbl = getLabel(sel);
+      const opt = selectOptionForQuestion(sel, lbl, p);
+      if (opt) { setSelectValue(sel, opt.value); await sleep(80); }
+    }
+  }
+
+  // Workable custom dropdowns (react-select style: a control you click to open a listbox).
+  // Open each unfilled one, read the rendered options, and pick the decision-mapped option.
+  async function answerWorkableDropdowns(p) {
+    const controls = $$('[class*="Select__control"],[class*="select__control"],[role="combobox"],[aria-haspopup="listbox"]')
+      .filter(el => isVisible(el));
+    for (const ctrl of controls) {
+      try {
+        // Skip if it already shows a chosen value.
+        const shown = ctrl.querySelector('[class*="singleValue"],[class*="single-value"]');
+        if (shown && shown.textContent.trim()) continue;
+        const lbl = getLabel(ctrl) || getFullQuestionText(ctrl);
+        realClick(ctrl);
+        const listSel = '[class*="option"],[role="option"],li[role="option"]';
+        const first = await waitFor(listSel, 1200);
+        if (!first) { continue; }
+        const opts = $$(listSel).filter(isVisible);
+        if (!opts.length) continue;
+        const texts = opts.map(o => (o.textContent || '').trim());
+        let decision = determineYesNo(lbl || '');
+        if (decision === 'eeo') decision = /hispanic|latino/i.test(lbl || '') ? 'no' : 'decline';
+        let idx = decision ? optionIndexForDecision(texts, decision) : -1;
+        // Non-binary dropdown → try a value/keyword match instead of forcing yes/no.
+        if (idx < 0) {
+          const val = guessFieldValue(lbl, p, ctrl);
+          if (val) { const v = val.toLowerCase(); idx = texts.findIndex(t => t.toLowerCase() === v); if (idx < 0) idx = texts.findIndex(t => t.toLowerCase().includes(v)); }
+        }
+        if (idx >= 0 && opts[idx]) { realClick(opts[idx]); await sleep(200); }
+        else { // close the menu without picking to avoid leaving it open
+          realClick(ctrl); await sleep(100);
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Free-text "Please elaborate on your experience…" prompts (required textareas Workable
+  // won't submit without). Prefer a learned/saved answer; else a concise professional
+  // paragraph derived from the prompt so it's relevant, never blank.
+  async function fillOpenTextPrompts(p) {
+    for (const ta of $$('textarea').filter(el => isVisible(el) && !el.value?.trim())) {
+      const lbl = getLabel(ta) || '';
+      if (/cover/i.test(lbl)) continue; // handled above
+      let val = findSavedResponseMatch(getFullQuestionText(ta)) || getLearnedAnswer(lbl, ta, true);
+      if (!val) {
+        const topic = lbl.replace(/please\s+elaborate\s+on\s+(your\s+)?/i, '').replace(/[?.]+$/, '').trim();
+        val = topic
+          ? `I have hands-on, professional experience with ${topic.slice(0, 140)}. In previous roles I applied these skills to deliver reliable, high-quality results, and I am confident I can bring the same value to your team.`
+          : DEFAULTS.cover;
+      }
+      ta.focus({ preventScroll: true }); nativeSet(ta, val); await sleep(80);
+    }
   }
 
   // ===================== INDEED EASY APPLY =====================
