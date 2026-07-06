@@ -2675,6 +2675,56 @@
   }
 
   // SpeedyApply Workday: education section fill (enhanced with iCIMS dropdowns + multi-entry)
+  // Workday "School or University" is a SEARCHABLE TYPEAHEAD. Setting .value alone leaves
+  // it uncommitted (stays required/red) — you must type, let Workday query, then SELECT an
+  // option. When the school isn't in Workday's list (dropdown shows "No Items"), you must
+  // pick "Not Listed" exactly as the page instructs. This commits it robustly, and never
+  // blurs mid-search (blur closes the suggestion list).
+  async function commitWorkdaySchool(input, schoolName) {
+    if (!input || !isVisible(input)) return false;
+    const name = (schoolName || '').trim();
+    const typeNoBlur = (text) => {
+      try {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        input.focus({ preventScroll: true });
+        if (setter) setter.call(input, text); else input.value = text;
+        input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+      } catch (_) {}
+    };
+    const optionEls = () => $$('[role="option"],[data-automation-id="promptOption"],[data-automation-id="menuItem"],[data-automation-id="promptLeafNode"],ul[role="listbox"] li')
+      .filter(el => isVisible(el) && (el.textContent || '').trim() && !/^\s*no items\b/i.test((el.textContent || '').trim()));
+    const waitOptions = async (ms) => { const dl = Date.now() + ms; let o = optionEls(); while (!o.length && Date.now() < dl) { await sleep(150); o = optionEls(); } return o; };
+    const pick = (opts, matcher) => { const m = opts.find(matcher); if (m) { realClick(m); return true; } return false; };
+
+    // 1) The real school name → select a matching suggestion.
+    if (name) {
+      typeNoBlur(name);
+      const opts = await waitOptions(2500);
+      const words = name.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+      if (pick(opts, o => { const t = (o.textContent || '').toLowerCase(); return t.includes(name.toLowerCase()) || (words.length && words.every(w => t.includes(w))) || words.some(w => t.includes(w)); })) { await sleep(400); return true; }
+    }
+    // 2) Not found → "Not Listed" (the page's own instruction).
+    typeNoBlur('Not Listed');
+    let opts = await waitOptions(2000);
+    if (pick(opts, o => /not listed|not on (the )?list|none of|^\s*other\s*$/i.test((o.textContent || '').trim()))) { await sleep(400); return true; }
+    // 3) Open the field's picklist (☰) and choose Not Listed there.
+    const menuBtn = (input.closest('[data-automation-id="formField-school"],[data-automation-id^="education-"],div') || document)
+      .querySelector('button[aria-haspopup="listbox"],button[data-automation-id="promptOption"],button[aria-label*="search" i]');
+    if (menuBtn && isVisible(menuBtn)) { realClick(menuBtn); opts = await waitOptions(1500); if (pick(opts, o => /not listed|^\s*other\s*$/i.test((o.textContent || '').trim()))) { await sleep(400); return true; } }
+    // 4) Last resort: take the first real suggestion for the name so it's never left blank/invalid.
+    if (name) { typeNoBlur(name); opts = await waitOptions(1500); if (opts[0]) { realClick(opts[0]); await sleep(300); return true; } }
+    return false;
+  }
+
+  // True when a Workday school typeahead already has a committed selection (a pill chip),
+  // so we don't re-commit / overwrite it.
+  function workdaySchoolCommitted(input) {
+    const c = input.closest('[data-automation-id="formField-school"],[data-automation-id^="education-"],div');
+    return !!(c && c.querySelector('[data-automation-id="selectedItem"],[data-automation-id="DELETE_charm"],[class*="multiValue"],[data-automation-id="pill"]'));
+  }
+
   async function workdayFillEducation(p) {
     // Click "Add Education" if no education section exists yet
     const addEduBtn = $('button[data-automation-id="btnAddEducationHistory"],button[data-automation-id="add-button"]');
@@ -2688,11 +2738,8 @@
 
     // Strategy 1: Modern Workday data-automation-id inputs
     const schoolInput = $('input[data-automation-id="school"], [data-automation-id="formField-school"] input');
-    if (schoolInput && !schoolInput.value && school) {
-      nativeSet(schoolInput, school); await sleep(500);
-      // Handle autocomplete dropdown (type → wait → click match)
-      const autoList = await waitFor('[data-automation-id="school"] [role="listbox"] li, [role="option"]', 1500);
-      if (autoList) { realClick(autoList); await sleep(300); }
+    if (schoolInput && !workdaySchoolCommitted(schoolInput)) {
+      await commitWorkdaySchool(schoolInput, school);
     }
     const degreeInput = $('input[data-automation-id="degree"], [data-automation-id="formField-degree"] input');
     if (degreeInput && !degreeInput.value) nativeSet(degreeInput, degree);
@@ -2750,7 +2797,7 @@
         const sec = eduSections[i];
         const entry = eduEntries[i] || {};
         const secSchool = sec.querySelector('input[data-automation-id="school"]');
-        if (secSchool && !secSchool.value && (entry.school || school)) { nativeSet(secSchool, entry.school || school); await sleep(100); }
+        if (secSchool && !workdaySchoolCommitted(secSchool)) { await commitWorkdaySchool(secSchool, entry.school || school); }
         const secDegree = sec.querySelector('button[data-automation-id="degree"]:not([disabled])');
         if (secDegree) await selectFromWorkdayDropdown(secDegree, mapDegree(entry.degree || degree));
         const secMajor = sec.querySelector('input[data-automation-id="fieldOfStudy"], input[data-automation-id="major"]');
@@ -2771,6 +2818,18 @@
     // Graduated status
     const gradSelect = xpath("//select[contains(@id,'CandProfileFields.IsGraduated')]") || $('select[data-automation-id="isGraduated"]');
     if (gradSelect) { const opt = $$('option', gradSelect).find(o => /yes|complete|graduated/i.test(o.text)); if (opt) { setSelectValue(gradSelect, opt.value); } }
+
+    // CATCH-ALL: commit EVERY school typeahead on the page that isn't already committed —
+    // covers second/third education entries Workday renders outside the education-* wrapper
+    // (the "required, no value" rows). Each gets the matching entry's school, else the
+    // primary school, else "Not Listed".
+    const schoolInputs = $$('input[data-automation-id="school"]').filter(isVisible);
+    for (let i = 0; i < schoolInputs.length; i++) {
+      const si = schoolInputs[i];
+      if (workdaySchoolCommitted(si)) continue;
+      await commitWorkdaySchool(si, (eduEntries[i] && eduEntries[i].school) || school);
+      await sleep(200);
+    }
 
     LOG('Workday: education fields filled (enhanced)');
   }
@@ -4590,7 +4649,25 @@
       return t.length < 44 && re.test(t);
     });
 
-    // Self-correct the form mode based on the error.
+    // CREATE ACCOUNT COMES FIRST. Workday's apply flow lands on the Sign In form by
+    // default, but a first-time applicant has NO account yet — so trying to Sign In just
+    // fails. Unless we have a record that this tenant already has an account, proactively
+    // switch to Create Account BEFORE submitting anything (don't wait for a failed sign-in).
+    const known = await accountExistsFor(location.hostname);
+    if (onSignIn && !known && !existsErr) {
+      const toCreate = inFormLink(/create account|create my account|sign ?up|new user|don'?t have an account|register/i)
+        || $('[data-automation-id="createAccountLink"],a[data-automation-id*="createAccount" i]');
+      if (toCreate && isVisible(toCreate)) { _wdLastSubmit = Date.now(); _wdActions++; LOG('Workday: fresh application (no account yet) — switching to Create Account FIRST'); realClick(toCreate); return 'working'; }
+    }
+    // Mirror image: if we KNOW an account was already created here, prefer Sign In.
+    if (onCreate && known && !wrongCredErr) {
+      const toSignIn = inFormLink(/sign ?in|log ?in|already have an account/i)
+        || $('[data-automation-id="signInLink"],a[data-automation-id*="signIn" i]');
+      if (toSignIn && isVisible(toSignIn)) { _wdLastSubmit = Date.now(); _wdActions++; LOG('Workday: account already created here — switching to Sign In'); realClick(toSignIn); return 'working'; }
+    }
+
+    // Self-correct the form mode based on the error text (covers accounts created outside
+    // the extension, or a stale record).
     if (onSignIn && wrongCredErr) {
       const toCreate = inFormLink(/create account|sign ?up|new user|don'?t have an account/i);
       if (toCreate) { _wdLastSubmit = Date.now(); _wdActions++; LOG('Workday: Sign In rejected (no account yet) — switching to Create Account'); realClick(toCreate); return 'working'; }
