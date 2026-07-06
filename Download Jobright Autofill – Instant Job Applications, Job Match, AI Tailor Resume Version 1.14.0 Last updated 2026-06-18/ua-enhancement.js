@@ -4546,6 +4546,33 @@
     }
   }
 
+  // The manager (side panel) tells THIS tab exactly which job it owns — robust across
+  // the Jobright→ATS→apply-page redirects that made URL-guessing fail. Fires on every
+  // completed navigation in the tab, so the content script on the FINAL apply page is
+  // the one that runs. A per-job guard makes double-delivery a no-op.
+  let _mgrHandledJobId = null;
+  async function runManagedAssignment(job) {
+    if (!job || !job.id) return;
+    if (_mgrHandledJobId === job.id) return;
+    _mgrHandledJobId = job.id;
+    LOG(`Manager assigned this tab to "${job.title || job.url}"`);
+    // On an odd redirect init() may have bailed before loading these — ensure they're ready.
+    try { await load(); } catch (_) {}
+    try {
+      await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory();
+      await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay();
+    } catch (_) {}
+    try { injectCSS(); } catch (_) {}
+    await processManagedJob(job);
+  }
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'UA_ASSIGN_JOB' && msg.job) {
+      if (window.self === window.top) runManagedAssignment(msg.job);
+      try { sendResponse({ ok: true }); } catch (_) {}
+      return true;
+    }
+  });
+
   async function processQ() {
     if (!qActive || qPaused || !queue.length) return;
     // Only the dedicated runner tab drives the queue — never hijack other tabs.
@@ -7172,7 +7199,8 @@
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
     // Manager-driven tab: run this ONE job to a verified terminal status and report.
-    if (mgrJob) { await sleep(1000); processManagedJob(mgrJob); }
+    // (Fallback path — normally the manager's direct UA_ASSIGN_JOB message drives this.)
+    if (mgrJob && _mgrHandledJobId !== mgrJob.id) { await sleep(2500); if (_mgrHandledJobId !== mgrJob.id) { _mgrHandledJobId = mgrJob.id; processManagedJob(mgrJob); } }
     // Workday: when Fully Automated is ON (or a bulk run is active), auto-fill + submit
     // the Create Account / Sign In step. When OFF we stay out of the way and let
     // Jobright's native flow handle it, so the toggle is the single source of truth.

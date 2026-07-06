@@ -210,31 +210,66 @@
     for (const j of queue) if (j.status === 'applying' && _tabMap.has(j.id)) n++;
     return n;
   }
+  /* Push the job assignment into the tab. The content script may not be ready the
+     instant the tab is created, and the page redirects (Jobright → ATS → apply form),
+     so we retry and also re-send on every completed navigation (see onUpdated below). */
+  function assignToTab(tabId, job) {
+    let tries = 0;
+    const payload = { type: 'UA_ASSIGN_JOB', job: { id: job.id, url: job.url, title: job.title, jobBoard: job.jobBoard, startedAt: job.startedAt } };
+    const send = () => {
+      tries++;
+      try {
+        chrome.tabs.sendMessage(tabId, payload, () => {
+          const err = chrome.runtime.lastError; // no receiver yet → content script still booting
+          if (err && tries < 12 && _tabMap.get(job.id) === tabId) setTimeout(send, 1500);
+        });
+      } catch (_) { if (tries < 12) setTimeout(send, 1500); }
+    };
+    setTimeout(send, 1200);
+  }
+
   async function fillSlots() {
     if (_filling) return; _filling = true;
     try {
       if ((await get(KEY_ACTIVE)) !== true) return;
       await loadQ();
-      const conc = getConc();
-      while (runningWithTab() < conc) {
-        const next = queue.find(j => j.status === 'pending');
-        if (!next) break;
-        next.status = 'applying';
-        next.startedAt = Date.now();
-        next.error = null;
-        await set({ [KEY_Q]: queue });
-        // Background tab: a big run never hijacks the screen — the content script
-        // fills background tabs fine (OptimHire technique).
+      const slots = getConc() - runningWithTab();
+      if (slots <= 0) { render(); return; }
+      // Mark the whole batch applying and save ONCE, so a mid-loop storage.onChanged
+      // can't reset our array and leave only one tab opened (the bug you hit).
+      const toOpen = [];
+      for (const j of queue) {
+        if (toOpen.length >= slots) break;
+        if (j.status === 'pending') { j.status = 'applying'; j.startedAt = Date.now(); j.error = null; toOpen.push(j); }
+      }
+      if (!toOpen.length) { if (runningWithTab() === 0) await finish(); render(); return; }
+      await set({ [KEY_Q]: queue });
+      for (const job of toOpen) {
+        // Background tab: a big run never hijacks the screen. active:false keeps focus
+        // on whatever you're doing while jobs apply in the background.
         const tab = await new Promise(res => {
-          try { chrome.tabs.create({ url: next.url, active: false }, res); } catch (_) { res(null); }
+          try { chrome.tabs.create({ url: job.url, active: false }, res); } catch (_) { res(null); }
         });
-        if (tab && tab.id != null) { _tabMap.set(next.id, tab.id); log(`▶ ${next.title || next.url}`, 'act'); }
-        else { next.status = 'failed'; next.error = 'Could not open tab'; await set({ [KEY_Q]: queue }); }
+        if (tab && tab.id != null) { _tabMap.set(job.id, tab.id); assignToTab(tab.id, job); log(`▶ ${job.title || job.url}`, 'act'); }
+        else { job.status = 'failed'; job.error = 'Could not open tab'; await set({ [KEY_Q]: queue }); }
       }
       render();
       if (!queue.some(j => j.status === 'pending' || (j.status === 'applying' && _tabMap.has(j.id)))) await finish();
-    } catch (_) {} finally { _filling = false; }
+    } catch (e) { log('fillSlots error: ' + (e && e.message), 'err'); } finally { _filling = false; }
   }
+
+  /* Re-assign on every completed navigation so the content script on the FINAL apply
+     page (after redirects) is the one that receives its job. */
+  try {
+    chrome.tabs.onUpdated.addListener((tabId, info) => {
+      if (info.status !== 'complete') return;
+      let jobId = null;
+      for (const [jid, tid] of _tabMap) if (tid === tabId) { jobId = jid; break; }
+      if (!jobId) return;
+      const job = queue.find(j => j.id === jobId);
+      if (job) assignToTab(tabId, job);
+    });
+  } catch (_) {}
   function closeJobTab(jobId) {
     const tabId = _tabMap.get(jobId);
     if (tabId == null) return;
