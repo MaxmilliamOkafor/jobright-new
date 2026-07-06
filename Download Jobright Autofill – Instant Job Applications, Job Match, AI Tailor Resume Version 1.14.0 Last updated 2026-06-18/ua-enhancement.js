@@ -4450,6 +4450,129 @@
     return hasApplicationForm() || hasApplyButton();
   }
 
+  // ===== MANAGER MODE (OptimHire-style orchestration) =====
+  // The docked Queue Manager page (ua-queue.html — openable as a tab or Chrome side
+  // panel) opens each job in its own BACKGROUND tab. Here, the content script in that
+  // tab recognizes it's manager-driven, applies with the same verified flow as the
+  // single-tab runner, then reports a terminal status; the manager closes this tab and
+  // opens the next. window.name carries the job id across cross-origin redirects.
+  const MGR_PREFIX = 'UA_MJOB:';
+  function managedIdFromTab() {
+    try { if (typeof window.name === 'string' && window.name.indexOf(MGR_PREFIX) === 0) return window.name.slice(MGR_PREFIX.length); } catch (_) {}
+    return '';
+  }
+  async function findManagedJob() {
+    try {
+      if ((await st.get('ua_mgr_active')) !== true) return null;
+      if (isRunnerTab()) return null; // the old runner owns its tab
+      const tagId = managedIdFromTab();
+      if (tagId) return queue.find(j => j.id === tagId && j.status === 'applying') || null;
+      const here = normalizeUrl(location.href);
+      const j = queue.find(x => x.status === 'applying'
+        && (normalizeUrl(x.url) === here || urlsRoughlyMatch(x.url, location.href)));
+      if (j) { try { window.name = MGR_PREFIX + j.id; } catch (_) {} }
+      return j || null;
+    } catch (_) { return null; }
+  }
+  async function processManagedJob(c) {
+    LOG(`Manager mode: driving "${c.title || c.url}"`);
+    let finalized = false, tId = null;
+    const finalize = async (status, error) => {
+      if (finalized) return; finalized = true;
+      clearTimeout(tId);
+      const patch = { status, error: error || null, completedAt: Date.now(), duration: Date.now() - (c.startedAt || Date.now()) };
+      Object.assign(c, patch);
+      // Fresh read-modify-write on ua_q: parallel job tabs each hold their own copy of
+      // the array, so writing the whole local copy would clobber sibling results.
+      try {
+        const q = (await st.get(SK.Q)) || [];
+        const j = q.find(x => x.id === c.id);
+        if (j) Object.assign(j, patch);
+        await st.set(SK.Q, q);
+      } catch (_) {}
+      if (status === 'done' || status === 'failed') {
+        try { await recordApplication(c.url, c.title, status === 'done' ? 'applied' : 'failed', c.jobBoard, patch.duration); } catch (_) {}
+      }
+      try { await learnFromPage(); } catch (_) {}
+      await st.set('ua_mgr_advance', { id: c.id, status, ts: Date.now() });
+      LOG(`Manager mode: job ${status} — manager will close this tab`);
+    };
+    const onTimeout = async () => {
+      if (finalized) return;
+      if (detectCaptcha()) { showCaptchaBanner(detectCaptcha()?.provider); tId = setTimeout(onTimeout, 60000); return; }
+      await finalize('timeout', `Timed out after ${qTimeout / 1000}s`);
+    };
+    tId = setTimeout(onTimeout, qTimeout);
+    try {
+      if (qSkipApplied && alreadyApplied(c.url)) return void await finalize('skipped', 'Already applied');
+      await openApplicationForm();
+      await handleAccountAuth();
+      if (detectCaptcha()) await waitForCaptchaClear();
+      if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess()) {
+        await sleep(2500);
+        await openApplicationForm();
+        if (!hasApplicationForm() && !hasApplyButton() && !detectATS() && !isWorkday() && !findApplyManually() && !checkSuccess())
+          return void await finalize('skipped', 'No application form found');
+      }
+      if (pageHasFailure()) return void await finalize('skipped', 'Already applied / posting closed');
+      _lastSubmitAt = 0;
+      let success = false, validationStuck = false;
+      for (let attempt = 0; attempt < 2 && !success && !finalized; attempt++) {
+        await withRetry(async () => { await dispatchATSAutomation(); }, 'Manager job automation');
+        for (let check = 0; check < 6 && !finalized; check++) {
+          await sleep(2000);
+          if (detectCaptcha()) { await waitForCaptchaClear(); continue; }
+          if (confirmSubmitted()) { success = true; break; }
+          if (pageHasFailure()) break;
+        }
+        if (success || finalized) break;
+        try {
+          await openApplicationForm(); await waitForFormStable(2500); await fallbackFill(); await guaranteeRequiredFields();
+          const r = await autoSubmitOrNext();
+          if (r === 'next_page') { await sleep(2500); await multiPageLoop(); }
+        } catch (e) { LOG('Manager retry pass error:', e?.message || e); }
+        for (let check = 0; check < 5 && !finalized; check++) {
+          await sleep(2000);
+          if (confirmSubmitted()) { success = true; break; }
+          if (check >= 3 && pageHasValidationError()) { validationStuck = true; break; }
+        }
+        if (validationStuck) break;
+      }
+      if (finalized) return;
+      if (success) await finalize('done', null);
+      else await finalize('failed', validationStuck ? 'Validation errors could not be resolved' : 'Could not confirm submission after retries');
+    } catch (e) {
+      if (!finalized) await finalize('failed', e?.message || String(e));
+    }
+  }
+
+  // The manager (side panel) tells THIS tab exactly which job it owns — robust across
+  // the Jobright→ATS→apply-page redirects that made URL-guessing fail. Fires on every
+  // completed navigation in the tab, so the content script on the FINAL apply page is
+  // the one that runs. A per-job guard makes double-delivery a no-op.
+  let _mgrHandledJobId = null;
+  async function runManagedAssignment(job) {
+    if (!job || !job.id) return;
+    if (_mgrHandledJobId === job.id) return;
+    _mgrHandledJobId = job.id;
+    LOG(`Manager assigned this tab to "${job.title || job.url}"`);
+    // On an odd redirect init() may have bailed before loading these — ensure they're ready.
+    try { await load(); } catch (_) {}
+    try {
+      await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory();
+      await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay();
+    } catch (_) {}
+    try { injectCSS(); } catch (_) {}
+    await processManagedJob(job);
+  }
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'UA_ASSIGN_JOB' && msg.job) {
+      if (window.self === window.top) runManagedAssignment(msg.job);
+      try { sendResponse({ ok: true }); } catch (_) {}
+      return true;
+    }
+  });
+
   async function processQ() {
     if (!qActive || qPaused || !queue.length) return;
     // Only the dedicated runner tab drives the queue — never hijack other tabs.
@@ -6388,6 +6511,7 @@
         <div style="margin-top:7px;height:5px;border-radius:4px;background:#2a2a2d;overflow:hidden"><div id="ua-sb-bar" style="height:100%;width:0%;border-radius:4px;background:linear-gradient(90deg,#00a86b,#00e58f);transition:width .4s"></div></div>
       </div>
       <button id="ua-sb-start" style="${greenBtn}">Start Applying</button>
+      <button id="ua-sb-mgr" style="${greenBtn};background:#161925;color:#6ee7b7;border:1px solid #2c2c30" title="Docked queue manager: runs jobs in parallel background tabs and stays in place while you browse">🗂 Queue Manager (parallel tabs)</button>
       <button id="ua-sb-stop" style="${greenBtn};background:#000;color:#fff;border:1px solid #2c2c30;display:none">Stop</button>
       <div id="ua-sb-runrow" style="display:none;gap:8px;margin-top:8px">
         <button id="ua-sb-pause" style="${ghostBtn};flex:1">Pause</button>
@@ -6421,6 +6545,9 @@
       LOG(`Added ${urls.length} URLs from sidebar`);
     });
     wrap.querySelector('#ua-sb-start').addEventListener('click', () => { if (!queue.some(j => j.status === 'pending')) { alert('Queue is empty — upload a CSV or paste job URLs first.'); return; } startQ(); });
+    wrap.querySelector('#ua-sb-mgr')?.addEventListener('click', () => {
+      try { window.open(chrome.runtime.getURL('ua-queue.html'), '_blank'); } catch (_) { alert('Could not open the Queue Manager'); }
+    });
     wrap.querySelector('#ua-sb-stop').addEventListener('click', stopQ);
     wrap.querySelector('#ua-sb-pause').addEventListener('click', () => { if (qPaused) resumeQ(); else pauseQ(); });
     wrap.querySelector('#ua-sb-skip').addEventListener('click', skipJob);
@@ -7032,6 +7159,8 @@
     // where we click "Apply" to reveal the form). Skipping was the #1 reason the
     // CSV queue "did nothing" on many sites.
     const runnerActive = qActive && isRunnerTab();
+    // Manager mode: this tab was opened by the docked Queue Manager for a specific job.
+    const mgrJob = await findManagedJob();
     // Whether this page is genuinely a job application (known ATS host, or a page that
     // actually READS like a job application — not just a "/apply" URL or a PDF upload).
     const eligible = typeof window.__uaIsEligiblePage !== 'function' || window.__uaIsEligiblePage();
@@ -7040,7 +7169,7 @@
     // detectATS() 'Career' match on a /apply URL is NOT enough — so Fully Automated can't
     // mount+drive on non-job forms (loan/membership/contact pages) and hallucinate answers.
     const fullAutoOnATS = autoApply && eligible && (detectATS() || isWorkday());
-    if (!runnerActive && !fullAutoOnATS && !eligible) { engageQuietMode(); return; }
+    if (!runnerActive && !fullAutoOnATS && !eligible && !mgrJob) { engageQuietMode(); return; }
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
@@ -7063,16 +7192,19 @@
     // Gate the auto-run on `eligible` too: on a real ATS host / genuine job-application
     // page only. Without this, detectATS()'s broad generic "Career" pattern (any URL with
     // /apply, /jobs, /careers) would let Fully Automated fill non-job forms.
-    if (autoApply && !runnerActive && eligible && (ats || isWorkday())) {
+    if (autoApply && !runnerActive && !mgrJob && eligible && (ats || isWorkday())) {
       LOG(`Fully Automated: starting full automation for ${ats || 'Workday'}`);
       await sleep(1500);
       await dispatchATSAutomation();
     }
     if (runnerActive) { await sleep(1000); processQ(); } // start fast — Apply fires ASAP
+    // Manager-driven tab: run this ONE job to a verified terminal status and report.
+    // (Fallback path — normally the manager's direct UA_ASSIGN_JOB message drives this.)
+    if (mgrJob && _mgrHandledJobId !== mgrJob.id) { await sleep(2500); if (_mgrHandledJobId !== mgrJob.id) { _mgrHandledJobId = mgrJob.id; processManagedJob(mgrJob); } }
     // Workday: when Fully Automated is ON (or a bulk run is active), auto-fill + submit
     // the Create Account / Sign In step. When OFF we stay out of the way and let
     // Jobright's native flow handle it, so the toggle is the single source of truth.
-    if (isWorkday() && (autoApply || runnerActive)) startWorkdayAccountWatch();
+    if (isWorkday() && (autoApply || runnerActive || mgrJob)) startWorkdayAccountWatch();
     if (isJobright()) {
       await sleep(2000); resumeTailoringAutomation();
       // Capture Jobright's Insider Connections (recruiter/hiring manager for this role) so a
