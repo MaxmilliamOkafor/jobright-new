@@ -6986,6 +6986,39 @@
   }
 
   // ===================== INIT =====================
+  // QUIET MODE: on a page that is NOT a job application (and with no queue running) the
+  // extension should be INVISIBLE. Our own UI already doesn't mount there, but Jobright's
+  // native content scripts still inject their floating widget on every site — that's the
+  // "annoying on random websites" complaint. Hide those hosts with a CSS kill-switch and
+  // lift it automatically if an SPA navigation turns the page into a real application.
+  function engageQuietMode() {
+    try {
+      if (isJobright() || /(^|\.)linkedin\.com$/i.test(location.hostname)) return; // never touch these
+      const CSS_ID = 'ua-quiet-css';
+      const add = () => {
+        if (document.getElementById(CSS_ID)) return;
+        const s = document.createElement('style');
+        s.id = CSS_ID;
+        s.textContent = 'plasmo-csui,[id^="plasmo-"],[data-plasmo]{display:none !important;pointer-events:none !important}';
+        (document.head || document.documentElement).appendChild(s);
+      };
+      add();
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add, { once: true });
+      const iv = setInterval(() => {
+        try {
+          // Eligibility cache clears on SPA URL changes, so this picks up a genuine
+          // navigation into an application page and un-hides the native UI.
+          if (typeof window.__uaIsEligiblePage === 'function' && window.__uaIsEligiblePage()) {
+            clearInterval(iv);
+            document.getElementById(CSS_ID)?.remove();
+            LOG('Quiet mode lifted — page now reads like a job application');
+          } else add();
+        } catch (_) {}
+      }, 3000);
+      LOG('Quiet mode: Jobright UI hidden on this non-job page');
+    } catch (_) {}
+  }
+
   async function init() {
     if (window.self !== window.top) return;
     // Show the control panel IMMEDIATELY in the runner tab (before any awaits), so
@@ -7007,7 +7040,7 @@
     // detectATS() 'Career' match on a /apply URL is NOT enough — so Fully Automated can't
     // mount+drive on non-job forms (loan/membership/contact pages) and hallucinate answers.
     const fullAutoOnATS = autoApply && eligible && (detectATS() || isWorkday());
-    if (!runnerActive && !fullAutoOnATS && !eligible) return;
+    if (!runnerActive && !fullAutoOnATS && !eligible) { engageQuietMode(); return; }
     await loadAnswerBank(); await loadSavedResponses(); await loadAppHistory(); await loadResumes(); await loadCustomDefaults(); await loadRateLimitDelay(); injectCSS(); buildUI(); setupKeyboardShortcuts();
     [500, 1500, 3000, 5000, 8000, 12000].forEach(ms => setTimeout(hideCredits, ms));
     observe(); injectSidebarUI(); showATSBadge(); renderQ(); updateStat(); updateCtrl();
@@ -11010,6 +11043,11 @@ a[href*="/checkout" i],
   // ---------- on-page control panel ----------
   function renderPanel(c) {
     try {
+      // Stay out of the way while BROWSING LinkedIn: only show on profile (/in/) and
+      // job (/jobs/) pages — never the feed, messaging, search or notifications.
+      if (!/^\/(in|jobs)\//.test(location.pathname)) { document.getElementById('ua-li-followup')?.remove(); return; }
+      S.get('ua_followup_panel_snooze').then(sn => {
+      if (sn && Date.now() < sn) { document.getElementById('ua-li-followup')?.remove(); return; }
       queue().then(q => {
         let el = document.getElementById('ua-li-followup');
         if (!q.length && !c.enabled) { if (el) el.remove(); return; }
@@ -11022,7 +11060,8 @@ a[href*="/checkout" i],
         sentToday().then(st => {
           el.innerHTML =
             '<div style="padding:9px 11px;background:#0a66c2;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:space-between">📨 Recruiter Follow-up' +
-            '<label style="display:inline-flex;align-items:center;gap:5px;font-weight:600;font-size:11px;cursor:pointer"><input type="checkbox" id="ua-li-tog" ' + (c.enabled ? 'checked' : '') + '> Auto-send</label></div>' +
+            '<span style="display:inline-flex;align-items:center;gap:8px"><label style="display:inline-flex;align-items:center;gap:5px;font-weight:600;font-size:11px;cursor:pointer"><input type="checkbox" id="ua-li-tog" ' + (c.enabled ? 'checked' : '') + '> Auto-send</label>' +
+            '<span id="ua-li-x" title="Hide for 24h" style="cursor:pointer;font-weight:600;opacity:.85;padding:0 2px">✕</span></span></div>' +
             '<div style="padding:9px 11px">' +
             '<div style="font-size:10px;color:#666;margin-bottom:6px">Sent today: <b>' + st + '/' + c.cap + '</b> · Pending: <b>' + q.length + '</b></div>' +
             (c.enabled ? '<div style="font-size:10px;color:#0a66c2;margin-bottom:6px">Open a recruiter/hiring-manager profile at a company you applied to — it will auto-send.</div>'
@@ -11044,7 +11083,10 @@ a[href*="/checkout" i],
           if (tog) tog.onchange = () => S.set('ua_followup_enabled', tog.checked).then(() => cfg().then(renderPanel));
           const tpl = el.querySelector('#ua-li-tpl');
           if (tpl) tpl.onchange = () => S.set('ua_followup_template', tpl.value);
+          const x = el.querySelector('#ua-li-x');
+          if (x) x.onclick = () => S.set('ua_followup_panel_snooze', Date.now() + 86400000).then(() => el.remove());
         });
+      });
       });
     } catch (_) {}
   }
