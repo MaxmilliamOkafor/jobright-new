@@ -1025,16 +1025,35 @@
   }
 
   // Button-style knockout questions (Ashby, Kraken, etc.) — non-radio UI
+  // PERFORMANCE-CRITICAL: this used to be a synchronous loop over an ultra-broad, NESTED
+  // selector, calling group.textContent (materializes the whole subtree) + a broad
+  // querySelectorAll + isVisible (forces layout) on EVERY match. On a big form with open
+  // date-picker calendars that was O(n²) synchronous work — the real "Page Unresponsive"
+  // freeze. It's now bounded: narrower selector, a hard cap, innermost-first with consumed-
+  // button dedup (so parent containers aren't reprocessed), option count capped at 2–6, and
+  // the question text comes from a cheap bounded label — never a full-subtree textContent.
   function answerButtonStyleQuestions(p) {
     let answered = 0;
-    const buttonGroups = $$('fieldset, [class*="question"], [class*="Question"], [data-qa], [class*="field-group"], [class*="FieldGroup"], [class*="radio-group"], [class*="RadioGroup"], [class*="ButtonGroup"], [class*="button-group"], [role="radiogroup"], [role="group"]').filter(isVisible);
-    for (const group of buttonGroups) {
-      const selectedBtn = group.querySelector('[aria-checked="true"], [data-selected="true"], [class*="selected"], [aria-pressed="true"], .bg-primary, .btn-primary, [class*="Checked"], [class*="checked"]');
+    let groups = $$('fieldset, [role="radiogroup"], [class*="radio-group"], [class*="RadioGroup"], [class*="ButtonGroup"], [class*="button-group"], [class*="question"], [class*="Question"]')
+      .filter(isVisible).slice(0, 120);
+    // Innermost first so we answer the actual small choice group, not a wrapping container.
+    const depth = el => { let d = 0; for (let n = el; n; n = n.parentElement) d++; return d; };
+    groups.sort((a, b) => depth(b) - depth(a));
+    const consumed = new Set(); // buttons already handled (dedupes nested containers)
+    let processed = 0;
+    for (const group of groups) {
+      if (processed++ > 90) break; // hard cap — never let this run unbounded
+      const selectedBtn = group.querySelector('[aria-checked="true"], [data-selected="true"], [aria-pressed="true"], [class*="Checked"]');
       if (selectedBtn) continue;
-      const groupText = group.textContent?.toLowerCase().replace(/\s+/g, ' ') || '';
-      const btns = $$('button, [role="button"], [role="option"], [role="radio"], div[tabindex], span[tabindex], div[class*="option"], div[class*="Option"], div[class*="choice"], div[class*="Choice"], div[class*="answer"], div[class*="Answer"]', group)
+      const btns = $$('button, [role="button"], [role="option"], [role="radio"], div[tabindex], span[tabindex]', group)
         .filter(el => isVisible(el) && (el.textContent?.trim() || '').length > 0 && (el.textContent?.trim() || '').length < 80);
-      if (btns.length < 2) continue;
+      if (btns.length < 2 || btns.length > 6) continue;      // a real Yes/No-ish choice group
+      if (btns.some(b => consumed.has(b))) continue;          // handled via an inner group already
+      btns.forEach(b => consumed.add(b));
+      // Cheap, BOUNDED question text — a label/aria/legend, never the whole subtree.
+      let groupText = (getLabel(group) || group.getAttribute('aria-label')
+        || group.querySelector('legend,label,[class*="label"],[class*="title"],[class*="question"]')?.textContent
+        || '').toLowerCase().replace(/\s+/g, ' ').slice(0, 200);
       const btnTexts = btns.map(b => (b.textContent?.trim() || '').toLowerCase());
       // Yes/No (incl. reworded options) — decide semantically, then map onto the real
       // button wording so "Does not require sponsorship" is picked for a NO, etc.
