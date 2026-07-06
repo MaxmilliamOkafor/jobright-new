@@ -937,16 +937,16 @@
       const lbl = $(`label[for="${CSS.escape(r.id)}"]`, parent);
       return (lbl?.textContent || r.value || '').trim().toLowerCase();
     });
-    const hasYes = labels.some(l => /^yes$/i.test(l));
-    const hasNo = labels.some(l => /^no$/i.test(l));
-
-    if (hasYes && hasNo) {
-      const decision = determineYesNo(questionText);
+    // Yes/No — including REWORDED options ("Requires sponsorship" / "Does not require
+    // sponsorship", "I am authorized" / "I am not authorized"). We decide semantically,
+    // then map the decision onto the ACTUAL option wording via optionIndexForDecision.
+    // This is the fix for picking the wrong option (or defaulting to the first = wrong)
+    // when the choices aren't literally "Yes"/"No".
+    {
+      let decision = determineYesNo(questionText);
       if (decision === 'eeo') {
-        // Try profile value first for EEO questions
+        // Try the profile value first for EEO questions.
         let eeoVal = '';
-        // "Are you Hispanic/Latino?" is a Yes/No EEO question with no ethnicity words —
-        // without this it fell through to the generic yes-default below and answered YES.
         if (/hispanic|latino|latina|latinx/i.test(questionText)) eeoVal = p.hispanic || 'No';
         else if (/gender|sex\b/i.test(questionText)) eeoVal = p.gender || '';
         else if (/ethnic|race|racial|heritage/i.test(questionText)) eeoVal = p.ethnicity || p.race || '';
@@ -954,25 +954,18 @@
         else if (/disabilit/i.test(questionText)) eeoVal = p.disability || '';
         if (eeoVal) {
           const eeoMatch = radios.find(r => {
-            const lbl = $(`label[for="${CSS.escape(r.id)}"]`, parent);
-            const txt = (lbl?.textContent || r.value || '').toLowerCase().trim();
+            const txt = (($(`label[for="${CSS.escape(r.id)}"]`, parent)?.textContent) || r.value || '').toLowerCase().trim();
             return txt === eeoVal.toLowerCase() || txt.includes(eeoVal.toLowerCase());
           });
           if (eeoMatch) { realClick(eeoMatch); return true; }
         }
-        // Fall back to "Prefer not to say/answer"
-        const pref = radios.find(r => {
-          const lbl = $(`label[for="${CSS.escape(r.id)}"]`, parent);
-          return /prefer not|decline|do not|don.t wish/i.test(lbl?.textContent || r.value || '');
-        });
-        if (pref) { realClick(pref); return true; }
+        // Hispanic/Latino is really a No question; other EEO → decline.
+        decision = /hispanic|latino|latina|latinx/i.test(questionText) ? 'no' : 'decline';
       }
-      const target = decision === 'no' ? 'no' : 'yes';
-      const match = radios.find(r => {
-        const lbl = $(`label[for="${CSS.escape(r.id)}"]`, parent);
-        return (lbl?.textContent || r.value || '').trim().toLowerCase() === target;
-      });
-      if (match) { realClick(match); return true; }
+      if (decision) {
+        const idx = optionIndexForDecision(labels, decision);
+        if (idx >= 0 && radios[idx]) { realClick(radios[idx]); return true; }
+      }
     }
 
     // 4. Proficiency level questions
@@ -1043,13 +1036,17 @@
         .filter(el => isVisible(el) && (el.textContent?.trim() || '').length > 0 && (el.textContent?.trim() || '').length < 80);
       if (btns.length < 2) continue;
       const btnTexts = btns.map(b => (b.textContent?.trim() || '').toLowerCase());
-      const hasYes = btnTexts.some(t => /^yes$/i.test(t));
-      const hasNo = btnTexts.some(t => /^no$/i.test(t));
-      if (hasYes && hasNo) {
-        const decision = determineYesNo(groupText);
-        const target = decision === 'no' ? 'no' : 'yes';
-        const matchBtn = btns.find(b => b.textContent?.trim().toLowerCase() === target);
-        if (matchBtn) { realClick(matchBtn); answered++; continue; }
+      // Yes/No (incl. reworded options) — decide semantically, then map onto the real
+      // button wording so "Does not require sponsorship" is picked for a NO, etc.
+      const hasYesNoish = btnTexts.some(t => /^yes$/i.test(t)) || btnTexts.some(t => /^no$/i.test(t))
+        || /sponsor|authori[sz]|require|eligible|do you|are you|have you|will you|willing|able to|consent|agree/i.test(groupText);
+      if (hasYesNoish && btns.length <= 4) {
+        let decision = determineYesNo(groupText);
+        if (decision === 'eeo') decision = /hispanic|latino|latina|latinx/i.test(groupText) ? 'no' : 'decline';
+        if (decision) {
+          const bi = optionIndexForDecision(btnTexts, decision);
+          if (bi >= 0 && btns[bi]) { realClick(btns[bi]); answered++; continue; }
+        }
       }
       const hasRange = btnTexts.some(t => /\d+\s*[-–]\s*\d+|\d+\s*\+/i.test(t));
       if (hasRange && /experience|years|how (many|long)/i.test(groupText)) {
@@ -1269,13 +1266,105 @@
   function choiceLabel(r) {
     return (getLabel(r) || r.value || (r.nextElementSibling && r.nextElementSibling.textContent) || (r.closest('label') && r.closest('label').textContent) || '').trim().toLowerCase();
   }
+
+  // ── Semantic option matching ──────────────────────────────────────────────
+  // Our knockout logic decides yes / no / decline. But real ATS options are often
+  // WORDED, not literal — e.g. "Requires sponsorship for employment authorization" vs
+  // "Does not require sponsorship". These map a decision onto the actual option text by
+  // reading each option's polarity, so a NO decision correctly clicks the "Does not
+  // require…" option instead of guessing (or picking the first = wrong).
+  function isDeclineOption(text) {
+    return /prefer not|do(es)? ?n['’]?t wish|do not wish|\bdecline\b|choose not|not to (answer|say|disclose|identify)|rather not/i.test(text || '');
+  }
+  // -1 = negative/negated premise ("does not require", "no", "not authorized"),
+  // +1 = affirmative ("requires", "yes", "I am authorized"), 0 = neutral/unknown.
+  function optionPolarity(text) {
+    const t = ' ' + (text || '').toLowerCase().replace(/[^a-z0-9'’\s]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
+    if (!t.trim()) return 0;
+    // An explicit negator makes the statement negative regardless of where it sits —
+    // "I am NOT authorized" / "Does NOT require" must read as -1 even though "i am" /
+    // "require" appear. Negation dominates; affirmative only counts when none is present.
+    const NEG = /\b(no|not|n['’]?t|dont|doesnt|does not|do not|will not|wont|cannot|cant|never|without|none|neither|unable|unwilling)\b/;
+    const AFF = /\b(yes|requires?|needs?|need|authorized|authorised|eligible|agree|accept|consent|confirm|i do|i am|i will|i have|currently)\b/;
+    if (NEG.test(t)) return -1;
+    if (AFF.test(t)) return 1;
+    return 0;
+  }
+  // Return the index of the option (from an array of label texts) that best satisfies the
+  // decision, or -1 if nothing fits confidently.
+  function optionIndexForDecision(texts, decision) {
+    if (!texts || !texts.length || !decision) return -1;
+    const norm = texts.map(t => (t || '').trim().toLowerCase());
+    if (decision === 'decline' || decision === 'eeo') {
+      const di = norm.findIndex(isDeclineOption);
+      if (di >= 0) return di;
+    }
+    const want = decision === 'no' ? 'no' : decision === 'yes' ? 'yes' : null;
+    if (want) {
+      const exact = norm.findIndex(t => t === want || t === want + '.');
+      if (exact >= 0) return exact;
+    }
+    const wantPol = decision === 'yes' ? 1 : decision === 'no' ? -1 : 0;
+    if (wantPol !== 0) {
+      const pol = norm.map(optionPolarity);
+      // Prefer an option whose polarity matches the decision.
+      const match = pol.findIndex(p => p === wantPol);
+      if (match >= 0) return match;
+      // Two-option group where only the OPPOSITE is polarized → pick the other one.
+      if (texts.length === 2) {
+        const opp = pol.findIndex(p => p === -wantPol);
+        if (opp >= 0) return opp === 0 ? 1 : 0;
+      }
+    }
+    return -1;
+  }
+
+  // Decision-aware <option> picker for native selects, ATS-agnostic. Only applies the
+  // yes/no/decline mapping when the option set is genuinely BINARY (<=3 options that
+  // carry clear affirmative/negative polarity, or literal Yes/No) — so it never hijacks
+  // a Country / Degree / Year select. Otherwise it defers to value/keyword matching.
+  function selectOptionForQuestion(el, lbl, p) {
+    const opts = $$('option', el).filter(o => o.value && o.index > 0);
+    if (!opts.length) return null;
+    const texts = opts.map(o => (o.text || '').trim());
+    const q = lbl || '';
+    const pols = texts.map(optionPolarity);
+    const hasPolarPair = pols.includes(1) && pols.includes(-1);
+    const literalYN = texts.some(t => /^yes$/i.test(t)) && texts.some(t => /^no$/i.test(t));
+    const declinable = /gender|disability|veteran|race|ethnic|sex\b|hispanic|latino/i.test(q);
+    if (texts.length <= 3 && (hasPolarPair || literalYN || declinable)) {
+      let decision = determineYesNo(q);
+      if (decision === 'eeo') decision = /hispanic|latino|latina|latinx/i.test(q) ? 'no' : 'decline';
+      if (decision) {
+        const idx = optionIndexForDecision(texts, decision);
+        if (idx >= 0) return opts[idx];
+      }
+    }
+    // Value/keyword fallback (exact text, then contains).
+    const val = guessFieldValue(lbl, p, el);
+    if (val) {
+      const v = val.toLowerCase();
+      return opts.find(o => o.text.trim().toLowerCase() === v)
+        || opts.find(o => o.text.toLowerCase().includes(v))
+        || null;
+    }
+    return null;
+  }
+
   function pickChoice(radios, want) {
-    const isYes = r => /^\s*(yes|y|true|1|i (am|do|will)|authorized|eligible)\b/.test(choiceLabel(r));
-    const isNo = r => /^\s*(no|n|false|0|i (am not|do not|don'?t|will not)|not require|do not require)\b/.test(choiceLabel(r));
-    const isDecline = r => /decline|prefer not|don'?t wish|do not wish|not to (answer|disclose|identify)|choose not/.test(choiceLabel(r));
-    let target = want === 'yes' ? radios.find(isYes)
-      : want === 'no' ? radios.find(isNo)
-        : radios.find(isDecline) || radios.find(isNo);
+    // First: semantic mapping onto the real option wording.
+    const labels = radios.map(choiceLabel);
+    const idx = optionIndexForDecision(labels, want);
+    let target = idx >= 0 ? radios[idx] : null;
+    if (!target) {
+      // Legacy literal fallback.
+      const isYes = r => /^\s*(yes|y|true|1|i (am|do|will)|authorized|eligible)\b/.test(choiceLabel(r));
+      const isNo = r => /^\s*(no|n|false|0|i (am not|do not|don'?t|will not)|not require|do not require)\b/.test(choiceLabel(r));
+      const isDecline = r => isDeclineOption(choiceLabel(r));
+      target = want === 'yes' ? radios.find(isYes)
+        : want === 'no' ? radios.find(isNo)
+          : radios.find(isDecline) || radios.find(isNo);
+    }
     if (!target) return false;
     realClick(target);
     if (!target.checked) { try { target.checked = true; } catch (_) {} target.dispatchEvent(new Event('input', { bubbles: true })); target.dispatchEvent(new Event('change', { bubbles: true })); }
@@ -1359,13 +1448,10 @@
       }
       if (el.type === 'radio') continue;
       if (el.tagName === 'SELECT') {
-        // Pick the first real option as a last resort (skips placeholder).
-        let val = guessFieldValue(lbl, p, el);
         const opts = $$('option', el).filter(o => o.value && o.index > 0);
-        let opt = val ? opts.find(o => o.text.toLowerCase().includes(val.toLowerCase())) : null;
-        // "Are you Hispanic/Latino?" → No
-        if (!opt && /hispanic|latino|latina|latinx/i.test(lbl || ''))
-          opt = opts.find(o => /^\s*no\b/i.test(o.text));
+        // Decision-aware pick (reads the real option wording); then EEO/decline; then
+        // first real option as a last resort so a required select is never left blank.
+        let opt = selectOptionForQuestion(el, lbl, p);
         if (!opt && /gender|disability|veteran|race|ethnic|sex\b/i.test(lbl || ''))
           opt = opts.find(o => /prefer not|decline|not to/i.test(o.text));
         if (!opt) opt = opts[0];
@@ -3008,12 +3094,19 @@
     for (const inp of qInputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      if (inp.tagName === 'SELECT') {
+        // Decision-aware pick (reads reworded options like "Does not require sponsorship")
+        // then value/keyword fallback — applied uniformly across every ATS handler.
+        const gv = guessFieldValue(lbl, p, inp);
+        const opt = selectOptionForQuestion(inp, lbl, p)
+          || (gv ? $$('option', inp).find(o => o.text.toLowerCase().includes(gv.toLowerCase())) : null);
+        if (opt) { setSelectValue(inp, opt.value); }
+        await sleep(80);
+        continue;
+      }
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      if (inp.tagName === 'SELECT') {
-        const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { setSelectValue(inp, opt.value); }
-      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
+      inp.focus({ preventScroll: true }); nativeSet(inp, val);
       await sleep(80);
     }
     // Workday radio/checkbox groups — Master Knockout Question System
@@ -3635,12 +3728,19 @@
     for (const inp of inputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      if (inp.tagName === 'SELECT') {
+        // Decision-aware pick (reads reworded options like "Does not require sponsorship")
+        // then value/keyword fallback — applied uniformly across every ATS handler.
+        const gv = guessFieldValue(lbl, p, inp);
+        const opt = selectOptionForQuestion(inp, lbl, p)
+          || (gv ? $$('option', inp).find(o => o.text.toLowerCase().includes(gv.toLowerCase())) : null);
+        if (opt) { setSelectValue(inp, opt.value); }
+        await sleep(80);
+        continue;
+      }
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      if (inp.tagName === 'SELECT') {
-        const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { setSelectValue(inp, opt.value); }
-      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
+      inp.focus({ preventScroll: true }); nativeSet(inp, val);
       await sleep(80);
     }
 
@@ -3712,12 +3812,19 @@
     for (const inp of inputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      if (inp.tagName === 'SELECT') {
+        // Decision-aware pick (reads reworded options like "Does not require sponsorship")
+        // then value/keyword fallback — applied uniformly across every ATS handler.
+        const gv = guessFieldValue(lbl, p, inp);
+        const opt = selectOptionForQuestion(inp, lbl, p)
+          || (gv ? $$('option', inp).find(o => o.text.toLowerCase().includes(gv.toLowerCase())) : null);
+        if (opt) { setSelectValue(inp, opt.value); }
+        await sleep(80);
+        continue;
+      }
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      if (inp.tagName === 'SELECT') {
-        const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { setSelectValue(inp, opt.value); }
-      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
+      inp.focus({ preventScroll: true }); nativeSet(inp, val);
       await sleep(80);
     }
 
@@ -3795,12 +3902,19 @@
     for (const inp of inputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      if (inp.tagName === 'SELECT') {
+        // Decision-aware pick (reads reworded options like "Does not require sponsorship")
+        // then value/keyword fallback — applied uniformly across every ATS handler.
+        const gv = guessFieldValue(lbl, p, inp);
+        const opt = selectOptionForQuestion(inp, lbl, p)
+          || (gv ? $$('option', inp).find(o => o.text.toLowerCase().includes(gv.toLowerCase())) : null);
+        if (opt) { setSelectValue(inp, opt.value); }
+        await sleep(80);
+        continue;
+      }
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      if (inp.tagName === 'SELECT') {
-        const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { setSelectValue(inp, opt.value); }
-      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
+      inp.focus({ preventScroll: true }); nativeSet(inp, val);
       await sleep(80);
     }
 
@@ -3829,12 +3943,19 @@
     for (const inp of inputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      if (inp.tagName === 'SELECT') {
+        // Decision-aware pick (reads reworded options like "Does not require sponsorship")
+        // then value/keyword fallback — applied uniformly across every ATS handler.
+        const gv = guessFieldValue(lbl, p, inp);
+        const opt = selectOptionForQuestion(inp, lbl, p)
+          || (gv ? $$('option', inp).find(o => o.text.toLowerCase().includes(gv.toLowerCase())) : null);
+        if (opt) { setSelectValue(inp, opt.value); }
+        await sleep(80);
+        continue;
+      }
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      if (inp.tagName === 'SELECT') {
-        const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { setSelectValue(inp, opt.value); }
-      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
+      inp.focus({ preventScroll: true }); nativeSet(inp, val);
       await sleep(80);
     }
 
@@ -3860,12 +3981,19 @@
     for (const inp of inputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      if (inp.tagName === 'SELECT') {
+        // Decision-aware pick (reads reworded options like "Does not require sponsorship")
+        // then value/keyword fallback — applied uniformly across every ATS handler.
+        const gv = guessFieldValue(lbl, p, inp);
+        const opt = selectOptionForQuestion(inp, lbl, p)
+          || (gv ? $$('option', inp).find(o => o.text.toLowerCase().includes(gv.toLowerCase())) : null);
+        if (opt) { setSelectValue(inp, opt.value); }
+        await sleep(80);
+        continue;
+      }
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
-      if (inp.tagName === 'SELECT') {
-        const opt = $$('option', inp).find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-        if (opt) { setSelectValue(inp, opt.value); }
-      } else { inp.focus({ preventScroll: true }); nativeSet(inp, val); }
+      inp.focus({ preventScroll: true }); nativeSet(inp, val);
       await sleep(80);
     }
 
