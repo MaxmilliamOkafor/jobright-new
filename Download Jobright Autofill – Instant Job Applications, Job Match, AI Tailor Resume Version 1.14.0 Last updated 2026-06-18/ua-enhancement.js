@@ -5508,7 +5508,10 @@
 #ua-fab-add .ico{width:18px;height:18px}
 
 /* === AUTOMATION IN PROGRESS PANEL (matches Jobright 1.14.0 dark UI) === */
-#ua-ctrl{position:fixed;top:46px;right:24px;z-index:2147483647;display:none;font-family:'Inter',system-ui,-apple-system,sans-serif}
+/* Anchored to the LEFT edge — Jobright's own sidebar (with the field checklist) lives on
+   the RIGHT, so a right-anchored overlay sat right on top of it. Left keeps both readable.
+   Still draggable; a saved position overrides this. */
+#ua-ctrl{position:fixed;top:80px;left:20px;right:auto;z-index:2147483647;display:none;font-family:'Inter',system-ui,-apple-system,sans-serif}
 #ua-ctrl.show{display:block}
 #ua-ctrl-card{width:300px;background:#0e0e0f;border:1px solid #232325;border-radius:14px;padding:16px 18px;box-shadow:0 12px 40px rgba(0,0,0,.45);color:#e7e7ea}
 .uc-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
