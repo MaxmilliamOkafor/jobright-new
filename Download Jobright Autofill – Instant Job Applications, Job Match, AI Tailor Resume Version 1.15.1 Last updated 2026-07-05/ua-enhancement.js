@@ -413,6 +413,15 @@
     set: (k, v) => new Promise(r => chrome.storage.local.set({ [k]: v }, r)),
     getMulti: keys => new Promise(r => chrome.storage.local.get(keys, d => r(d)))
   };
+  // Keep the Fully-Automated state authoritative across tabs/re-renders: whenever the
+  // stored value changes (this tab, another tab, or a race), adopt it and repaint. This
+  // guarantees the toggle reflects what's actually persisted — no reverting on refresh.
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      if (changes.ua_aa) { autoApply = !!changes.ua_aa.newValue; try { paintAutoToggle(); } catch (_) {} }
+    });
+  } catch (_) {}
   let queue = [], qActive = false, qPaused = false, autoApply = false, selected = new Set();
   let qSpeedFactor = 1; // multiplies automation waits (set from queue speed); lower = faster
   let qSkipApplied = true; // LazyApply-style: skip URLs already applied to (across imports)
@@ -6956,21 +6965,27 @@
     }
   }
   function paintAutoToggle() {
-    // The card lives inside Jobright's SHADOW DOM, so document.getElementById can't see
-    // it — query within the card element reference instead.
-    const card = _faCard;
-    if (card) {
-      const t = card.querySelector('#ua-fa-toggle');
-      if (t) {
+    // Repaint EVERY toggle instance, not just _faCard. Jobright's React sidebar re-renders
+    // can leave stale/duplicate cards in the shadow DOM; if we only painted _faCard, a copy
+    // the user actually clicked could show the wrong state (the "won't turn off" bug). Deep-
+    // query all toggles across shadow roots and sync the drawer checkbox too.
+    try {
+      const toggles = (typeof window.__uaDeepQueryAll === 'function')
+        ? window.__uaDeepQueryAll('#ua-fa-toggle')
+        : [_faCard && _faCard.querySelector('#ua-fa-toggle')].filter(Boolean);
+      for (const t of toggles) {
+        if (!t) continue;
         t.setAttribute('aria-checked', autoApply ? 'true' : 'false');
         t.style.background = autoApply ? '#00f0a0' : '#3a3a42';
         const knob = t.querySelector('span');
         if (knob) knob.style.transform = autoApply ? 'translateX(20px)' : 'translateX(0)';
+        const card = t.closest('#ua-fa-card');
+        const lbl = card && card.querySelector('#ua-fa-state');
+        if (lbl) { lbl.textContent = autoApply ? 'ON' : 'OFF'; lbl.style.color = autoApply ? '#00f0a0' : '#9aa0a6'; }
+        if (card) card.style.borderColor = autoApply ? '#1c8a5e' : '#1c5743';
       }
-      const lbl = card.querySelector('#ua-fa-state');
-      if (lbl) { lbl.textContent = autoApply ? 'ON' : 'OFF'; lbl.style.color = autoApply ? '#00f0a0' : '#9aa0a6'; }
-      card.style.borderColor = autoApply ? '#1c8a5e' : '#1c5743';
-    }
+      const d = document.getElementById('ua-aa'); if (d) d.checked = autoApply;
+    } catch (_) {}
   }
   let _faCard = null;
   function buildFullAutoCard() {
@@ -7007,6 +7022,12 @@
     if (!root) return;
     const fa = buildFullAutoCard();
     const sec = buildSidebarSection();
+    // Remove any stale/duplicate Fully-Automated cards (left behind by Jobright re-renders)
+    // so there's exactly ONE live toggle — a click can never land on a dead copy.
+    try {
+      (typeof window.__uaDeepQueryAll === 'function' ? window.__uaDeepQueryAll('#ua-fa-card') : [...document.querySelectorAll('#ua-fa-card')])
+        .forEach(c => { if (c !== _faCard) c.remove(); });
+    } catch (_) {}
     // Already attached — just make sure the Fully-Automated card is present too.
     if (sec.isConnected && root.contains(sec)) {
       if (fa && !root.contains(fa) && sec.parentElement) sec.parentElement.insertBefore(fa, sec);
