@@ -1742,6 +1742,10 @@
     for (const inp of inputs) {
       const lbl = getLabel(inp);
       if (!lbl) continue;
+      // Leave OPTIONAL date fields alone — typing into MM/YYYY pickers pops calendars
+      // open and risks committing junk dates. Required ones are handled by the per-ATS
+      // education/experience fillers with real dates.
+      if (!isFieldRequired(inp) && (inp.type === 'date' || /MM\s*\/\s*YYYY|DD\s*\/\s*MM/i.test(inp.placeholder || '') || /\b(start|end)\s+date\b/i.test(lbl))) continue;
       const val = guessFieldValue(lbl, p, inp);
       if (!val) continue;
       inp.focus({ preventScroll: true });
@@ -3720,8 +3724,17 @@
         const shown = ctrl.querySelector('[class*="singleValue"],[class*="single-value"]');
         if (shown && shown.textContent.trim()) continue;
         const lbl = getLabel(ctrl) || getFullQuestionText(ctrl);
+        // NEVER click DATE controls — Workable's Start/End date (MM/YYYY) fields match the
+        // combobox selectors, and clicking them pops open calendar pickers (the two open
+        // calendars in the screenshots). Education dates are optional there anyway.
+        const isDateCtrl = /\bdate\b|start date|end date|mm\s*\/\s*yyyy|dd\s*\/\s*mm|month|year of/i.test(lbl || '')
+          || ctrl.querySelector('input[placeholder*="MM" i],input[placeholder*="YYYY" i],[class*="datepicker" i],[class*="DatePicker"]')
+          || ctrl.closest('[class*="datepicker" i],[class*="DatePicker"],[data-ui*="date" i]');
+        if (isDateCtrl) continue;
         realClick(ctrl);
-        const listSel = '[class*="option"],[role="option"],li[role="option"]';
+        // Strict option selector — a loose [class*="option"] also matches "optional-label"
+        // etc. and could click junk.
+        const listSel = '[role="option"],li[role="option"],[class*="select__option"],[class*="Select__option"],[class*="menu"] [class*="option"]:not([class*="optional" i])';
         const first = await waitFor(listSel, 1200);
         if (!first) { continue; }
         const opts = $$(listSel).filter(isVisible);
@@ -3736,8 +3749,9 @@
           if (val) { const v = val.toLowerCase(); idx = texts.findIndex(t => t.toLowerCase() === v); if (idx < 0) idx = texts.findIndex(t => t.toLowerCase().includes(v)); }
         }
         if (idx >= 0 && opts[idx]) { realClick(opts[idx]); await sleep(200); }
-        else { // close the menu without picking to avoid leaving it open
-          realClick(ctrl); await sleep(100);
+        else { // close the abandoned menu with Escape (a re-click can just re-open it)
+          try { ctrl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); document.body.click(); } catch (_) {}
+          await sleep(100);
         }
       } catch (_) {}
     }
